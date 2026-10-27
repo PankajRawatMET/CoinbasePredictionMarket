@@ -1,0 +1,768 @@
+CPM FIX MARKET DATA - OPEN QUESTIONS (Stage 0)
+=============================================
+Date: 2026-10-23 (answers recorded 2026-10-23)
+
+References:
+  "PDF p.N"  = page N of docs/spec/cpm-api-spec.pdf
+               (identical to the original "Coinbase Prediction Market API specs 1.pdf",
+               which is now in Temp/)
+  "MD:L"     = line L of docs/spec/fix-market-data.txt
+               (text extract of the FIX Market Data section, PDF p.96-114)
+  [OBS]      = observed on the sandbox during the prototype logon on 2026-10-23
+  [WS]       = taken from the WebSocket section, which the FIX MD spec names
+               as the equivalent channel definitions
+
+Each entry has the question, the spec reference, the proposed answer
+(what will be built if you don't say otherwise) and its status.
+
+Answer format suggestion:  Q4: agree   /   Q9: no, use > 1.000 only   etc.
+
+
+=============================================================================
+A. BLOCKING STAGE 1
+=============================================================================
+
+Q18  Dependencies (CMake, QuickFIX, GoogleTest)
+-----------------------------------------------------------------------------
+Question : How should the dependencies be installed?
+           CMake, git, QuickFIX and GoogleTest are not installed.
+           The apt package libquickfix-dev 1.15.1 might not be built with SSL,
+           and the sandbox port needs TLS.
+Spec ref : Not in the spec (this is an environment question).
+           Related: the spec says "Transport: TCP" and never mentions TLS
+           (PDF p.96, MD:21), yet the sandbox port 6120 only works with TLS [OBS].
+Proposal : sudo apt install cmake git libgtest-dev
+           Build QuickFIX from source through CMake FetchContent, pinned to a
+           release tag, with HAVE_SSL=ON (libssl-dev 3.5.5 is already installed).
+           Alternative: apt libquickfix-dev, with stunnel providing TLS.
+Status   : RESOLVED 2026-10-23 - approved. apt: cmake, libgtest-dev. QuickFIX v1.16.0
+           (tag sha 2ce8a60667d9) built from the release tarball through
+           FetchContent with HAVE_SSL=ON, so git is not needed.
+
+Q19  Git repository and prototype files
+-----------------------------------------------------------------------------
+Question : There is no git repo and git is not installed. Once git is
+           installed, OK to "git init" and commit Stage 0?
+           Also OK to delete the prototype fix_md_login.cpp and its binary
+           once Stage 1 replaces them? Until then they stay uncommitted.
+Spec ref : Not in the spec.
+Proposal : git init; .gitignore (already written) excludes creds.env, *.env,
+           build/ and the binary; commit Stage 0; delete the prototype in
+           Stage 1.
+Status   : RESOLVED 2026-10-23 - no git or GitHub at all for now; no commits.
+           Unneeded files were moved to Temp/: the prototype fix_md_login.cpp,
+           its binary, .gitignore and the original PDF (an identical copy is in
+           docs/spec/).
+
+
+=============================================================================
+B. SPEC vs. YOUR INSTRUCTIONS (the spec was followed - please confirm)
+=============================================================================
+
+Q1  "All custom tags and message types" in the dictionaries
+-----------------------------------------------------------------------------
+Question : Your instructions say to generate dictionaries "including all custom
+           tags and message types". In the spec, every 20000+ tag, the
+           U-prefixed message and F1-F5 belong to ORDER ENTRY. FIX Market Data
+           uses none of them. Leave them out of the MD dictionaries?
+Spec ref : MD header claims the extension ranges:
+             PDF p.96, MD:10  "Baseline: FIX 5.0 SP2, with CPM-specific
+                               extensions in the 20000+ / U-prefixed / F1-F5
+                               ranges."
+           But the MD message catalog lists only A,0,1,2,3,4,5,V,W,X,Y,f,j:
+             PDF p.97, MD:69-95
+           The custom items are all in the Order Entry section:
+             PDF p.45  ReceiveSettlementReports(20127)
+             PDF p.59  LastExecIDRequest (35=F1), F2-F5 follow
+             PDF p.68  MarketSettlementReport (35=UMS), tags 20105, 21052-21056
+             PDF p.81  OE overview repeats the same "20000+ / U / F1-F5" line
+           The only MD-specific CPM extensions:
+             PDF p.100, MD:200      MDEntryType(269) = L (custom)
+             PDF p.114, MD:832-834  SecurityTradingStatus(326) custom values
+             PDF p.98,  MD:121      HMAC signature in Text(58) on Logon
+Proposal : Leave the Order Entry items out (already done this way in config/).
+Status   : RESOLVED 2026-10-23 - follow the spec: OE-only items stay out of the
+           MD dictionaries.
+
+Q11  Sizes as int64
+-----------------------------------------------------------------------------
+Question : Your instructions say "sizes as int64". Sizes on the wire have 2
+           decimal places, so they can't be whole numbers. OK to store sizes
+           as int64 HUNDREDTHS and prices as int64 THOUSANDTHS?
+Spec ref : PDF p.102, MD:303  MDEntryPx "Price level, 3 dp."
+           PDF p.102, MD:307  MDEntrySize "quantity at this level, 2 dp."
+           PDF p.34 [WS]      real fractional example: "level_quantity": "30.72"
+Proposal : price 0.580 -> 580 ; size 300.00 -> 30000 ; 30.72 -> 3072.
+           Decimal strings are parsed directly, never through double.
+Status   : RESOLVED 2026-10-23 - follow the spec: 2 dp sizes as int64 hundredths,
+           3 dp prices as int64 thousandths.
+
+
+=============================================================================
+C. SPEC AMBIGUITIES AFFECTING STAGES 3-4
+   (Q4-Q8 can be settled by logging raw sandbox traffic in Stage 1)
+=============================================================================
+
+Q3  MarketDepth(264) = 0 (full book): allowed or not?
+-----------------------------------------------------------------------------
+Question : The field table lists 0 as valid, but the reject table rejects any
+           value other than 1 or 10. Which is right?
+Spec ref : PDF p.99,  MD:156      "0 = full book, 1 = best prices, 10 = top 10
+                                   levels. Order book is capped at 10 levels
+                                   per side."
+           PDF p.101, MD:239-240  281=5 Unsupported MarketDepth: "264 absent on
+                                   an order-book request; 264 not 1 or 10; 264
+                                   present on a non-order-book request"
+Proposal : Only send 264=1 (L1) or 264=10 (L2).
+Status   : ADOPTED 2026-10-23 - proposal accepted (no conflict with spec);
+           revisit if sandbox traffic contradicts it.
+
+Q4  Can one MarketDataRequest mix channel groups?
+-----------------------------------------------------------------------------
+Question : Can one V carry 269=0,1,2,B,C together, or is it one channel group
+           per request?
+Spec ref : PDF p.100, MD:186-200  269 -> channel mapping (each a separate channel)
+           PDF p.101, MD:240      264 "present on a non-order-book request" is
+                                   rejected, so a mixed book+trade request
+                                   could not be valid either with or without 264.
+           Examples only ever group 0+1 (book) and B+C (vol/OI):
+             PDF p.106 (book L1), p.108 (trade), p.109 (vol/OI)
+Proposal : One V per channel group: book (0+1), trade (2), vol/OI (B+C),
+           lifecycle (L).
+Status   : ADOPTED 2026-10-23 - proposal accepted (no conflict with spec);
+           revisit if sandbox traffic contradicts it.
+
+Q5  Content of an unsubscribe (263=2)
+-----------------------------------------------------------------------------
+Question : Does an unsubscribe need only MDReqID(262), or must it repeat the
+           same 264/267/146 groups as the original subscribe?
+Spec ref : PDF p.99, MD:147-154  262 "used as the subscription handle for
+                                   unsubscribe"; 263 "2 = Disable previous
+                                   snapshot + Updates (unsubscribe)"
+           PDF p.101, MD:229-230 281=0 also covers "unsubscribe named an
+                                   unknown MDReqID"
+           No unsubscribe example is given.
+           Note: 267 is required (MD:165) and an absent 146 is a 281=9 reject
+           (PDF p.101), which suggests the groups are always needed.
+Proposal : Repeat the original 262 plus the same 264/266/267/146 groups,
+           with 263=2.
+Status   : ADOPTED 2026-10-23 - proposal accepted (no conflict with spec);
+           revisit if sandbox traffic contradicts it.
+
+Q6  Layout of MarketDataIncrementalRefresh (35=X)
+-----------------------------------------------------------------------------
+Question : (a) Are Symbol(55) and SecurityID(48) per entry (as the table says)
+               or at message level (as the trade examples show)?
+           (b) The vol/OI delta example puts 279 before 268, and says 268=1
+               while carrying two entries. Is that example simply wrong?
+Spec ref : (a) table, per entry:      PDF p.103, MD:335-337  "-> 55 Symbol",
+                                       "-> 48 SecurityID" inside NoMDEntries
+               trade example, message level:
+                                       PDF p.108, MD:563-568  55/48 before 268=1
+                                       PDF p.111, MD:702-707  same (all-instr.)
+               book delta example, per entry:
+                                       PDF p.106, MD:434-439  268=1|279|269|55|48
+           (b) PDF p.110, MD:646-654  "279=1| 55=...| 48=...| 268=1| 269=B|271=..|
+                                      269=C|271=.."
+Proposal : Dictionary accepts 55/48 in both places (already done). Treat (b)
+           as a typo: 279 per entry, 268 = real entry count. Confirm against
+           captured sandbox X messages.
+Status   : ADOPTED 2026-10-23 - proposal accepted (no conflict with spec);
+           revisit if sandbox traffic contradicts it.
+
+Q7  MDPriceLevel(1023) contradicts the example
+-----------------------------------------------------------------------------
+Question : The L2 delta updates price 0.580 and labels it level 2, but in the
+           snapshot 0.580 was level 1. Can 1023 be trusted?
+Spec ref : PDF p.105, MD:411  snapshot "269=0|270=0.580|271=300.00|1023=1|
+                              # Bid; ... MDPriceLevel 1 (best)"
+           PDF p.106, MD:440-442  delta "270=0.580| 271=246.00| 1023=2|
+                              # bid level 2 changed"
+           PDF p.102, MD:309  1023 is optional (Req = N)
+Proposal : Key the book by price; treat 1023 as informational only.
+Status   : CONFIRMED 2026-10-26 by O9: 1023 is the price's position after the
+           change in 969 of 969 observed entries (L2 and L1, snapshots and
+           deltas), with zero mismatches. The spec's example is wrong.
+           Deletes never carry 1023 (0 of 173).
+
+Q8  L1 (264=1) behaviour when the best price moves
+-----------------------------------------------------------------------------
+Question : When the best YES/NO bid moves to a new price, does the server send
+           a Delete of the old level plus a New level, or a single Change
+           carrying the new price?
+Spec ref : PDF p.106-107, MD:449-529  L1 subscribe, snapshot and delta examples.
+           The delta example only shows a size change at the same price
+           (0.560: 333.00 -> 200.00), MD:521-523.
+           PDF p.103, MD:317-318  "Replace the level with this value ... A size
+                                   of 0.00 removes the level."
+Proposal : The L1 book holds one level per side, and any update for that side
+           replaces it. A size of 0 empties that side.
+Status   : CONFIRMED 2026-10-26 by O9: exactly as proposed. A size change at
+           the same best price is one 279=1 (236 messages); a new best price is
+           279=2 delete of the old best THEN 279=0 new (92 messages). No other
+           pattern occurred.
+
+Q9  Crossed / locked book definition
+-----------------------------------------------------------------------------
+Question : Both sides are bids (YES bids and NO bids). What exactly counts as
+           crossed?
+Spec ref : PDF p.100, MD:192  "1 Ask - Order book - NO bids"
+           PDF p.107, MD:496  "best NO bid 0.380 ... -> yes_ask = 0.620"
+                              (so implied YES ask = 1.000 - best NO bid)
+           The spec has no crossed-book rule.
+Proposal : crossed if best_yes_bid + best_no_bid > 1.000
+           locked  if best_yes_bid + best_no_bid = 1.000
+           Both flag the book as suspect (reported, not auto-fixed).
+Status   : ADOPTED 2026-10-23, STILL UNOBSERVED as of O9: over 1142 book
+           entries the top-of-book sum never exceeded 0.990, so the rule has
+           never been violated, but neither has it been exercised. The check
+           stays in, and stays an assumption.
+
+Q10  AggressorSide(2446) -> YES/NO taker
+-----------------------------------------------------------------------------
+Question : For a binary contract, does 1=Buy mean "taker bought YES" and
+           2=Sell mean "taker bought NO" (sold YES)?
+Spec ref : PDF p.104, MD:357-360  "Aggressor (taker) direction of the trade:
+                                   1 = Buy, 2 = Sell, 0 = NoAggressor
+                                   (opening / uncrossing fill)"
+           PDF p.108, MD:574      "1 = Buy (aggressor bought)"
+           PDF p.32-33 [WS]       taker_side: "yes" / "no" / null
+           PDF p.108, MD:571      270 is the YES price ("NO = 1.000 - 0.620")
+Proposal : 1 -> YES taker, 2 -> NO taker, 0 -> none.
+Status   : ADOPTED 2026-10-23 - proposal accepted (no conflict with spec);
+           revisit if sandbox traffic contradicts it.
+
+Q13  Instrument lifecycle: initial state
+-----------------------------------------------------------------------------
+Question : No snapshot is sent for lifecycle. The WebSocket docs say to fetch
+           the current state over REST first. Is REST in scope?
+Spec ref : PDF p.100, MD:213  "Trade, Instrument lifecycle: no snapshot is
+                               sent; only live updates are delivered after
+                               subscribe."
+           PDF p.27 [WS]      "Lifecycle channels only stream updates that
+                               occur after you subscribe. To get the current
+                               state, use the REST API first"
+Proposal : No REST. State stays Unknown until the first SecurityStatus(f)
+           arrives for that instrument.
+Status   : ADOPTED 2026-10-23 - proposal accepted (no conflict with spec);
+           revisit if sandbox traffic contradicts it.
+
+Q14  Lifecycle status meanings and transitions
+-----------------------------------------------------------------------------
+Question : (a) Is Amended(26) a STATE, or an EVENT (e.g. a close-date change)
+               that leaves the trading state unchanged?
+           (b) Are there transitions that should be flagged as unexpected
+               (e.g. Settled -> Open)?
+           (c) Several codes reuse standard FIX values with different
+               meanings (21 std=Pre-open, 26 std=Post-close, 18 std=Not
+               available). OK to use the CPM meanings only?
+Spec ref : PDF p.114, MD:832-834  "Reused some tags from FIX 5.0 SP2, created
+                                   new tags for determined and settled statuses
+                                   21 = Listed 29 = Delisted 17 = Open 2 = Pause
+                                   18 = Closed 27 = Determined 28 = Settled
+                                   26 = Amended"
+           PDF p.112, MD:757-764  lifecycle "Tracks lifecycle changes: creation,
+                                   (de)activation, close-date changes,
+                                   determination, settlement."
+           No state machine is given.
+Proposal : CPM meanings only; Amended is treated as an event; every transition
+           is recorded, none rejected.
+Status   : ADOPTED 2026-10-23 - proposal accepted (no conflict with spec);
+           revisit if sandbox traffic contradicts it.
+
+
+=============================================================================
+D. INFORMATIONAL (decided; answer only if you disagree)
+=============================================================================
+
+Q2  Logon signing recipe
+-----------------------------------------------------------------------------
+Issue    : The MD section names an HMAC in Text(58) but gives no recipe.
+Spec ref : PDF p.98, MD:101-104  "an API key carried in SenderCompID(49) +
+                                  passphrase (Password 554) + an HMAC signature
+                                  (Text 58)"
+           PDF p.50 (Order Entry) "payload = SendingTime + ApiKey +
+                                   TargetCompID + Password", SendingTime at ms
+                                   precision (21 chars), ±30 second window
+Decision : Use the Order Entry recipe with TargetCompID=CPMMD.
+Status   : RESOLVED - verified on the sandbox, Logon accepted [OBS]
+
+Q12  Sequence gaps / ResendRequest
+-----------------------------------------------------------------------------
+Issue    : The spec doesn't say whether the MD gateway honours ResendRequest.
+Spec ref : PDF p.97, MD:82    "2/4 ResendRequest / SequenceReset - Session-level
+                               recovery" (listed, behaviour not described)
+           PDF p.96, MD:39-40 "Send ResetSeqNumFlag=Y ... Sequence numbers may
+                               not be persisted across restarts."
+           PDF p.41 [WS]      "If you detect a gap, you should unsubscribe and
+                               resubscribe"
+Decision : On a gap: reconnect with 141=Y, resubscribe, rebuild from a fresh
+           snapshot. No reliance on resend.
+Status   : DECIDED
+
+Q15  Volume / open interest may be empty
+-----------------------------------------------------------------------------
+Spec ref : PDF p.31 [WS]  open_interest / total_volume: "Implementation is
+                          pending; this field is not yet populated"
+           PDF p.109-110  the FIX B/C channels are fully specified
+Decision : Implement fully; don't treat empty or zero values as an error.
+Status   : DECIDED
+
+Q16  SendingTime precision
+-----------------------------------------------------------------------------
+Spec ref : PDF p.96, MD:31  "Microseconds inbound / milliseconds outbound"
+           [OBS] the server actually sends microseconds:
+                 52=20261023-05:41:10.530768
+Decision : Send microseconds; accept both ms and µs.
+Status   : DECIDED
+
+Q17  Heartbeat strictness
+-----------------------------------------------------------------------------
+Spec ref : PDF p.96, MD:33  "Heartbeat interval: 30 seconds (configurable on
+                             Logon)"
+           [OBS] the server sent TestRequest exactly 30s after Logon when the
+                 client had sent nothing
+Decision : The client heartbeats on its own send timer (QuickFIX default).
+Status   : DECIDED
+
+Q20  Limits
+-----------------------------------------------------------------------------
+Issue    : No limits are given for symbols per request, subscriptions per
+           session, or message rate.
+Spec ref : Not in the spec (searched the MD section, PDF p.96-114).
+Decision : No client-side limits; reject codes are surfaced if the server
+           enforces any.
+Status   : DECIDED
+
+Q21  Subscribing by SecurityID(48) only
+-----------------------------------------------------------------------------
+Spec ref : PDF p.100, MD:183  "48 SecurityID ... Numeric instrument ID
+                               (alternate to Symbol)"
+           PDF p.100, MD:178-180  "55 Symbol ... Required when 146 > 0"
+Decision : Always send Symbol(55). Sending 48 alone would break QuickFIX's
+           repeating-group delimiter, and the spec requires 55 anyway.
+Status   : DECIDED
+
+Q22  Do subscriptions survive a reconnect?
+-----------------------------------------------------------------------------
+Spec ref : Not stated for FIX.
+           PDF p.41 [WS]  "If your connection drops, you must reconnect,
+                           re-authenticate, and resubscribe"
+Decision : Assume they don't. Always resubscribe with fresh MDReqIDs.
+Status   : DECIDED
+
+Q23  Endpoint / TLS not in the spec
+-----------------------------------------------------------------------------
+Spec ref : PDF p.96, MD:21-23  "Transport TCP", "Default Port TBD"; no host given
+Decision : Sandbox only: fix-marketdata.cpm-sandbox.fairx.net:6120 over TLS
+           (from you, confirmed by a successful TLS logon [OBS]). The client
+           refuses any non-sandbox host.
+Status   : DECIDED
+
+
+=============================================================================
+E. SANDBOX OBSERVATIONS (instrument discovery, 2026-10-23)
+=============================================================================
+
+O1  All-instrument volume/OI subscribe returns nothing
+-----------------------------------------------------------------------------
+Sent     : 35=V 262=instruments-1|263=1|267=2|269=B|269=C|146=0  (07:45:12Z)
+Observed : accepted (server's 369 advanced past it), but no W, no Y and no X
+           in the following 30 s. [OBS]
+Why      : consistent with Q15. The REST catalog shows open_interest and
+           total_volume as null on a live instrument (see O2).
+Effect   : FIX MD has no instrument-list message, so discovery uses the public
+           REST catalog: GET /api/v1/instruments (PDF REST section 5.1).
+
+O2  Sandbox instruments are short-lived 15-minute markets
+-----------------------------------------------------------------------------
+Example  : ticker BTCD15M-BTC26OCT230830-0, id 239300587844272128 (from REST,
+           supplied by the user). Series BTCD15M = "BTC up/down, 15 min".
+           Listed and opened 08:15:06Z, expected close 08:30:00Z. The event
+           ticker's time (0830) is the window end in UTC.
+           price_level_structure TAPERED_DECI_CENT, fractional_enabled true,
+           open_interest/total_volume null.
+Effect   : a symbol is only useful for about 15 minutes, so a feed capture must
+           use an instrument fetched with status=OPEN just before the capture.
+Assumed  : FIX Symbol(55) = REST ticker, SecurityID(48) = REST id.
+           Not yet confirmed on FIX.
+
+O3  First feed capture: BTCD15M-BTC26OCT230930-0, 09:25:49-09:30:56Z
+-----------------------------------------------------------------------------
+Raw log  : docs/spec/capture-sandbox-20261023T0925.log
+           (book L2 264=10, trades and lifecycle; window closed 09:30:00Z)
+Confirms : - FIX 55 = REST ticker, 48 = REST id (48=239315693328138240). O2's
+             assumption is now confirmed.
+           - All three subscribes and all three unsubscribes were accepted.
+             Unsubscribe repeating the original groups (Q5) got no Y and no
+             reply of any kind.
+           - One V per channel group works (Q4: mixing groups still untested).
+           - The dictionaries validated every real W, X and f. The client sent
+             no Reject(3).
+           - Q6 answered: in X, 279/269/55/48/1023/270/271 sit INSIDE each
+             entry, and 60 TransactTime is once at message level after the
+             group. Real layout:
+               262|268=1|279=0|269=0|55=..|48=..|1023=1|270=0.44|271=2|60=..
+           - Delete: 279=2 with 270 and 271=0, no 1023.
+Spec gaps: - W carries 60 TransactTime (time of the last book change). An empty
+             book is a W with 268=0.
+           - Prices arrive with 2 dp (270=0.44); the spec says 3 dp.
+           - Sizes arrive with no decimals (271=2); the spec says 2 dp.
+             => the decimal parser must accept 0..N dp (N = 3 for price,
+                N = 2 for size).
+           - SecurityStatus f has NO 324 (MDReqID echo) and no 58. Route
+             lifecycle by Symbol/SecurityID, not by MDReqID.
+Lifecycle: At the window close (09:30:00Z), in sequence order:
+             34=18  f 326=18 (Closed)       60=09:30:00.445
+             34=19  X 279=2 delete of the resting YES bid (book cleared)
+             34=20  f 326=27 (Determined)   60=09:30:00.686
+           No 326=28 (Settled) within the following 55 s.
+           No f arrived on subscribe: no initial state (matches Q13).
+Trades   : none during the capture (thin sandbox book; no execution).
+Not seen : NO-side (269=1) book entries, L1 (264=1) behaviour (Q8), a change
+           279=1, more than one book level (Q7), trades, Settled.
+Session  : the server sends TestRequest(1) 112=12345 whenever ~30 s pass
+           without inbound traffic. That happened 7 times in 5 minutes,
+           because our 30 s heartbeat timer races its 30 s check. The client
+           answered every one. Relevant to Stage 5 stale-feed timing.
+
+O4  Second feed capture: BTCD15M-BTC26OCT231030-0, 10:18:11-10:33:20Z
+-----------------------------------------------------------------------------
+Raw log  : docs/spec/capture-sandbox-20261023T1018.log (book L2 264=10,
+           trades, lifecycle). 19 X, 1 W, 3 f. No Y, j or Reject(3) either way.
+Trades   : two public trades. Each was immediately followed by the matching
+           book update, which had the SAME TransactTime(60), with the trade
+           message first.
+           (a) 10:18:48.509  trade 270=0.49 271=4 2446=1 (Buy)
+               resting NO bid 0.51 x 4 -> 279=2 delete (fully filled)
+               0.49 + 0.51 = 1.00: the aggressor BOUGHT YES against a NO bid.
+           (b) 10:28:35.501  trade 270=0.48 271=1 2446=2 (Sell)
+               resting YES bid 0.48 x 3 -> 279=1 CHANGE to 271=2
+               the aggressor SOLD YES (= bought NO at 0.52) into a YES bid.
+           Trade X layout: 262|268=1|279=0|269=2|55|48|270|271|278|2446|60
+           (no 1023). Each 278 MDEntryID is unique.
+Confirms : - Q10: 2446=1 -> YES taker, 2446=2 -> NO taker. 270 is the YES price.
+           - NO bids (269=1) are quoted in the NO contract's own price
+             (NO 0.51 matched YES 0.49).
+           - 279=1 Change carries the ABSOLUTE new size (3 -> 2, sent as 271=2,
+             not -1). Replace the level, never add.
+           - A full fill is sent as a 279=2 delete.
+Prices   : 270=0.4 seen (ONE decimal). Prices arrive with 1-2 dp so far; the
+           parser must accept 0..3 dp.
+Lifecycle: full sequence, with no initial state on subscribe:
+             10:30:06.403  326=18 Closed     (6.4 s after the nominal close;
+                                              0.4 s in O3)
+             10:30:06.721  326=27 Determined
+             10:31:06.424  326=28 Settled    (~60 s after Determined)
+           None of them carried 324 or 58.
+Book     : at most one resting order in the whole book at any time. Quotes
+           lived ~15-16 s each, then were cancelled (looks like a sandbox quoting
+           bot). So still not observed: more than one level (Q7), L1 (Q8), a
+           crossed or locked book (Q9).
+Session  : 19 TestRequests in 15 minutes (the heartbeat race, see O3). All were
+           answered.
+
+O5  Tick size (from the spec, REST section 6.4 "PriceLevelStructure", PDF)
+-----------------------------------------------------------------------------
+           LINEAR_CENT        0.00-1.00  tick 0.01
+           DECI_CENT          0.00-1.00  tick 0.001
+           TAPERED_DECI_CENT  0.00-0.10  tick 0.001   (BTCD15M uses this)
+                              0.10-0.90  tick 0.01
+                              0.90-1.00  tick 0.001   (0.100 and 0.900 are valid)
+           Order prices exclude 0 and 1; settlement values may equal either.
+           So 3 dp in thousandths covers every structure. The 1-2 dp prices
+           seen in O3/O4 are the 0.01 band written without trailing zeros.
+
+O6  Third capture: all-instrument lifecycle + trades, 11:17:16-11:37:33Z
+-----------------------------------------------------------------------------
+Raw log  : docs/spec/capture-sandbox-20261023T1117.log
+           225 f, 174 X (trades), 8 Y. The client sent no Reject(3).
+Discovery: YES, new instruments are announced over FIX. With 269=L 146=0, each
+           new window arrives as f 326=21 (Listed), then f 326=17 (Open)
+           ~0.3 s later. This comes ~2-3 s after the previous window's
+           Closed/Determined. So instruments can be discovered from the
+           lifecycle feed; no REST call and no name guessing.
+           Example (11:30 boundary):
+             11:30:01.775 BTCD5M-BTC26OCT231130-0 Closed
+             11:30:01.986 BTCD5M-BTC26OCT231130-0 Determined
+             11:30:05.006 BTCD5M-BTC26OCT231135-0 Listed
+             11:30:05.255 BTCD5M-BTC26OCT231135-0 Open
+             11:31:00.958 BTCD5M-BTC26OCT231130-0 Settled  (~60 s later)
+           Each instrument went through 21 -> 17 -> 18 -> 27 -> 28 (45 each).
+Series   : 18 rolling crypto up/down series: {BTC, ETH, SOL, XRP, DOGE, BNB,
+           NEAR, ZEC, HYPE} x {D5M, D15M}. The ticker pattern holds for all of
+           them: <SERIES>-<ASSET><YY><MON><DD><HHMM end, UTC>-0.
+           Long-lived sports markets also trade: NFLGAME, NBAGAME, NCAAFGAME,
+           e.g. NFLGAME-26OCT25LVLAR-LV. The outcome suffix there is a team, so
+           one event has several instruments. These sent no f in 20 minutes
+           (no status change).
+f layout : always exactly 55|48|326|60. Never 324 or 58 (confirms O3).
+Trades   : all-instrument trades use the SAME layout as per-instrument ones
+           (55/48 inside the entry, 268=1). The spec's all-instrument example
+           puts 55/48 at message level; the real feed does not.
+           159 of 174 trades were on sports markets. 2446: 89 Buy, 85 Sell.
+           No duplicate 278. Prices again 1-2 dp.
+Rejects  : real Y layout: 262|281|58, with no other fields.
+           - unknown symbol:   281=0  58=unknown symbol=<SYMBOL>
+           - unsubscribe of an MDReqID that is not active:
+                               281=0  58=no subscription for mdReqId=<ID>
+           An instrument closed/settled ~2 min earlier is already "unknown
+           symbol" (BTCD15M-BTC26OCT231115-0 at 11:17:16).
+           => Stage 3: drop a subscription once it is rejected, so we don't
+              send an unsubscribe for it.
+Not seen : L1 behaviour (Q8). The captured symbol had already closed, so it was
+           rejected. Whether a trade arrives twice under two overlapping
+           subscriptions is also still unknown.
+
+O7  Fourth capture: two sports books, L2 + L1 at once, 11:44:24-11:54:33Z
+-----------------------------------------------------------------------------
+Raw log  : docs/spec/capture-sandbox-20261023T1144.log
+           NFLGAME-26OCT26PHIDAL-PHI and NCAAFGAME-26OCT31STETDAY-STET, each
+           with book 264=10 AND book 264=1, trades and lifecycle, plus
+           all-instrument trades. 4 W, 126 X, no Y. The client sent no
+           Reject(3).
+Book     : the sports books are as thin as the crypto ones. Both snapshots were
+           empty (268=0). After that, one resting order at a time, alternating
+           YES/NO, each living ~15-16 s before deletion. This looks like a
+           sandbox quoting bot. No trade on either game in 10 min.
+           => Q7 (multi-level 1023), Q8 (L1 when the best price moves) and Q9
+              (crossed/locked) cannot be observed on the sandbox. The simulator
+              (Stage 2) must produce them.
+Two book subscriptions on one instrument (264=10 and 264=1): both accepted.
+           Every update is sent separately to each MDReqID: identical content
+           and TransactTime, consecutive MsgSeqNums. So data is delivered per
+           subscription; overlapping subscriptions produce duplicates.
+           Duplicate trades under overlapping subscriptions are likely for the
+           same reason, but not observed (no trades on the two games; 76
+           trades elsewhere arrived only under the all-instrument request).
+Unsubscribe: all 9 accepted silently (Q5 again).
+
+O8  Fifth capture: all-instrument volume/OI, 05:02:10-05:03:11Z (2026-10-26)
+-----------------------------------------------------------------------------
+Raw log  : docs/spec/capture-sandbox-20261026T0502-instruments.log
+           (md_client --list-instruments, i.e. 269=B,C with 146=0).
+           64 X, 0 W, no Y, j or Reject(3) either way.
+Supersedes O1 ("all-instrument volume/OI subscribe returns nothing") and the
+[WS] note under Q15 that OI and volume are "implementation pending".
+Observed : - The channel IS populated now: volume rose 74 -> 112 and OI moved
+             between 9 and 15 over the minute, about one X per instrument per
+             second.
+           - NO W snapshot is sent at all. The gateway answers the subscribe
+             with X updates only, although spec §4.2 (MD:213) says volume and
+             OI get a snapshot on subscribe. Layout:
+               262|268=2|279=0|269=B|55|48|271|279=0|269=C|55|48|271|60
+             i.e. 55/48 per entry, 279=0 (New) even for a running total.
+           - Two live instruments: ETHD15M-ETH26OCT260515-0 (48=2403386550
+             15600128) and BTCD15M-BTC26OCT260515-0 (48=240338655317590016).
+             Still the 15-minute series of O2.
+           - 271 arrives with no decimals ("74", "103"), consistent with O4.
+Effect   : (a) list_instruments collected symbols from W only, so it returned
+               "0 instrument(s)" after waiting out its 60 s timeout. Fixed
+               2026-10-26: discovery now takes symbols from the volume/OI X
+               updates as well as W, and its wait settles when no NEW
+               instrument has appeared for `quiet` rather than when traffic
+               goes quiet (the updates never stop).
+           (b) Decoding was verified against live traffic: all 64 messages,
+               128 events, zero decode errors.
+           (c) TransactTime(60) was being required on W/X/f. The spec marks it
+               N in all three tables (MD:311, MD:364, MD:782), so it is now
+               optional: absent leaves the event time at the epoch, and only a
+               malformed value is an error.
+Not shown: still nothing on multi-level L2 books (Q7), L1 behaviour (Q8) or a
+           crossed book (Q9): this capture used no book channel.
+
+O9  Sixth capture: L2 + L1 book and trades, 05:33:03-05:37:04Z (2026-10-26)
+-----------------------------------------------------------------------------
+Raw log  : docs/spec/capture-sandbox-20261026T0533.log
+           BTCD15M-BTC26OCT260545-0 (48=240346204372729859), one 4-minute
+           window, five subscriptions at once: book L2 (264=10, 262=book-1),
+           book L1 (264=1, 262=book-2), per-instrument trades, per-instrument
+           lifecycle, all-instrument trades.
+           2 W, 1480 X, 0 f, no Y, j or Reject(3) either way.
+           Decoded: 2 snapshots, 1050 book updates, 430 trades, 0 decode errors.
+Settles  : Q7 (1023 = position after the change) and Q8 (L1 pattern). See both.
+Books    : This is the first capture with real depth. The L2 snapshot came back
+           yes[0.5x5 0.49x6 0.48x2] no[0.48x3 0.47x2 0.46x3 0.45x1], best-first
+           on both sides, and the L1 snapshot the top of each: yes[0.5x5]
+           no[0.48x3].
+Replayed : the capture was replayed through the book rules of design §8:
+             1023 == position after the change        969 / 969
+             279=0 at a price already in the book       0
+             279=1 at a price not in the book          0
+             delete of a price not in the book         0
+             delete carrying 1023 or a non-zero 271    0
+             more than 10 levels on a side             0
+             crossed or locked (top sum >= 1.000)      0  (max 0.990)
+           So: deltas are absolute, deletes are clean, depth is capped, and
+           269=0/269=1 are both bids whose tops sum to just under 1.000.
+Q9       : still not exercised; see Q9.
+Lifecycle: no f in the window (the instrument rolls at :45, the capture ended
+           at :37), so the O4/O6 lifecycle sequence is still the only evidence.
+
+O10 Seventh capture: a 15-minute window closing, 06:07:33-06:27:50Z (2026-10-26)
+-----------------------------------------------------------------------------
+Raw log  : docs/spec/capture-sandbox-20261026T0607-roll.log
+           BTCD15M-BTC26OCT260615-0 (48=240353754824572928) with book L2
+           (book-1) AND book L1 (book-2), per-instrument trades and lifecycle,
+           plus all-instrument trades and lifecycle. 20 minutes across the
+           06:15 boundary. 2 W, 3502 X, 13 f, no Y, j or Reject(3) either way.
+           Zero decode errors, zero book anomalies, zero warnings.
+Roll     : the full sequence, matching O3/O4/O6:
+             06:15:00.183  last ordinary book update
+             06:15:00.18x  279=2 deletes of every resting level (268=3 and
+                           268=2 messages, i.e. several levels per message)
+             06:15:00.2465 326=18 Closed
+             06:15:00.2711 the LAST delete (so the clearing straddles Closed;
+                           O3 saw it entirely after)
+             06:15:00.4216 326=27 Determined
+             06:15:00.6058 BTCD15M-BTC26OCT260630-0 326=21 Listed
+             06:15:00.8521 the successor 326=17 Open
+             06:16:00.1397 326=28 Settled (~60 s after Determined)
+Book     : the book ended EXACTLY empty after 1325 updates, 1330 level changes
+           and 1159 MDPriceLevel(1023) checks, with no mismatch and no delete
+           of a missing price. Every delete named a price the book held, so the
+           book never drifted over 12.5 minutes of continuous L2 traffic. This
+           is the strongest end-to-end check of the Stage 4 book so far.
+NEW      : OVERLAPPING SUBSCRIPTIONS DUPLICATE LIFECYCLE TOO, not just book
+           updates. O6 and O7 left this open. With a per-instrument AND an
+           all-instrument lifecycle request, the old symbol's Closed,
+           Determined and Settled each arrived twice (34=2626/2627,
+           2631/2632, 2708/2709) with identical 326 and TransactTime.
+           SecurityStatus(f) has no MDEntryID, so the dedup key is
+           (Symbol, 326, TransactTime).
+           The successor arrived once per event, because the per-instrument
+           request named the OLD symbol: delivery really is per subscription.
+           Trades behaved the same way: 252 for the old symbol of which 252
+           were duplicates (per-instrument + all-instrument), against 448 for
+           the successor with none.
+Effect   : MarketState now counts an identical consecutive transition as
+           duplicate_status_events instead of recording it again. Q14's
+           "record every transition, reject none" is unchanged for real ones;
+           the same 326 at the same TransactTime is the same event.
+Stage 5  : two inputs for recovery design.
+           (a) SILENCE IS PER SUBSCRIPTION, NOT PER SESSION. book-1 went
+               silent at 06:15:00.406 and stayed silent for 12.5 minutes while
+               the session was perfectly healthy: 10 TestRequests answered, 50
+               heartbeats sent, and the other channels kept delivering. A
+               session-level staleness check would never have fired.
+           (b) A SETTLED INSTRUMENT IS SUPPOSED TO GO SILENT. Resubscribing it
+               would be answered with 281=0 unknown symbol (O6), so the stale
+               feed detector must consult lifecycle state and recover only
+               instruments that are still Open.
+Session  : the 30 s TestRequest race of O3/Q17 is still there: 10 in 20 min,
+           all answered. The unsubscribes of the settled symbol's four
+           subscriptions, sent at 06:27:50 (11 min after Settled), drew no Y
+           and no reply at all (Q5 again).
+
+=============================================================================
+F. STAGE 5 QUESTIONS (raised 2026-10-26, answers pending)
+=============================================================================
+Each will be built to its proposal unless you say otherwise, and the proposal
+is recorded here so the choice is visible later.
+
+Q24 Gap recovery: resubscribe, or reconnect the session?
+-----------------------------------------------------------------------------
+Question : A MsgSeqNum gap means market data was lost. Does recovery tear the
+           session down and log on again, or keep it and resubscribe?
+Spec ref : PDF p.97, MD:82     ResendRequest/SequenceReset listed, behaviour
+                               not described.
+           PDF p.41 [WS]       "If you detect a gap, you should unsubscribe
+                               and resubscribe" (no reconnect mentioned).
+           Q12 (DECIDED)       "On a gap: reconnect with 141=Y, resubscribe."
+           [OBS O10]           the session stayed healthy for 20 minutes while
+                               one subscription was silent: session health and
+                               data health are independent.
+Proposal : Resubscribe on the live session for a gap; reconnect only when the
+           session itself drops. A gap fill resolves the sequence, so the
+           session is fine and only the data is missing. This narrows Q12,
+           which is a decision of yours rather than anything the spec says.
+Status   : RESOLVED 2026-10-26 - NEITHER. A gap stops the strategy, and
+           stopping the strategy stops the feed. No automatic recovery: the
+           client detects the gap, marks the affected books invalid, reports a
+           terminal halt and stops the session. This supersedes Q12's
+           "reconnect with 141=Y, resubscribe" and the original Stage 5
+           instruction to rebuild from a fresh snapshot.
+
+Q25 Default stale-feed threshold
+-----------------------------------------------------------------------------
+Question : How long must a subscription be silent before it is rebuilt?
+Spec ref : Not in the spec.
+           [OBS O3/O4]  sandbox quotes live 15-16 s, so a thin book is
+                        genuinely quiet for that long.
+           [OBS O10]    a settled instrument is silent forever, by design.
+Proposal : 30 s, configurable with --stale-secs. Below ~20 s a thin book would
+           false-positive.
+Status   : RESOLVED 2026-10-26 - a stale feed stops the strategy, so the
+           threshold default of 30 s was confirmed 2026-10-26 ("go with
+           defaults"), overridable with --stale-secs.
+           Originally:
+           threshold is a halt trigger rather than a recovery trigger. The
+           30 s default and --stale-secs stand unless you say otherwise.
+           CONSEQUENCE: the detector MUST exclude instruments that are
+           Closed, Determined or Settled. Those are silent by design [OBS
+           O10], so a detector that ignored lifecycle state would halt the
+           strategy at every 15-minute window roll.
+
+Q26 Does recovery follow a rolled window's successor?
+-----------------------------------------------------------------------------
+Question : When a 15-minute window closes, the successor is announced on the
+           lifecycle feed (O6/O10). Should the supervisor subscribe the
+           successor's book automatically?
+Spec ref : Not in the spec. [OBS O6] new windows arrive as 326=21 then 326=17.
+Proposal : No. Recovery repairs the subscriptions you asked for; deciding what
+           to follow is strategy policy, and belongs above the market data
+           library.
+Status   : ADOPTED 2026-10-26 - "go with defaults". Nothing follows a
+           successor; the lifecycle feed still reports it (O6/O10) so a
+           strategy can.
+
+Q27 Which reject codes are retryable?
+-----------------------------------------------------------------------------
+Question : A resubscribe can be rejected. Which 281 codes should stop us
+           retrying that symbol?
+Spec ref : PDF p.111 (281 codes); [OBS O6] a settled instrument is already
+           "281=0 unknown symbol" about 2 minutes after it settles.
+Proposal : 281=0 (unknown symbol) drops the symbol permanently: it is gone,
+           not broken. 281=1 (duplicate MDReqID) retries once with a fresh id.
+           281=4/5/8/9 are client bugs, so they are logged and the
+           subscription is abandoned rather than retried in a loop.
+Status   : RESOLVED 2026-10-26 - NONE are retried. Any reject (Y or j) stops
+           the strategy, whatever the code. No taxonomy is needed.
+           NOTE: a subscribe sent within ~2 minutes of a window closing is
+           answered 281=0 unknown symbol [OBS O6], so under this rule a
+           mistimed subscribe at a window boundary halts the strategy. See
+           Q29.
+
+Q28 Does a disconnect also stop the strategy?
+-----------------------------------------------------------------------------
+Question : Q24/Q25/Q27 cover gaps, stale feeds and rejects. A TCP disconnect
+           or a server Logout is a fourth case. QuickFIX reconnects on its own
+           every ReconnectInterval (30 s) and re-sends a signed Logon, so
+           unless the initiator is actively stopped the session comes back up
+           WITHOUT any subscriptions (Q22) and therefore with no data.
+Spec ref : PDF p.41 [WS]  "If your connection drops, you must reconnect,
+                           re-authenticate, and resubscribe".
+Proposal : Treat it like a gap: halt. A disconnect means data was missed, and
+           a silently re-established session with no subscriptions is worse
+           than a stopped one. The halt stops the initiator so QuickFIX cannot
+           quietly log back on.
+Status   : ADOPTED 2026-10-26 - "go with defaults". Implemented, with one
+           consequence found while building it: the owner's own stop() causes
+           a logout, which arrives as a Disconnect on the session's thread. A
+           halt is therefore never delivered after FeedMonitor::stop(), or it
+           re-enters the halt handler there and deadlocks. See design.md §15.
+
+Q29 A reject on the very first subscribe
+-----------------------------------------------------------------------------
+Question : Should a reject while subscriptions are still being established be
+           treated differently from one that arrives mid-run? Starting a
+           strategy seconds before a window rolls would halt it immediately
+           with 281=0, before it ever had data.
+Spec ref : [OBS O6] a settled instrument is "unknown symbol" ~2 min after it
+           settles.
+Proposal : No difference: halt either way, since a strategy that cannot
+           subscribe what it was told to subscribe should not run. The
+           operator restarts it with a live symbol.
+Status   : ADOPTED 2026-10-26 - "go with defaults". A subscribe within ~2 min
+           of a window closing halts the run with 281=0; restart with a live
+           symbol (md_client --list-instruments names them).

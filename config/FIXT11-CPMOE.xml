@@ -1,0 +1,209 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  CPM FIX Order Entry gateway (TargetCompID=CPMOE) - session/transport dictionary.
+  Source: docs/spec/fix-order-entry.txt "Connection & Session", "Authentication",
+  "Standard Header & Trailer". See docs/design-oms.md.
+
+  Standard FIXT.1.1, with three CPM changes on Logon(A):
+    - the HMAC signature in Text(58) (or RawData(96)), not a standard Logon field;
+    - ReceiveSettlementReports(20127), the per-session MarketSettlementReport opt-in;
+    - CancelOrdersOnDisconnect(8013), the per-session cancel-on-disconnect scope.
+  Password(554) and DefaultApplVerID(1137) are required on our Logon per the spec;
+  Password is optional here because a server Logon ack need not carry it, and this
+  dictionary validates both directions.
+  PossResend(97) matters on this session: replayed events (EventResendRequest F3)
+  carry 97=Y with a fresh MsgSeqNum, and are NOT PossDupFlag(43) gap fills.
+  NextExpectedMsgSeqNum(789) is defined because the spec declares it, and noted
+  there as accepted but inert.
+-->
+<fix type="FIXT" major="1" minor="1" servicepack="0">
+  <header>
+    <field name="BeginString" required="Y"/>
+    <field name="BodyLength" required="Y"/>
+    <field name="MsgType" required="Y"/>
+    <field name="ApplVerID" required="N"/>
+    <field name="CstmApplVerID" required="N"/>
+    <field name="ApplExtID" required="N"/>
+    <field name="SenderCompID" required="Y"/>
+    <field name="TargetCompID" required="Y"/>
+    <field name="OnBehalfOfCompID" required="N"/>
+    <field name="DeliverToCompID" required="N"/>
+    <field name="SecureDataLen" required="N"/>
+    <field name="SecureData" required="N"/>
+    <field name="MsgSeqNum" required="Y"/>
+    <field name="SenderSubID" required="N"/>
+    <field name="SenderLocationID" required="N"/>
+    <field name="TargetSubID" required="N"/>
+    <field name="TargetLocationID" required="N"/>
+    <field name="OnBehalfOfSubID" required="N"/>
+    <field name="OnBehalfOfLocationID" required="N"/>
+    <field name="DeliverToSubID" required="N"/>
+    <field name="DeliverToLocationID" required="N"/>
+    <field name="PossDupFlag" required="N"/>
+    <field name="PossResend" required="N"/>
+    <field name="SendingTime" required="Y"/>
+    <field name="OrigSendingTime" required="N"/>
+    <field name="LastMsgSeqNumProcessed" required="N"/>
+  </header>
+  <messages>
+    <message name="Heartbeat" msgtype="0" msgcat="admin">
+      <field name="TestReqID" required="N"/>
+    </message>
+    <message name="TestRequest" msgtype="1" msgcat="admin">
+      <field name="TestReqID" required="Y"/>
+    </message>
+    <message name="ResendRequest" msgtype="2" msgcat="admin">
+      <field name="BeginSeqNo" required="Y"/>
+      <field name="EndSeqNo" required="Y"/>
+    </message>
+    <message name="Reject" msgtype="3" msgcat="admin">
+      <field name="RefSeqNum" required="Y"/>
+      <field name="RefTagID" required="N"/>
+      <field name="RefMsgType" required="N"/>
+      <field name="SessionRejectReason" required="N"/>
+      <field name="Text" required="N"/>
+    </message>
+    <message name="SequenceReset" msgtype="4" msgcat="admin">
+      <field name="GapFillFlag" required="N"/>
+      <field name="NewSeqNo" required="Y"/>
+    </message>
+    <message name="Logout" msgtype="5" msgcat="admin">
+      <field name="Text" required="N"/>
+    </message>
+    <message name="Logon" msgtype="A" msgcat="admin">
+      <field name="EncryptMethod" required="Y"/>
+      <field name="HeartBtInt" required="Y"/>
+      <field name="RawDataLength" required="N"/>
+      <field name="RawData" required="N"/>
+      <field name="ResetSeqNumFlag" required="N"/>
+      <field name="NextExpectedMsgSeqNum" required="N"/>
+      <field name="TestMessageIndicator" required="N"/>
+      <field name="Username" required="N"/>
+      <!-- Required on our Logon (spec §3) but absent from the server's Logon ack [OBS],
+           and this dictionary validates both directions. logon_auth always sets it. -->
+      <field name="Password" required="N"/>
+      <field name="DefaultApplVerID" required="Y"/>
+      <!-- CPM: HMAC-SHA256 signature, base64 (44 chars). Not standard on Logon.
+           Required if RawData(96) is absent, and takes precedence over it. -->
+      <field name="Text" required="N"/>
+      <!-- CPM: Y to receive MarketSettlementReport(UMS) pushes. Default N. -->
+      <field name="ReceiveSettlementReports" required="N"/>
+      <!-- CPM: cancel-on-disconnect scope, fixed for the life of the session. -->
+      <field name="CancelOrdersOnDisconnect" required="N"/>
+    </message>
+  </messages>
+  <trailer>
+    <field name="SignatureLength" required="N"/>
+    <field name="Signature" required="N"/>
+    <field name="CheckSum" required="Y"/>
+  </trailer>
+  <components/>
+  <fields>
+    <field number="7" name="BeginSeqNo" type="SEQNUM"/>
+    <field number="8" name="BeginString" type="STRING"/>
+    <field number="9" name="BodyLength" type="LENGTH"/>
+    <field number="10" name="CheckSum" type="STRING"/>
+    <field number="16" name="EndSeqNo" type="SEQNUM"/>
+    <field number="34" name="MsgSeqNum" type="SEQNUM"/>
+    <field number="35" name="MsgType" type="STRING">
+      <value enum="0" description="HEARTBEAT"/>
+      <value enum="1" description="TEST_REQUEST"/>
+      <value enum="2" description="RESEND_REQUEST"/>
+      <value enum="3" description="REJECT"/>
+      <value enum="4" description="SEQUENCE_RESET"/>
+      <value enum="5" description="LOGOUT"/>
+      <value enum="A" description="LOGON"/>
+      <!-- Client -> server -->
+      <value enum="D" description="NEW_ORDER_SINGLE"/>
+      <value enum="F" description="ORDER_CANCEL_REQUEST"/>
+      <value enum="q" description="ORDER_MASS_CANCEL_REQUEST"/>
+      <value enum="F1" description="LAST_EXEC_ID_REQUEST"/>
+      <value enum="F3" description="EVENT_RESEND_REQUEST"/>
+      <!-- Server -> client -->
+      <value enum="8" description="EXECUTION_REPORT"/>
+      <value enum="9" description="ORDER_CANCEL_REJECT"/>
+      <value enum="r" description="ORDER_MASS_CANCEL_REPORT"/>
+      <value enum="UMS" description="MARKET_SETTLEMENT_REPORT"/>
+      <value enum="F2" description="LAST_EXEC_ID"/>
+      <value enum="F4" description="EVENT_RESEND_COMPLETE"/>
+      <value enum="F5" description="EVENT_RESEND_REJECT"/>
+      <value enum="j" description="BUSINESS_MESSAGE_REJECT"/>
+    </field>
+    <field number="36" name="NewSeqNo" type="SEQNUM"/>
+    <field number="43" name="PossDupFlag" type="BOOLEAN"/>
+    <field number="45" name="RefSeqNum" type="SEQNUM"/>
+    <field number="49" name="SenderCompID" type="STRING"/>
+    <field number="50" name="SenderSubID" type="STRING"/>
+    <field number="52" name="SendingTime" type="UTCTIMESTAMP"/>
+    <field number="56" name="TargetCompID" type="STRING"/>
+    <field number="57" name="TargetSubID" type="STRING"/>
+    <field number="58" name="Text" type="STRING"/>
+    <field number="89" name="Signature" type="DATA"/>
+    <field number="90" name="SecureDataLen" type="LENGTH"/>
+    <field number="91" name="SecureData" type="DATA"/>
+    <field number="93" name="SignatureLength" type="LENGTH"/>
+    <field number="95" name="RawDataLength" type="LENGTH"/>
+    <field number="96" name="RawData" type="DATA"/>
+    <field number="97" name="PossResend" type="BOOLEAN"/>
+    <field number="98" name="EncryptMethod" type="INT">
+      <value enum="0" description="NONE"/>
+    </field>
+    <field number="108" name="HeartBtInt" type="INT"/>
+    <field number="112" name="TestReqID" type="STRING"/>
+    <field number="115" name="OnBehalfOfCompID" type="STRING"/>
+    <field number="122" name="OrigSendingTime" type="UTCTIMESTAMP"/>
+    <field number="123" name="GapFillFlag" type="BOOLEAN"/>
+    <field number="128" name="DeliverToCompID" type="STRING"/>
+    <field number="129" name="DeliverToSubID" type="STRING"/>
+    <field number="141" name="ResetSeqNumFlag" type="BOOLEAN"/>
+    <field number="142" name="SenderLocationID" type="STRING"/>
+    <field number="143" name="TargetLocationID" type="STRING"/>
+    <field number="144" name="OnBehalfOfLocationID" type="STRING"/>
+    <field number="145" name="DeliverToLocationID" type="STRING"/>
+    <field number="116" name="OnBehalfOfSubID" type="STRING"/>
+    <field number="369" name="LastMsgSeqNumProcessed" type="SEQNUM"/>
+    <field number="371" name="RefTagID" type="INT"/>
+    <field number="372" name="RefMsgType" type="STRING"/>
+    <field number="373" name="SessionRejectReason" type="INT">
+      <value enum="0" description="INVALID_TAG_NUMBER"/>
+      <value enum="1" description="REQUIRED_TAG_MISSING"/>
+      <value enum="2" description="TAG_NOT_DEFINED_FOR_THIS_MESSAGE_TYPE"/>
+      <value enum="3" description="UNDEFINED_TAG"/>
+      <value enum="4" description="TAG_SPECIFIED_WITHOUT_A_VALUE"/>
+      <value enum="5" description="VALUE_IS_INCORRECT"/>
+      <value enum="6" description="INCORRECT_DATA_FORMAT_FOR_VALUE"/>
+      <value enum="7" description="DECRYPTION_PROBLEM"/>
+      <value enum="8" description="SIGNATURE_PROBLEM"/>
+      <value enum="9" description="COMPID_PROBLEM"/>
+      <value enum="10" description="SENDINGTIME_ACCURACY_PROBLEM"/>
+      <value enum="11" description="INVALID_MSGTYPE"/>
+      <value enum="12" description="XML_VALIDATION_ERROR"/>
+      <value enum="13" description="TAG_APPEARS_MORE_THAN_ONCE"/>
+      <value enum="14" description="TAG_SPECIFIED_OUT_OF_REQUIRED_ORDER"/>
+      <value enum="15" description="REPEATING_GROUP_FIELDS_OUT_OF_ORDER"/>
+      <value enum="16" description="INCORRECT_NUMINGROUP_COUNT_FOR_REPEATING_GROUP"/>
+      <value enum="17" description="NON_DATA_VALUE_INCLUDES_FIELD_DELIMITER"/>
+      <value enum="18" description="INVALID_UNSUPPORTED_APPLICATION_VERSION"/>
+      <value enum="99" description="OTHER"/>
+    </field>
+    <field number="464" name="TestMessageIndicator" type="BOOLEAN"/>
+    <field number="553" name="Username" type="STRING"/>
+    <field number="554" name="Password" type="STRING"/>
+    <field number="789" name="NextExpectedMsgSeqNum" type="SEQNUM"/>
+    <!-- CPM extensions on Logon -->
+    <field number="8013" name="CancelOrdersOnDisconnect" type="CHAR">
+      <value enum="N" description="NO_CANCEL"/>
+      <value enum="Y" description="CANCEL_FOR_SESSION"/>
+      <value enum="A" description="CANCEL_FOR_API_KEY"/>
+    </field>
+    <field number="20127" name="ReceiveSettlementReports" type="BOOLEAN"/>
+    <field number="1128" name="ApplVerID" type="STRING">
+      <value enum="9" description="FIX50SP2"/>
+    </field>
+    <field number="1129" name="CstmApplVerID" type="STRING"/>
+    <field number="1137" name="DefaultApplVerID" type="STRING">
+      <value enum="9" description="FIX50SP2"/>
+    </field>
+    <field number="1156" name="ApplExtID" type="INT"/>
+  </fields>
+</fix>

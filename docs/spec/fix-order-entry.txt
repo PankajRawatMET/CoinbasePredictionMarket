@@ -1,0 +1,1487 @@
+FIX Order Entry
+FIX Order-Entry API Reference
+FIX 5.0 SP2
+
+
+
+
+Table of Contents
+Overview
+
+   -​   Introduction
+   -​   Implementation Status
+   -​   Connection & Session
+   -​   Authentication
+   -​   Standard Header & Trailer
+   -​   Price & Quantity Scaling
+   -​   Identifier handling
+
+Client → Server
+
+   -​   NewOrderSingle (D)
+   -​   OrderCancelRequest (F)
+   -​   OrderMassCancelRequest (q)
+   -​   LastExecIDRequest (F1)
+   -​   EventResendRequest (F3)
+
+Server → Client
+
+   -​   ExecutionReport (8)
+   -​   OrderCancelReject (9)
+   -​   OrderMassCancelReport (r)
+   -​   MarketSettlementReport (UMS)
+   -​   LastExecID (F2)
+   -​   EventResendComplete (F4)
+   -​   EventResendReject (F5)
+   -​   BusinessMessageReject (j)
+
+Concepts
+
+   -​   Max Execution Cost
+   -​   Self-Match Prevention
+   -​   Cancel on Disconnect
+      -​   Event Resend
+      -​   Message Examples
+
+
+
+
+  Introduction
+  The Coinbase Prediction Markets (CPM) FIX order-entry gateway implements FIX 5.0 SP2
+  (FIXT 1.1) for order submission, cancellation, and execution reporting on binary-outcome
+  prediction markets.
+
+
+
+
+  Implementation Status
+  What the order-entry gateway does today versus what is defined in the dictionary but not yet
+  active. Per-message detail is in the sections that follow.
+
+
+  Supported today
+Capability                                        Notes
+
+Session layer — A, 5, 0, 1, 2, 3, 4               Includes ResendRequest(2) gap fill.
+
+Order entry — D, F, q                             New order, single cancel, mass cancel.
+
+Reports — 8, 9, r, UMS, j                         Execution, cancel reject, mass-cancel report,
+                                                  settlement report, business reject.
+
+Event replay — F1, F2, F3, F4, F5                 ExecID-keyed replay of recent events; see
+                                                  retention.
+
+MaxExecutionCost(21009)                           FOK-only all-in spend cap.
+
+Post-only — ExecInst(18) 6 / A                    Slide and reject modes.
+
+Self-match prevention — 7928 / 8000               Firm-level and id-based paths.
+
+ManualOrderIndicator(1028)                        Required on D and F; echoed on reports.
+
+Settlement reports —                              Per-session opt-in at Logon.
+ReceiveSettlementReports(20127)
+  Capability                                           Notes
+
+  Sub-account routing — Parties with                   Required on D; lazily created on first use.
+  PartyRole=24
+
+  Cancel-on-disconnect —                               Per-session opt-in at Logon (N/Y/A). On a
+  CancelOrdersOnDisconnect(8013)                       genuine session drop the user's resting orders
+                                                       are canceled per scope. See Cancel on
+                                                       Disconnect.
+
+  Logon credential validation — API-key HMAC           The API key in SenderCompID(49) +
+                                                       Password passphrase + HMAC-SHA256
+                                                       signature are all verified; the API key must
+                                                       resolve to an ACTIVE trading user with the
+                                                       TRADE permission. See Authentication.
+
+
+       Interim — works, but not the final contract
+Item                                 Today                               Planned
+
+Event Resend retention               Up to 24 hours, not guaranteed.     A longer retention window.
+                                                                         Treat the current 24 hours as a
+                                                                         present limit, not a contract —
+                                                                         see Event Resend.
+
+
+       Accepted but inert
+       Declared in the dictionary, so sending them is not an error — but nothing reads them and they
+       have no effect. Treat their behavior as undefined rather than as a feature to depend on.
+
+
+  Tag                                                  Consequence
+
+  NextExpectedMsgSeqNum(789)                           Ignored. Use ResendRequest(2) to fill a
+                                                       sequence gap.
+
+  RequestTime(5979)                                    Ignored.
+
+  TestReqID(112) on                                    Intentionally ignored — a structural
+  LastExecIDRequest(F1)                                placeholder, not a feature, since F1 has no
+                                                       parameters. Correlate with RefSeqNum(45) on
+                                                       the LastExecID(F2) response.
+                  Not supported
+                Message                                           Notes
+
+                OrderCancelReplaceRequest(G)                      No amend — cancel and re-submit.
+
+                OrderStatusRequest(H)                             Use EventResendRequest(F3) to recover
+                                                                  missed events.
+
+                Quote / RFQ — R, S, AH, AI, AJ                    Continuous CLOB only; no quote negotiation.
+
+
+                  An unrecognized application MsgType(35) is answered with BusinessMessageReject(j),
+                  Text(58)="unsupported message type".
+
+
+                  Defined but never emitted
+                  Your FIX engine should be able to parse these dictionary values, but the exchange does not
+                  currently emit them.
+
+
+Field                          Value                              Name                               Why not emitted
+
+ExecType(150)                  5                                  Replaced                           No order amend — see Not
+                                                                                                     supported.
+
+ExecType(150)                  6                                  Pending Cancel                     Cancels are applied without a
+                                                                                                     pending state.
+
+OrdStatus(39)                  6                                  Pending Cancel                     As above.
+
+CxlRejResponseTo(434)          2                                  Order Cancel/Replace Request       No order amend, so a cancel
+                                                                                                     reject only ever answers
+                                                                                                     OrderCancelRequest(F).
+
+MassCancelResponse(531)        1                                  Cancel Orders for a Security       An accepted mass cancel always
+                                                                                                     reports 7 (Cancel All Orders)
+                                                                                                     regardless of the scope
+                                                                                                     requested.
+
+
+                        ℹ️ Scope of this list. "Planned" covers only the Event Resend retention window.
+                        Nothing else in Accepted but inert or Not supported should be read as a roadmap
+                        commitment — those entries record present behavior, not intent.
+  Connection & Session
+Property                                           Value
+
+Protocol                                           FIX 5.0 SP2 (FIXT 1.1)
+
+Transport                                          TCP
+
+Default Port                                       6110
+
+TargetCompID (56)                                  CPMOE
+
+BeginString (8)                                    FIXT.1.1
+
+DefaultApplVerID (1137)                            9 (FIX50SP2)
+
+SendingTime precision                              Microseconds, inbound and outbound
+
+Heartbeat interval                                 Default 10 seconds; client-specified via
+                                                   HeartBtInt(108), capped at 300 seconds
+
+SendingTime tolerance                              60 seconds, two-sided — a client clock ahead of
+                                                   the server also rejects
+
+Logon throttle                                     One Logon attempt per 100 ms
+
+
+  Each FIX session maps 1-to-1 to a registered trading user. The user is resolved from
+  SenderCompID(49), which is the API key. There is no separate API-key field in the Logon
+  body.
+
+  A second Logon for the same user disconnects the first session with Logout(5),
+  Text(58)="replaced by newer connection".
+
+           ⚠️ Sequence Numbers Send ResetSeqNumFlag=Y on Logon to reset sequence
+           numbers. Sequence numbers are not guaranteed to persist across a reconnect.
+
+
+
+
+  Authentication (Logon 35=A)
+  Send a FIX Logon message to establish a session. The gateway validates credentials and
+  responds with a Logon ack or Logout.
+Tag     Name                                  Type                                Req                         Description
+
+35      MsgType                               CHAR                                Y                           A
+
+98      EncryptMethod                         INT                                 Y                           0 = No encryption
+
+108     HeartBtInt                            INT                                 Y                           Heartbeat interval in seconds.
+                                                                                                              Recommended: 30
+
+141     ResetSeqNumFlag                       BOOLEAN                             N                           Y to reset sequence numbers on
+                                                                                                              connect
+
+1137    DefaultApplVerID                      STRING                              Y                           9 (FIX50SP2)
+
+554     Password                              STRING                              Y                           API key passphrase. Must be
+                                                                                                              non-empty. No fallback carrier.
+
+58      Text                                  STRING                              C                           HMAC signature. Required if
+                                                                                                              RawData(96) is absent; takes
+                                                                                                              precedence when both are
+                                                                                                              present. Must be non-empty.
+
+96      RawData                               STRING                              C                           Compatibility carrier for the
+                                                                                                              signature. Required if Text(58)
+                                                                                                              is absent.
+
+20127   ReceiveSettlementReports              BOOLEAN                             N                           Set Y to receive
+                                                                                                              MarketSettlementReport (UMS)
+                                                                                                              push messages when markets
+                                                                                                              settle. Default: N.
+
+
+               Req legend: Y = required, N = optional, C = conditional
+
+               The API key is carried in the standard header field SenderCompID(49) (see Standard
+               Header), not in a Logon-body field.
+
+               Credential validation. Every Logon is fully authenticated before the session is established:
+
+                  1.​ SenderCompID(49) must resolve to a known API key.
+                  2.​ Password(554) must be non-empty and match the API key's stored passphrase.
+                  3.​ The signature in Text(58) (or RawData(96)) must be a valid HMAC-SHA256 over the
+                      signature payload — a 44-character Base64 encoding of a 32-byte digest — and must
+                      verify against the API key's secret in constant time.
+          4.​ SendingTime(52) must be within the ±30-second signature window (see below).
+          5.​ The resolved trading user must be ACTIVE and carry the TRADE permission, and its
+              firm/FCM scope must resolve.
+
+       Any failure rejects the Logon (the gateway responds with Logout(5) and closes the
+       connection); a bad passphrase, an incorrect or malformed signature, an unknown/disabled key,
+       a missing TRADE permission, and a stale SendingTime are all rejected.
+
+            ⚠️ Send real credentials. Password(554) must be your actual API key
+            passphrase and Text(58) / RawData(96) a correctly computed HMAC-SHA256
+            signature. Placeholder or dummy values are rejected.
+
+       Signature payload
+       The signature is an HMAC-SHA256 over four values concatenated with no separators,
+       encoded UTF-8:
+
+
+         None
+         payload = SendingTime + ApiKey + TargetCompID + Password
+
+
+
+
+Part                                 Source                             Notes
+
+SendingTime                          Logon SendingTime(52)              Re-encoded at millisecond
+                                                                        precision:
+                                                                        yyyyMMdd-HH:mm:ss.SSS,
+                                                                        exactly 21 characters. Not the
+                                                                        microsecond form used
+                                                                        elsewhere on the session.
+
+ApiKey                               SenderCompID(49)                   The API key.
+
+TargetCompID                         TargetCompID(56)                   CPMOE.
+
+Password                             Password(554)                      The passphrase, plaintext.
+
+
+       Sign it and place the result in Text(58) (preferred) or RawData(96):
+
+       Clock window. Signature validation applies its own ±30 second tolerance on SendingTime,
+       rejecting outside it as an invalid signature. This is a separate, tighter check than the
+       session-level SendingTime tolerance in Connection & Session — a Logon can satisfy the
+       session guard and still fail the signature guard.
+                               Standard Header & Trailer
+                               All application messages must include the following header fields.
+
+
+Tag                     Name                                  Type                                  Req                        Description
+
+8                       BeginString                           STRING                                Y                          FIXT.1.1
+
+9                       BodyLength                            LENGTH                                Y                          Length of message body in bytes
+                                                                                                                               (auto-calculated)
+
+35                      MsgType                               STRING                                Y                          Message type identifier
+
+49                      SenderCompID                          STRING                                Y                          The client's API key. Used for
+                                                                                                                               credential lookup at Logon — see
+                                                                                                                               Authentication.
+
+56                      TargetCompID                          STRING                                Y                          CPMOE
+
+34                      MsgSeqNum                             SEQNUM                                Y                          Monotonically increasing
+                                                                                                                               sequence number, starting at 1
+
+52                      SendingTime                           UTCTIMESTAMP                          Y                          UTC timestamp of message send
+                                                                                                                               (e.g.
+                                                                                                                               20240101-12:00:00.000000)
+
+10                      CheckSum                              STRING                                Y                          3-digit checksum
+                                                                                                                               (auto-calculated, trailer field)
+
+
+
+
+                               Price & Quantity Encoding
+                               All numeric fields are ordinary FIX decimal values on the wire, not scaled integers. Send
+                               and parse them as PRICE / QTY / AMT decimals.
+
+
+      Field Type                            Decimal Places                      Example on the wire            Notes
+
+      Price (44, 31, 6, 730)                3                                   44=0.650 → $0.650              Range: 0.001–0.999
+                                                                                                               (probability in USDC)
+Field Type                           Decimal Places                       Example on the wire                 Notes
+
+Quantity (38, 32, 14, 151, 21054,    2                                    38=1.00 → 1.00 contract             Minimum increment: 0.01
+21055)                                                                                                        contract
+
+Amount (137, 21009, 21056)           6                                    137=0.049500 → $0.0495              Fees, spend caps, payouts
+                                                                          USDC
+
+
+                      Parse decimals tolerantly. Do not match a fixed field width — the number of decimal places
+                      present on the wire may be fewer than the maximum above. Excess precision is truncated
+                      toward zero, not rejected: 44=0.6505 is accepted and becomes 0.650. Range validation is
+                      applied after truncation.
+
+                               💡  Prediction Market Prices Prices represent probabilities in USDC. A YES
+                               contract at 0.650 means the market implies a ~65% probability. YES price + NO
+                               price = 1.000.
+
+
+
+
+                      Identifier handling
+                      ExecID(17), OrderID(37), MassActionReportID(1369) and
+                      MarketSettlementReportID(20105) are all FIX STRING fields. Each value is the base-10
+                      text form of a 64-bit integer — ASCII digits only, with no decimal point, sign, or separators.
+                      Despite looking numeric, treat them as opaque strings:
+
+                          -​    Do not parse into a 32-bit integer. These values grow with exchange activity and will
+                                exceed the range of a signed 32-bit type. If you must hold them numerically, use a 64-bit
+                                type.
+                          -​    Compare for equality as strings. Echo them back byte-for-byte — for example
+                                OrderID(37) on OrderCancelRequest(35=F), or an ExecID as an
+                                EventResendRequest(35=F3) bound.
+                          -​    Ordering is only meaningful for ExecID and the two report IDs, which share one
+                                increasing number space. Compare them numerically with a 64-bit type when you need
+                                ordering; do not assume consecutive values, since the space is not contiguous.
+                          -​    Do not derive meaning from the digits. The internal composition is not part of the
+                                contract and may change.
+
+                      These are not FIX PRICE or QTY values: there is no scale, no fractional part, and no rounding.
+                      Contrast Price & Quantity Encoding, which does use decimal values.
+
+                      0 appears as a sentinel where no identifier exists — see the individual field descriptions.
+             Client → Server Messages
+
+             NewOrderSingle (35=D) — CLIENT → SERVER
+             Submit a new limit or market order. Validation failures detectable on receipt are answered
+             immediately with BusinessMessageReject(j); everything else is answered with an
+             ExecutionReport(8).
+
+
+Tag   Name                                  Type                                Req                       Description
+
+11    ClOrdID                               STRING                              Y                         Unique client order ID, up to 16
+                                                                                                          ASCII characters. Must be
+                                                                                                          unique among the user's live
+                                                                                                          orders. Over-length is rejected
+                                                                                                          with
+                                                                                                          BusinessMessageReject(j).
+                                                                                                          See the character-set note below.
+
+55    Symbol                                STRING                              Y                         Instrument ticker (e.g.
+                                                                                                          NFL-GAMEWINNER-26NOV28LA
+                                                                                                          RSF-LAR). Must match a listed
+                                                                                                          instrument exactly.
+
+54    Side                                  CHAR                                Y                         1=Buy, 2=Sell. Both refer to the
+                                                                                                          YES contract — see Side
+                                                                                                          semantics below.
+
+38    OrderQty                              QTY                                 Y                         Order quantity in contracts, 2
+                                                                                                          decimal places (e.g. 1.00).
+
+44    Price                                 PRICE                               C                         Limit price, 3 decimal places (e.g.
+                                                                                                          0.650). Range 0.001–0.999.
+                                                                                                          Required for
+                                                                                                          OrdType(40)=LIMIT(2); must
+                                                                                                          be omitted for
+                                                                                                          OrdType(40)=MARKET(1).
+                                                                                                          Either mismatch is rejected.
+Tag     Name                          Type                Req   Description
+
+40      OrdType                       CHAR                Y     1=Market, 2=Limit. Market orders
+                                                                are assigned the worst
+                                                                admissible price and forced IOC.
+
+59      TimeInForce                   CHAR                N     1=GTC (default), 3=IOC, 4=FOK
+
+18      ExecInst                      MULTIPLECHARVALUE   N     Post-only mode: 6=Post-only
+                                                                slide (adjust price to avoid cross),
+                                                                A=Post-only reject (reject if would
+                                                                cross). Space-delimited
+                                                                multi-value; if both are set, reject
+                                                                mode wins.
+
+21009   MaxExecutionCost              AMT                 N     All-in spend cap in USDC, 6
+                                                                decimal places. FOK only and
+                                                                must be positive. See Max
+                                                                Execution Cost.
+
+7928    SelfMatchPreventionId         INT                 N     SMP group ID. Must match the
+                                                                SMP ID registered for this user.
+                                                                Order is rejected if it mismatches.
+
+8000    SelfMatchPreventionStrategy   CHAR                N     N=Cancel Aggressing, O=Cancel
+                                                                Resting, Q=Cancel Both. See
+                                                                Self-Match Prevention.
+
+1028    ManualOrderIndicator          BOOLEAN             Y     CFTC Rule 1.35 audit flag.
+                                                                Y=manually entered,
+                                                                N=automated/algorithmic.
+
+453     NoPartyIDs                    NUMINGROUP          Y     Parties repeating group.
+                                                                Required — must carry the
+                                                                sub-account.
+
+→ 448   PartyID                       STRING              N     Sub-account identifier. ≤18 chars:
+                                                                any printable ASCII
+                                                                (0x20–0x7E). 19–20:
+                                                                alphanumeric and - only. 21–31:
+                                                                lowercase hex (0-9, a-f) with
+                                                                no leading 0 — uppercase is
+                                                                rejected. Or exactly 36 chars for
+Tag     Name                                Type                               Req                          Description
+
+                                                                                                            a lowercase canonical UUID
+                                                                                                            (variant 2). Lengths 32–35 and
+                                                                                                            >36 are invalid. Off-charset or
+                                                                                                            over-length is rejected with
+                                                                                                            BusinessMessageReject(j),
+                                                                                                            Text(58)="invalid
+                                                                                                            PartyID" — the value is
+                                                                                                            rejected, never silently
+                                                                                                            truncated or corrupted.
+
+→ 452   PartyRole                           INT                                N                            24=CustomerAccount. Exactly
+                                                                                                            one entry with
+                                                                                                            PartyRole(452)=CUSTOMER_
+                                                                                                            ACCOUNT(24) is required; other
+                                                                                                            roles are ignored on inbound
+                                                                                                            orders.
+
+
+              Side semantics. The FIX gateway accepts only 1=Buy and 2=Sell, and both are expressed
+              against the YES contract — Side(54)=SELL(2) is sell YES, not buy NO. There is no NO-side
+              order entry on FIX; convert client-side: BUY_NO at P ≡ SELL YES at 1.000 − P.
+
+              Missing Parties. An order without a PartyRole(452)=CUSTOMER_ACCOUNT(24) entry, or
+              with an empty PartyID, is rejected with BusinessMessageReject(j),
+              Text(58)="INVALID_SUBACCOUNT: Parties with PartyRole=24
+              (CUSTOMER_ACCOUNT) is required". Sub-accounts are created lazily on first use, so an
+              unrecognized sub-account string is not itself an error.
+
+              ClOrdID character set. Use printable ASCII only. The limit is 16 bytes, which for ASCII is
+              exactly 16 characters. Non-ASCII is not supported: such a value is either rejected or
+              round-tripped back to you altered, and it consumes more than one byte per character against
+              the limit. Do not send multi-byte characters in this field.
+
+              OrdType Values
+
+
+          Code                                                Description
+
+          1                                                   Market — forced to worst admissible price
+                                                              (BUY→$0.999, SELL→$0.001), converted to
+                                                              IOC. Price(44) must not be sent.
+Code                                              Description
+
+2                                                 Limit — Price(44) is required.
+
+
+    OrdType(40) and Price(44) must agree. Both mismatches are rejected synchronously with
+    a BusinessMessageReject(j) carrying Text(58)="INVALID_FIELD_VALUE: ..."; no
+    ExecutionReport(8) follows.
+
+
+Request                                           Result
+
+OrdType(40)=LIMIT(2) with no Price(44)            Rejected — Price(44) is required for a limit
+                                                  order
+
+OrdType(40)=MARKET(1) with Price(44)              Rejected — a market order takes no price
+set
+
+
+    Market orders and post-only are mutually exclusive. A market order is aggressive by
+    construction, so post-only can never be satisfied. A market order carrying
+    ExecInst(18)=POST_ONLY(6) or POST_ONLY_REJECT(A) is rejected with
+    Text(58)="POST_ONLY_WOULD_CROSS" and
+    OrdRejReason(103)=UNSUPPORTED_ORDER_CHARACTERISTIC(11). The rejection arrives
+    synchronously as a BusinessMessageReject(j) — the request alone is enough to detect
+    the conflict, so it is rejected before reaching the matching engine and no
+    ExecutionReport(8) follows.
+
+    TimeInForce Values
+
+
+Code                                              Description
+
+1                                                 Good Till Cancel (GTC) — rests on book until
+                                                  filled or canceled
+
+3                                                 Immediate or Cancel (IOC) — fills what it can,
+                                                  cancels remainder
+
+4                                                 Fill or Kill (FOK) — must fill completely or
+                                                  canceled entirely
+              OrderCancelRequest (35=F) — CLIENT → SERVER
+              Cancel an open order by ClOrdID or exchange-assigned OrderID. Either OrigClOrdID or
+              OrderID must be provided.
+
+
+Tag    Name                                  Type                                Req                             Description
+
+11     ClOrdID                               STRING                              Y                               Unique ID for this cancel request
+                                                                                                                 (new value, not the original).
+
+41     OrigClOrdID                           STRING                              N                               ClOrdID of the order to cancel.
+                                                                                                                 Either this or OrderID required.
+
+37     OrderID                               STRING                              N                               Exchange-assigned OrderID,
+                                                                                                                 echoed verbatim from the
+                                                                                                                 ExecutionReport. Either this
+                                                                                                                 or OrigClOrdID is required;
+                                                                                                                 OrderID takes precedence if
+                                                                                                                 both are sent.
+
+55     Symbol                                STRING                              Y                               Market symbol of the order to
+                                                                                                                 cancel.
+
+54     Side                                  CHAR                                Y                               1=Buy, 2=Sell
+
+1028   ManualOrderIndicator                  BOOLEAN                             Y                               CFTC Rule 1.35 audit flag for this
+                                                                                                                 cancel action.
+
+
+              On success: ExecutionReport(8) with ExecType=4 (Canceled). On failure:
+              OrderCancelReject(9).
+
+              A cancel is always answered exactly once. You may cancel an order by OrigClOrdID(41)
+              even before you have received an ExecutionReport carrying its OrderID(37) — the
+              exchange resolves the order by the ClOrdID you assigned. Each OrderCancelRequest(F)
+              is answered by exactly one of:
+
+                 -​   ExecutionReport(8) with ExecType(150)=CANCELED(4) — the order, or any
+                      quantity still open, was canceled. You may first receive ExecutionReports for fills that
+                      occurred before the cancel took effect.
+                 -​   OrderCancelReject(9) — the cancel could not be applied; see OrderCancelReject
+                      for CxlRejReason(102). A second cancel for an order whose cancel is already in
+                      progress is rejected with ORDER_ALREADY_PENDING_CANCEL(3).
+             OrderMassCancelRequest (35=q) — CLIENT → SERVER
+             Cancel multiple open orders in a single request. Optionally filter by symbol and side.
+
+
+Tag   Name                                  Type                                 Req                           Description
+
+11    ClOrdID                               STRING                               Y                             Unique ID for this mass cancel
+                                                                                                               request.
+
+530   MassCancelRequestType                 CHAR                                 Y                             1=Cancel Orders for a Security
+                                                                                                               (requires Symbol), 6=Cancel
+                                                                                                               Orders for a Trading Session,
+                                                                                                               7=Cancel All Orders. Any other
+                                                                                                               value is rejected on receipt.
+
+55    Symbol                                STRING                               C                             Market symbol. Required when
+                                                                                                               MassCancelRequestType=1.
+
+54    Side                                  CHAR                                 N                             Optional side filter: 1=Buy,
+                                                                                                               2=Sell. If omitted, cancels both
+                                                                                                               sides.
+
+453   NoPartyIDs                            NUMINGROUP                           N                             Optional sub-account filter.
+
+
+             MassCancelRequestType(530)=CANCEL_ORDERS_FOR_A_TRADING_SESSION(6) and
+             MassCancelRequestType(530)=CANCEL_ALL_ORDERS(7) behave identically — neither
+             narrows by instrument. Your session is identified by your API key, and an API key has one
+             active session, so "this session's orders" and "all my orders" are the same set. Filters (type,
+             Side, sub-account) AND together.
+
+             Mass cancel covers resting orders, orders held by an instrument's speed bump, and orders you
+             have submitted but not yet received an ExecutionReport for. Cancel requests are exempt
+             from the session rate throttle.
+
+             Response: OrderMassCancelReport(r). Each canceled order also generates an individual
+             ExecutionReport(8) with ExecType=4, Text(58)="USER_MASS_CANCEL", emitted before the
+             summary report.
+            LastExecIDRequest (35=F1) — CLIENT → SERVER
+            Ask for the newest ExecID the exchange holds for this trading user. Use it to detect whether
+            you are behind — not as the replay start position; see LastExecID.
+
+
+Tag     Name                              Type                                Req                          Description
+
+112     TestReqID                         STRING                              N                            Intentionally ignored.
+                                                                                                           LastExecIDRequest carries no
+                                                                                                           request parameters; this field is
+                                                                                                           declared only because FIX
+                                                                                                           dictionary tooling requires every
+                                                                                                           message to define at least one
+                                                                                                           field. The exchange deliberately
+                                                                                                           does not read it, and
+                                                                                                           LastExecID(F2) has no field to
+                                                                                                           echo it into — this is by design,
+                                                                                                           not an omission. Send it or omit
+                                                                                                           it; either way it has no effect.
+                                                                                                           Correlate the response using
+                                                                                                           RefSeqNum(45) on F2, which
+                                                                                                           carries this request's
+                                                                                                           MsgSeqNum.
+
+
+
+
+            EventResendRequest (35=F3) — CLIENT → SERVER
+            Request replay of past outbound execution events by ExecID range. See Event Resend for
+            details on retention and behavior.
+
+
+Tag     Name                              Type                                Req                          Description
+
+22003   BeginExecId                       STRING                              Y                            First ExecID to replay (inclusive).
+                                                                                                           Need not match a stored event
+                                                                                                           exactly — see "everything since
+                                                                                                           X" semantics.
+
+22004   EndExecId                         STRING                              N                            Last ExecID to replay (inclusive).
+                                                                                                           Omit to replay from BeginExecId
+                                                                                                           to the latest stored event.
+ Response: the replayed messages in ascending ExecID order, then
+ EventResendComplete(F4) or EventResendReject(F5). See Event Resend for which
+ message types are replayable.
+
+
+
+
+ Server → Client Messages
+
+ ExecutionReport (35=8) — SERVER → CLIENT
+ Primary order lifecycle event. The ExecType(150) field identifies what triggered this report.
+
+ ExecType Values
+
+
+Code                                               Description
+
+A — PendingNew                                     Order accepted but held for the instrument's
+                                                   configured speed-bump delay, so not yet
+                                                   matchable. Only on instruments with a speed
+                                                   bump; a further report follows on release.
+
+0 — New                                            Order accepted, resting on book
+
+4 — Canceled                                       Order canceled (user request, mass cancel,
+                                                   SMP, admin, instrument lifecycle, or
+                                                   cancel-on-disconnect)
+
+8 — Rejected                                       Order rejected by the exchange
+
+F — Trade                                          Partial or full fill
+
+C — Expired                                        See below — has two distinct causes
+
+
+       ⚠️ ExecType(150)=EXPIRED(C) has two causes
+            1.​ An IOC remainder. An IOC order fills what it can and its unfilled remainder
+               is canceled with reason TIME_IN_FORCE, terminating as
+               ExecType(150)=EXPIRED(C) / OrdStatus(39)=EXPIRED(C) — and
+               not ExecType(150)=CANCELED(4). See the exception below.
+            2.​ An FOK that cannot fill. FOK is all-or-nothing and never leaves a remainder
+                — the exchange checks whether the whole quantity is available before
+                matching anything. If it is not, nothing executes and the order terminates as
+                         ExecType(150)=EXPIRED(C) / OrdStatus(39)=EXPIRED(C) with
+                         Text(58)="FOK_NOT_FILLED".
+
+                  Exception — a cancel you asked for reports Canceled, not Expired. Cancelling
+                  an order you have not yet received an ExecutionReport for looks the same as
+                  cancelling any working order: you receive the fills (if any) that occurred before the
+                  cancel took effect, then an ExecType(150)=CANCELED(4) report for the unfilled
+                  quantity — not EXPIRED(C), because that quantity went away at your request
+                  rather than through natural time-in-force expiry.
+
+                  Every other rejection, including MAX_EXECUTION_COST_EXCEEDED, reports
+                  ExecType(150)=REJECTED(8) / OrdStatus(39)=REJECTED(8).
+
+
+Tag   Name                                 Type                                 Req                       Description
+
+11    ClOrdID                              STRING                               Y                         Client order ID from the triggering
+                                                                                                          request.
+
+41    OrigClOrdID                          STRING                               N                         Original ClOrdID for cancel
+                                                                                                          responses.
+
+37    OrderID                              STRING                               Y                         Exchange-assigned order ID,
+                                                                                                          integer text (e.g. 1001) — see
+                                                                                                          Identifier handling. Echo verbatim
+                                                                                                          on OrderCancelRequest.
+
+17    ExecID                               STRING                               Y                         Unique execution ID for this
+                                                                                                          report, integer text — see
+                                                                                                          Identifier handling. Monotonically
+                                                                                                          increasing; the replay handle for
+                                                                                                          F1/F3.
+
+150   ExecType                             CHAR                                 Y                         See ExecType values above.
+
+39    OrdStatus                            CHAR                                 Y                         0=New, 1=PartiallyFilled,
+                                                                                                          2=Filled, 4=Canceled,
+                                                                                                          8=Rejected, A=PendingNew,
+                                                                                                          C=Expired
+
+55    Symbol                               STRING                               Y                         Market symbol.
+
+54    Side                                 CHAR                                 Y                         1=Buy, 2=Sell
+Tag    Name                   Type                Req   Description
+
+38     OrderQty               QTY                 N     Original order quantity.
+
+44     Price                  PRICE               N     Order limit price.
+
+151    LeavesQty              QTY                 Y     Remaining open quantity after
+                                                        this execution. 0 = fully filled or
+                                                        closed.
+
+14     CumQty                 QTY                 Y     Total cumulative filled quantity.
+
+6      AvgPx                  PRICE               N     Volume-weighted average fill
+                                                        price. Omitted on a cancel/expire
+                                                        of an order that had fills — use
+                                                        the AvgPx from the final trade
+                                                        report instead.
+
+32     LastQty                QTY                 N     Fill quantity of this specific
+                                                        execution. Present when
+                                                        ExecType=F.
+
+31     LastPx                 PRICE               N     Fill price of this specific
+                                                        execution. Present when
+                                                        ExecType=F.
+
+880    TrdMatchID             STRING              N     Exchange trade match ID.
+                                                        Present when ExecType=F.
+
+1057   AggressorIndicator     BOOLEAN             N     Y=aggressor (taker), N=passive
+                                                        (maker). Present when
+                                                        ExecType=F.
+
+59     TimeInForce            CHAR                N     Effective time in force.
+
+18     ExecInst               MULTIPLECHARVALUE   N     Echoed post-only mode. Omitted
+                                                        when neither post-only bit is set.
+
+40     OrdType                CHAR                N     1=Market, 2=Limit — reflects the
+                                                        original order intent, preserved
+                                                        for the order's life.
+
+1028   ManualOrderIndicator   BOOLEAN             Y     Echoed audit flag. On a cancel
+                                                        this is the original order's flag,
+                                                        not the cancel request's.
+Tag     Name                    Type           Req   Description
+
+60      TransactTime            UTCTIMESTAMP   Y     Exchange event timestamp,
+                                                     microsecond precision.
+                                                     Preserved exactly on replayed
+                                                     messages.
+
+378     ExecRestatementReason   INT            N     Present on unsolicited cancels
+                                                     where a FIX value exists:
+                                                     7=SMP, 105=Admin cancel,
+                                                     2=Instrument lifecycle
+                                                     (closed/determined/paused),
+                                                     1=Cancel on Disconnect.
+                                                     Omitted for time-in-force expiries
+                                                     and mass cancels.
+
+103     OrdRejReason            INT            N     Rejection reason code. Present
+                                                     on
+                                                     ExecType(150)=REJECTED(8
+                                                     ) only; never on an Expired or
+                                                     Canceled report.
+
+58      Text                    STRING         N     On rejects: a reason label,
+                                                     optionally followed by - and a
+                                                     detail — see OrdRejReason(103)
+                                                     mapping. On cancels/expiries:
+                                                     the cancel reason label (e.g.
+                                                     TIME_IN_FORCE,
+                                                     USER_REQUEST,
+                                                     USER_MASS_CANCEL).
+
+136     NoMiscFees              NUMINGROUP     N     Fee repeating group, exactly one
+                                                     entry. Present when ExecType=F.
+
+→ 137   MiscFeeAmt              AMT            N     Fee in USDC, 6 decimal places.
+                                                     Positive=fee, negative=maker
+                                                     rebate.
+
+→ 138   MiscFeeCurr             CURRENCY       N     USDC
+
+→ 139   MiscFeeType             INT            N     4=Exchange fees
+
+453     NoPartyIDs              NUMINGROUP     N     Always 5 entries — see below.
+      Parties group on ExecutionReport. Not an echo of the inbound group; it is populated by the
+      exchange and always contains 5 entries in this fixed order. Any value that cannot be resolved is
+      emitted as unknown.
+
+
+    PartyRole (452)                                     PartyID (448)
+
+    4 — ClearingFirm                                    FCM code
+
+    1 — ExecutingFirm                                   Trading firm code
+
+    24 — CustomerAccount                                Sub-account string
+
+    11 — OrderOriginationTrader                         Trading user name
+
+    55 — SessionID                                      API key
+
+
+      SelfMatchPreventionId(7928) and SelfMatchPreventionStrategy(8000) are
+      echoed on ExecutionReport(35=8), and the two behave differently. 7928 is exactly what
+      you sent — omitted if you sent nothing, so 7928=0 always means a real id of 0 rather than
+      "absent". 8000 is the strategy the exchange will apply to the order, which is the one you
+      sent if you sent one, otherwise the default configured on your API key or your firm. So an order
+      that carried no SMP tags at all can still come back with 8000 set — your configured default —
+      and no 7928. That combination is normal: firm-level self-match prevention keys on firm and
+      sub-account and needs no id.
+
+      Neither tag reports which strategy fired on a particular match. MaxExecutionCost(21009) is
+      not echoed.
+
+      Symbol(55) emits the sentinel deleted_instrument if the instrument is no longer available
+      — for example when it was removed after the order was placed. The order identifiers and status
+      on the report remain valid.
+
+      OrdRejReason(103) mapping
+      Tag 103 carries FIX-standard values. It is the field to branch on, together with
+      OrdStatus(39). Text(58) accompanies every rejection with a specific reason label — more
+      granular than tag 103, since several distinct conditions share one FIX value — and is intended
+      for logging and human diagnosis rather than control flow.
+
+
+103                                  Meaning                                Text(58) labels you may see
+
+1                                    Unknown symbol                         INVALID_INSTRUMENT
+103   Meaning                            Text(58) labels you may see
+
+3     Order exceeds limit                MAX_ORDER_SIZE_EXCEEDED,
+                                         MAX_ACTIVE_ORDERS_EXCEED
+                                         ED,
+                                         MAX_EXECUTION_COST_EXCEE
+                                         DED
+
+6     Duplicate order                    DUPLICATE_CLIENT_ORDER_I
+                                         D
+
+11    Unsupported order characteristic   INVALID_TIME_IN_FORCE,
+                                         POST_ONLY_WOULD_CROSS
+
+13    Incorrect quantity                 INVALID_QUANTITY
+
+15    Unknown account                    INVALID_SUBACCOUNT
+
+16    Price exceeds band                 INVALID_PRICE
+
+18    Invalid price increment            INVALID_PRICE_TICK
+
+25    Insufficient credit limit          INSUFFICIENT_BALANCE
+
+41    Exceeded position limit            POSITION_LIMIT_EXCEEDED,
+                                         POSITION_LIMIT_PER_INSTR
+                                         UMENT_EXCEEDED
+
+42    Invalid client                     INVALID_USER
+
+43    Client permission error            USER_TRADING_LOCKED
+
+44    Not allowed by market state        INSTRUMENT_NOT_ACTIVE
+
+48    Reduce only                        REDUCE_ONLY_VIOLATION
+
+99    Other — the catch-all; read        SELF_MATCH_PREVENTION,
+      Text(58)                           SPEED_BUMP_QUEUE_FULL,
+                                         INVALID_FIELD_VALUE, and
+                                         any label not listed above
+
+n/a   An FOK that cannot fill does not   FOK_NOT_FILLED
+      reject — it terminates as
+      103                                 Meaning                            Text(58) labels you may see
+
+                                          ExecType(150)/OrdStatus(3
+                                          9) = EXPIRED(C), so no 103 is
+                                          carried
+
+
+                  ⚠️ Do not treat Text(58) labels as a stable contract. New labels may be
+                  introduced without notice, and existing ones may be re-mapped to a different 103
+                  value. Handle 99 and any unrecognised label as a generic rejection. The stable
+                  signals are OrdStatus(39) and OrdRejReason(103).
+
+
+
+
+            OrderCancelReject (35=9) — SERVER → CLIENT
+            Sent when an OrderCancelRequest(F) cannot be processed.
+
+
+Tag   Name                                Type                               Req                           Description
+
+11    ClOrdID                             STRING                             Y                             ClOrdID from the cancel request.
+
+41    OrigClOrdID                         STRING                             N                             OrigClOrdID from the cancel
+                                                                                                           request.
+
+37    OrderID                             STRING                             N                             Exchange-assigned OrderID, or
+                                                                                                           the sentinel 0 when the order is
+                                                                                                           unknown.
+
+39    OrdStatus                           CHAR                               Y                             Always U = Undefined. The reject
+                                                                                                           carries no order state.
+
+102   CxlRejReason                        INT                                N                             1=UNKNOWN_ORDER (order
+                                                                                                           not in the active set),
+                                                                                                           0=TOO_LATE_TO_CANCEL
+                                                                                                           (order already fully filled),
+                                                                                                           3=ORDER_ALREADY_PENDIN
+                                                                                                           G_CANCEL (a cancel for this
+                                                                                                           order is already pending).
+
+434   CxlRejResponseTo                    CHAR                               Y                             Always 1 = Response to
+                                                                                                           OrderCancelRequest
+Tag    Name                              Type                              Req                     Description
+
+58     Text                              STRING                            Y                       The cancel-reject reason name:
+                                                                                                   UNKNOWN_ORDER,
+                                                                                                   ORDER_ALREADY_FILLED, or
+                                                                                                   CANCEL_ALREADY_PENDING.
+
+
+
+
+                 ⚠️ CxlRejReason(102) distinguishes the common failure causes, but
+                 UNKNOWN_ORDER still covers more than one. An order that was already fully
+                 filled rejects with TOO_LATE_TO_CANCEL(0); a cancel that arrives while a cancel
+                 for the same order is already pending rejects with
+                 ORDER_ALREADY_PENDING_CANCEL(3). An order that was already canceled or
+                 that never existed both report UNKNOWN_ORDER(1) — to tell those two apart,
+                 correlate against the ExecutionReports you have already received for that
+                 ClOrdID (a prior Canceled/Expired report means it had already terminated).
+
+
+
+
+              OrderMassCancelReport (35=r) — SERVER → CLIENT
+Tag    Name                              Type                              Req                     Description
+
+11     ClOrdID                           STRING                            Y                       ClOrdID from the mass cancel
+                                                                                                   request.
+
+1369   MassActionReportID                STRING                            Y                       Exchange-assigned report ID,
+                                                                                                   integer text in the same number
+                                                                                                   space as ExecID — see
+                                                                                                   Identifier handling. 0 when the
+                                                                                                   request was rejected on receipt.
+
+530    MassCancelRequestType             CHAR                              Y                       Echoes the scope you requested
+                                                                                                   — 1, 6 or 7. 6 and 7 are
+                                                                                                   equivalent, so an echoed 6 does
+                                                                                                   not mean a narrower cancel ran.
+
+531    MassCancelResponse                CHAR                              Y                       7=Succeeded, 0=Rejected. No
+                                                                                                   other value is emitted.
+Tag     Name                                Type                              Req                            Description
+
+532     MassCancelRejectReason              INT                               N                              Present when
+                                                                                                             MassCancelResponse(531)=
+                                                                                                             Rejected(0). 0=Mass cancel
+                                                                                                             not supported, 1=Invalid or
+                                                                                                             unknown security, 99=Other.
+
+533     TotalAffectedOrders                 INT                               N                              Number of orders canceled.
+                                                                                                             Forced to 0 on a reject.
+
+60      TransactTime                        UTCTIMESTAMP                      Y                              Exchange event timestamp,
+                                                                                                             microsecond precision.
+
+58      Text                                STRING                            N                              Human-readable reason. Present
+                                                                                                             on rejects only.
+
+
+               MassCancelRequestType(530) echoes the scope you asked for, and
+               MassCancelResponse(531) is only a success/reject flag — neither reports what actually ran.
+               A request can narrow by type, side and sub-account at once, and no single FIX response code
+               can express that, so TotalAffectedOrders(533) is the authoritative signal for what was
+               canceled. Requests rejected on receipt are not available for F3 replay.
+
+
+
+
+               MarketSettlementReport (35=UMS) — SERVER → CLIENT
+               Pushed per (firm, instrument) when an instrument settles. Only sent if
+               ReceiveSettlementReports=Y was included on Logon(A). Delivered to every connected
+               session belonging to the firm, so multiple sessions receive the same
+               MarketSettlementReportID.
+
+
+Tag     Name                                Type                              Req                            Description
+
+20105   MarketSettlementReportID            STRING                            Y                              Unique report ID, integer text in
+                                                                                                             the same number space as
+                                                                                                             ExecID, so it can be echoed as
+                                                                                                             an EventResendRequest(F3)
+                                                                                                             bound — see Identifier handling.
+
+55      Symbol                              STRING                            Y                              Settled instrument ticker.
+Tag     Name                      Type         Req   Description
+
+453     NoPartyIDs                NUMINGROUP   Y     2 entries:
+                                                     PartyRole(452)=CLEARING_
+                                                     FIRM(4) (FCM code), then
+                                                     PartyRole(452)=EXECUTING
+                                                     _FIRM(1) (firm code).
+
+21052   SettlementOutcome         CHAR         Y     Y=YES wins, N=NO wins,
+                                                     S=Scalar (settled strictly between
+                                                     0 and 1).
+
+730     SettlementPrice           PRICE        Y     Settlement price, 3 decimal
+                                                     places. 1.000 for YES, 0.000
+                                                     for NO, anything in between for
+                                                     scalar.
+
+21053   PositionAggregationMode   CHAR         Y     N=Net, G=Gross — the firm's
+                                                     configured position aggregation
+                                                     mode.
+
+21054   LongQty                   QTY          Y     Long contracts held immediately
+                                                     before settlement, 2 decimal
+                                                     places. See the
+                                                     aggregation-mode note below.
+
+21055   ShortQty                  QTY          Y     Short contracts held immediately
+                                                     before settlement, 2 decimal
+                                                     places. See the
+                                                     aggregation-mode note below.
+
+21056   PayoutAmount              AMT          Y     Gross settlement payout on the
+                                                     closing position for this (firm,
+                                                     instrument) in USDC, 6
+                                                     decimal places.
+                                                     SettlementPrice ×
+                                                     LongQty + (1.000 −
+                                                     SettlementPrice) ×
+                                                     ShortQty — what the position
+                                                     pays out, independent of what
+                                                     you paid to open it. Never
+                                                     negative.
+Tag   Name                                  Type                                Req                       Description
+
+60    TransactTime                          UTCTIMESTAMP                        Y                         Exchange event timestamp of
+                                                                                                          this settlement — when the
+                                                                                                          exchange settled this (firm,
+                                                                                                          instrument).
+
+
+                💡 LongQty and ShortQty depend on the aggregation mode. Under
+                PositionAggregationMode(21053)=NET(N), opposing positions net out, so
+                at most one of LongQty / ShortQty is non-zero — you can read the pair as a
+                single signed net position. Under GROSS(G), opposing positions from different
+                sub-accounts are held as separate legs, so both can be non-zero at the same
+                time and each is collateralised independently. Handle both legs if your firm is
+                configured GROSS.
+
+                💡 PayoutAmount(21056) is gross, not profit. It is what the settled position
+                pays out, not what you gained or lost — it does not subtract what you paid to open
+                the position, and it is never negative. To get your P&L on the position, subtract your
+                own entry cost. The exchange does not publish a net or realized figure on this
+                message.
+
+                It is always consistent with the other fields on this report:
+
+
+             None
+             PayoutAmount = SettlementPrice × LongQty + (1.000 − SettlementPrice) × ShortQty
+                    21056   =         730          ×   21054   + (1.000 −       730       ) ×   21055
+
+
+
+          Settlement is reported at firm-instrument granularity; there is no per-sub-account breakdown.
+
+
+
+
+          LastExecID (35=F2) — SERVER → CLIENT
+          Response to LastExecIDRequest(F1).
+
+
+Tag   Name                                  Type                                Req                       Description
+
+45    RefSeqNum                             SEQNUM                              Y                         MsgSeqNum of the request being
+                                                                                                          answered.
+Tag     Name                      Type                         Req                              Description
+
+17      ExecID                    STRING                       Y                                The newest ExecID the
+                                                                                                exchange holds for this user, or
+                                                                                                the sentinel 0 if the retention
+                                                                                                window holds no events.
+                                                                                                Compare it against your own
+                                                                                                last-processed ExecID to detect
+                                                                                                a gap.
+
+
+
+
+               EventResendComplete (35=F4) — SERVER → CLIENT
+Tag     Name                      Type                         Req                              Description
+
+45      RefSeqNum                 SEQNUM                       Y                                MsgSeqNum of the request being
+                                                                                                answered.
+
+22005   ResentEventCount          INT                          Y                                Number of events replayed in this
+                                                                                                request.
+
+
+
+
+               EventResendReject (35=F5) — SERVER → CLIENT
+Tag     Name                      Type                         Req                              Description
+
+45      RefSeqNum                 SEQNUM                       Y                                MsgSeqNum of the request being
+                                                                                                answered.
+
+22006   EventResendRejectReason   INT                          Y                                See below.
+
+58      Text                      STRING                       N                                Human-readable description.
+
+
+          Code                                Description
+
+          1                                   BEGIN_EXEC_ID_TOO_SMALL: BeginExecId
+                                              predates the retention window, is malformed, or
+                                              the range overlaps no stored event
+
+          2                                   END_EXEC_ID_TOO_LARGE: EndExecId is
+                                              beyond the latest stored event
+        Code                                                 Description
+
+        3                                                    RESEND_ALREADY_IN_PROGRESS: A resend is
+                                                             already in progress for this user, or the queue is
+                                                             full
+
+        4                                                    TOO_MANY_RESEND_REQUESTS: Too many
+                                                             resend requests
+
+        5                                                    SERVER_ERROR: Server error, including a
+                                                             mid-stream delivery failure
+
+
+
+
+             BusinessMessageReject (35=j) — SERVER → CLIENT
+             Sent when a message is rejected at the application level (e.g. unknown message type,
+             validation failure not covered by a specific reject message).
+
+
+Tag   Name                                 Type                                Req                                Description
+
+45    RefSeqNum                            SEQNUM                              N                                  Sequence number of the rejected
+                                                                                                                  message.
+
+372   RefMsgType                           STRING                              Y                                  MsgType of the rejected
+                                                                                                                  message.
+
+379   BusinessRejectRefID                  STRING                              N                                  ClOrdID or other reference from
+                                                                                                                  the rejected message.
+
+380   BusinessRejectReason                 INT                                 Y                                  0=Other, 2=Unknown ID
+
+58    Text                                 STRING                              N                                  Human-readable rejection
+                                                                                                                  reason.
+
+
+
+
+             Max Execution Cost
+             MaxExecutionCost(21009) caps the aggressor's all-in spend — base notional plus taker
+             fee, excluding any counterparty maker rebate — for a single order.
+
+             It is FOK-only. The cap only has meaning under fill-or-nothing semantics, so:
+Condition                                          Result
+
+MaxExecutionCost(21009) present with               BusinessMessageReject(j),
+TimeInForce(59) ≠ FOK(4)                           Text(58)="INVALID_TIME_IN_FORCE:
+                                                   MaxExecutionCost(21009) requires
+                                                   TimeInForce(59)=FOK"
+
+MaxExecutionCost(21009) ≤ 0                        BusinessMessageReject(j),
+                                                   Text(58)="INVALID_FIELD_VALUE:
+                                                   MaxExecutionCost(21009) must be
+                                                   positive"
+
+Projected all-in cost exceeds the cap              ExecutionReport(8) — see below
+
+
+  Both conditions are detected on receipt, so they are answered immediately with
+  BusinessMessageReject(j) rather than an ExecutionReport.
+
+  Before matching, the exchange totals the cost of the fills the order would take — excluding any
+  quantity that self-match prevention would remove — and compares it against the cap. Nothing
+  executes if the cap is exceeded. On breach:
+
+
+Field                                              Value
+
+ExecType(150)                                      8 — Rejected
+
+OrdStatus(39)                                      8 — Rejected
+
+OrdRejReason(103)                                  3 — Order exceeds limit
+
+Text(58)                                           MAX_EXECUTION_COST_EXCEEDED -
+                                                   insufficient liquidity
+
+
+        ⚠️ A cap breach is REJECTED, not EXPIRED. Both outcomes come from the
+        same pre-match check, but they terminate differently: a breached cap gives
+        ExecType(150)/OrdStatus(39) = REJECTED(8) with
+        OrdRejReason(103)=ORDER_EXCEEDS_LIMIT(3), whereas insufficient liquidity
+        gives EXPIRED(C) and carries no 103. Handle both terminal statuses when
+        submitting FOK orders, and branch on OrdStatus(39) rather than the Text(58)
+        wording.
+    Self-Match Prevention
+    Self-Match Prevention (SMP) prevents a trading user from inadvertently trading against their
+    own open orders. SMP is opt-in and is configured at the user and firm level;
+
+            ℹ️ SMP ID Validation The SelfMatchPreventionId(7928) on an order must
+            match the SMP ID registered for the trading user. If the IDs differ, the order is
+            rejected with Text(58)="INVALID_FIELD_VALUE" and
+            OrdRejReason(103)=OTHER(99). Set SelfMatchPreventionId to NULL (omit the
+            field) to opt out of id-based SMP for a specific order.
+
+    SelfMatchPreventionStrategy (8000) Values
+
+
+Code                                                     Description
+
+N                                                        Cancel Aggressing — the incoming order is
+                                                         canceled; the resting order remains on book
+
+O                                                        Cancel Resting — the resting order is canceled;
+                                                         the aggressor continues matching remaining
+                                                         liquidity
+
+Q                                                        Cancel Both — both the aggressor and the
+                                                         matched resting order are canceled
+
+
+    Mode resolution. Two independent SMP paths exist:
+
+       -​    Firm-level: fires when the aggressor and resting order share both the same firm and the
+             same sub-account. Uses the firm's configured default mode. This path needs no SMP
+             tags on the order at all.
+       -​    ID-based: fires when both orders carry the same positive SelfMatchPreventionId.
+             Uses the aggressor's SelfMatchPreventionStrategy(8000) if present, and
+             defaults to O (Cancel Resting) when omitted.
+
+    An SMP cancel arrives as ExecutionReport(8) with ExecType(150)=CANCELED(4),
+    ExecRestatementReason(378)=CANCEL_SELF_MATCH_PREVENTION(7), and
+    Text(58)="SELF_MATCH_PREVENTION".
+    Cancel on Disconnect
+    Cancel-on-disconnect (COD) is opt-in per session via CancelOrdersOnDisconnect(8013)
+    on Logon(A). When the session drops, the exchange cancels the user's resting orders
+    according to the scope you selected.
+
+    Scope values (tag 8013)
+
+
+Code                               Name                                Effect on disconnect
+
+N                                  NO_CANCEL                           No cancellation — resting orders
+                                                                       survive the drop. This is also the
+                                                                       default when 8013 is absent.
+
+Y                                  CANCEL_FOR_SESSION                  Cancel the disconnecting
+                                                                       session's orders.
+
+A                                  CANCEL_FOR_API_KEY                  Cancel all of the API key's active
+                                                                       orders.
+
+
+    Behavior
+
+       -​   The scope is fixed at Logon and applies for the life of the session.
+       -​   Cancellation fires only on a genuine client disconnect. When a newer connection for
+            the same API key replaces this session (see Connection & Session), the API key is still
+            live, so no cancel-on-disconnect is triggered — the replaced session's orders remain.
+       -​   Each canceled order is reported as ExecutionReport(8) with
+            ExecType(150)=CANCELED(4), OrdStatus(39)=CANCELED(4),
+            ExecRestatementReason(378)=CANCEL_ON_DISCONNECT(1), and
+            Text(58)="CLIENT_DISCONNECT". Because the session that placed the orders has
+            disconnected, these reports are recoverable through Event Resend after reconnecting.
+
+    Send the scope you actually want on every Logon rather than relying on the default, and do not
+    send Y or A unless you intend cancel-on-disconnect.
+
+
+
+
+    Event Resend (F3)
+    The exchange retains recent outbound events per trading user. You can request replay of a
+    range by ExecID to recover missed messages without rebuilding state from scratch.
+Replayable message types: ExecutionReport(8), OrderCancelReject(9),
+OrderMassCancelReport(r), MarketSettlementReport(UMS).
+BusinessMessageReject(j) and mass-cancel rejects raised on receipt are not stored.
+
+Key Behaviors
+
+   -​   Replayed messages carry PossResend(97)=Y in the header. PossDupFlag(43) is
+        not set.
+   -​   TransactTime(60) is the original event timestamp, preserved exactly. Only the
+        session header (MsgSeqNum(34), SenderCompID(49), TargetCompID(56),
+        SendingTime(52)) is re-stamped. Use PossResend, not TransactTime, to
+        distinguish replayed from live events.
+   -​   Replayed messages do consume outbound FIX sequence numbers — they are new
+        messages with a fresh MsgSeqNum, not a FIX-session gap fill. That is precisely why
+        PossResend is used rather than PossDupFlag.
+   -​   Replay is sequential, in ascending ExecID order.
+   -​   "Everything since X" semantics — BeginExecId need not match a stored event
+        exactly. The request is rejected only when [BeginExecId, EndExecId] overlaps no
+        stored event.
+   -​   Only one resend at a time per user; a concurrent EventResendRequest(F3) is
+        rejected with
+        EventResendRejectReason(22006)=RESEND_ALREADY_IN_PROGRESS(3).
+   -​   A mid-stream delivery failure demotes the terminating EventResendComplete(F4) to
+        EventResendReject(F5) with reason 5 (Server Error).
+
+Retention. The current window is up to 24 hours, and is a present limit rather than a
+contract — it is expected to be extended in a future release. Today it is not guaranteed: the
+usable window can be shorter without notice, and history may be lost, after which F3 rejects
+with EventResendRejectReason(22006)=BEGIN_EXEC_ID_TOO_SMALL(1) until new
+events accumulate.
+
+Treat 24 hours as a ceiling, not an allowance. Anchor recovery on your last-processed ExecID
+and reconcile promptly after reconnecting rather than deferring replay, and do not rely on Event
+Resend as an audit or system-of-record facility.
+
+Session-level gap fill is separate. Standard FIX ResendRequest(2) retransmission is
+supported and is the correct tool for filling a MsgSeqNum gap. F3 replays business events by
+ExecID and does not fill sequence gaps.
+
+Typical Recovery Flow
+ None
+ # 1. After reconnect, ask how far the exchange has got
+ 35=F1    (LastExecIDRequest)
+
+
+ # 2. Server responds with the NEWEST ExecID it holds for you
+ 35=F2 45=7 17=150    (LastExecID)
+
+
+ # 3. You last processed 120, so 150 > 120 means you are behind.
+ #      Replay from YOUR bookmark.
+ #      Begin is a lower bound and need not match a stored event exactly.
+ 35=F3 22003=120    (EventResendRequest)
+
+
+ # 4. Server streams replayed ExecutionReports, then sends F4
+ 35=8 97=Y    (ExecutionReport — replayed, PossResend=Y)
+ 35=8 97=Y    (ExecutionReport — replayed, PossResend=Y)
+ 35=F4 45=9 22005=2    (EventResendComplete — 2 events replayed)
+
+
+
+
+Message Examples
+Raw FIX messages in tag=value| format (SOH character shown as |).
+
+
+Logon (35=A)
+ None
+ 8=FIXT.1.1|9=155|35=A|34=1|49=RO-BUY0|56=CPMOE|
+ 52=20240701-12:00:00.000000|98=0|108=30|141=Y|
+ 1137=9|20001=my-access-key|554=my-passphrase|58=my-signature|
+ 20127=N|10=042|
+
+
+
+NewOrderSingle — GTC Limit Buy (35=D)
+ None
+ 8=FIXT.1.1|9=210|35=D|34=2|49=RO-BUY0|56=CPMOE|
+ 52=20240701-12:00:01.000000|
+ 11=order-001|           # ClOrdID
+ 55=MKT-A|               # Symbol
+ 54=1|                   # Side = Buy
+ 38=1.00|                # OrderQty = 1.00 contract
+ 44=0.650|               # Price = $0.650
+ 40=2|                   # OrdType = Limit
+ 59=1|                  # TimeInForce = GTC
+ 1028=N|               # ManualOrderIndicator = automated
+ 453=1|448=my-subaccount|452=24|   # Parties: sub-account
+ 10=187|
+
+
+
+ExecutionReport — New (35=8, ExecType=0)
+ None
+ 8=FIXT.1.1|9=280|35=8|34=1|49=CPMOE|56=RO-BUY0|
+ 52=20240701-12:00:01.001500|
+ 11=order-001|          # ClOrdID (echoed)
+ 37=1001|               # OrderID (integer text)
+ 17=150|                # ExecID ((seqId << 1) | sideBit)
+ 150=0|                 # ExecType = New
+ 39=0|                  # OrdStatus = New
+ 55=MKT-A|54=1|38=1.00|44=0.650|
+ 40=2|59=1|
+ 151=1.00|14=0.00|6=0.000|   # LeavesQty=1.00, CumQty=0, AvgPx=0
+ 60=20240701-12:00:01.001200|1028=N|10=215|
+
+
+
+ExecutionReport — Trade Fill (35=8, ExecType=F)
+ None
+ 8=FIXT.1.1|9=350|35=8|34=2|49=CPMOE|56=RO-BUY0|
+ 52=20240701-12:01:00.005000|
+ 11=order-001|37=1001|17=181|
+ 150=F|                 # ExecType = Trade
+ 39=2|                  # OrdStatus = Filled
+ 55=MKT-A|54=1|
+ 32=1.00|31=0.650|      # LastQty=1.00, LastPx=$0.650
+ 151=0.00|14=1.00|6=0.650|   # LeavesQty=0, CumQty=1.00, AvgPx=$0.650
+ 880=3391027|1057=N|    # TrdMatchID, AggressorIndicator=passive (maker)
+ 136=1|137=-0.325000|138=USDC|139=4|   # Maker rebate $0.325 USDC, EXCHANGE_FEES
+ 60=20240701-12:01:00.004800|1028=N|10=093|
+
+
+
+OrderCancelRequest (35=F)
+ None
+ 8=FIXT.1.1|9=180|35=F|34=3|49=RO-BUY0|56=CPMOE|
+ 52=20240701-12:02:00.000000|
+ 11=cancel-001|         # New ClOrdID for this cancel request
+41=order-001|         # OrigClOrdID — original order to cancel
+55=MKT-A|54=1|1028=N|10=142|

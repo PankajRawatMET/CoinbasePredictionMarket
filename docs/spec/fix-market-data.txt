@@ -1,0 +1,835 @@
+FIX Market Data
+  FIX Market Data Gateway API Reference
+  FIX 5.0 SP2
+
+  The channel expressed trade, orderbook, open interest & trading volume, instrument_lifecycle in
+  FIX 5.0 SP2 message types.
+
+     -​    Session layer: FIXT.1.1
+     -​    Application layer: FIX 5.0 SP2 (DefaultApplVerID = 9)
+     -​    Baseline: FIX 5.0 SP2, with CPM-specific extensions in the 20000+ / U-prefixed / F1–F5
+           ranges.
+
+
+
+
+  1. Connection & Session
+Property                                           Value
+
+Protocol                                           FIX 5.0 SP2 (FIXT.1.1)
+
+Transport                                          TCP
+
+Default Port                                       TBD
+
+TargetCompID (56)                                  CPMMD
+
+BeginString (8)                                    FIXT.1.1
+
+DefaultApplVerID (1137)                            9 (FIX50SP2)
+
+SendingTime precision                              Microseconds inbound / milliseconds outbound
+
+Heartbeat interval                                 30 seconds (configurable on Logon)
+
+
+  Each FIX session maps to a registered trading user identified by SenderCompID, which must
+  match the user's API Key. The API Key must carry the MARKET_DATA permission.
+
+  Sequence Numbers. Send ResetSeqNumFlag=Y on Logon to reset sequence numbers.
+  Sequence numbers may not be persisted across restarts.
+                     2. Standard Header & Trailer
+                     Standard FIXT.1.1 header on every message, both directions.
+
+
+Tag              Field                             Type                              Req                            Notes
+
+8                BeginString                       String                            Y                              FIXT.1.1
+
+9                BodyLength                        Length                            Y                              Auto-calculated
+
+35               MsgType                           String                            Y                              See message catalog
+
+49               SenderCompID                      String                            Y                              Client API key on messages from
+                                                                                                                    the client
+
+56               TargetCompID                      String                            Y                              Server comp-id — CPMMD
+
+34               MsgSeqNum                         SeqNum                            Y                              Monotonically increasing, starting
+                                                                                                                    at 1
+
+52               SendingTime                       UTCTimestamp                      Y                              UTC timestamp of send
+
+1128             ApplVerID                         String                            C                              9 = FIX50SP2
+
+
+                     Trailer: CheckSum(10).
+
+
+                     Message catalog (MsgType)
+       MsgType                   Name                               Direction (client → server)   Notes
+
+       A                         Logon                              ⇄                             §3
+
+       0/1                       Heartbeat / TestRequest            ⇄                             Session keepalive
+
+       2/4                       ResendRequest /                    ⇄                             Session-level recovery
+                                 SequenceReset
+
+       3                         Reject                             ←                             Session-level reject
+
+       5                         Logout                             ⇄
+
+       V                         MarketDataRequest                  →                             Subscribe / unsubscribe (§4)
+
+       W                         MarketDataSnapshotFullRefresh      ←                             Orderbook snapshot (§5)
+       MsgType                      Name                               Direction (client → server)        Notes
+
+       X                            MarketDataIncrementalRefresh       ←                                  trades, orderbook (§5)
+
+       Y                            MarketDataRequestReject            ←                                  Subscription rejected (§4.3)
+
+       f                            SecurityStatus                     ←                                  Instrument status transitions (§6)
+
+       j                            BusinessMessageReject              ←                                  App-level reject (unknown /
+                                                                                                          invalid inbound)
+
+
+
+
+                        3. Authentication (Logon 35=A)
+                        Send a FIX Logon to establish a session. The gateway validates credentials and responds with
+                        a Logon ack or Logout. Authentication uses an API key carried in SenderCompID(49) +
+                        passphrase (Password 554) + an HMAC signature (Text 58). The gateway checks for
+                        MARKET_DATA permission.
+
+
+Tag              Name                                 Type                               Req                                Description
+
+98               EncryptMethod                        Int                                Y                                  0 = No encryption
+
+108              HeartBtInt                           Int                                Y                                  Heartbeat interval in seconds.
+                                                                                                                            Recommended: 30
+
+141              ResetSeqNumFlag                      Boolean                            N                                  Y to reset sequence numbers on
+                                                                                                                            connect
+
+1137             DefaultApplVerID                     String                             Y                                  9 (FIX50SP2)
+
+554              Password                             String                             Y                                  Passphrase. Must be non-empty.
+
+58               Text                                 String                             N                                  HMAC signature bytes. Must be
+                                                                                                                            non-empty.
+
+
+                        The API key is carried in the standard header field SenderCompID(49), not in a Logon-body
+                        field.
+
+
+                        Example Message
+                        Logon (35=A)
+               None
+               8=FIXT.1.1|9=150|35=A|34=1|49=my-api-key|56=CPMMD|
+               52=20240701-12:00:00.000000|98=0|108=30|141=Y|
+               1137=9|554=my-passphrase|58=my-signature|10=041|
+
+
+
+
+            4. MarketDataRequest (35=V) — CLIENT → SERVER
+            Subscribe or unsubscribe to a market-data channel for one or more instruments. This is the FIX
+            analogue of the WebSocket subscribe / unsubscribe commands.
+
+
+Tag     Name                              Type                                Req                            Description
+
+262     MDReqID                           String                              Y                              Client-assigned request ID.
+                                                                                                             Echoed on all responses; used
+                                                                                                             as the subscription handle for
+                                                                                                             unsubscribe.
+
+263     SubscriptionRequestType           Char                                Y                              1 = Snapshot + Updates
+                                                                                                             (subscribe), 2 = Disable previous
+                                                                                                             snapshot + Updates
+                                                                                                             (unsubscribe).
+
+264     MarketDepth                       Int                                 C                              0 = full book, 1 = best prices, 10
+                                                                                                             = top 10 levels. Order book is
+                                                                                                             capped at 10 levels per side.
+                                                                                                             Applies to the orderbook channel.
+
+266     AggregatedBook                    Boolean                             N                              Y = price-aggregated levels
+                                                                                                             (default and only supported
+                                                                                                             mode).
+
+267     NoMDEntryTypes                    NumInGroup                          Y                              Number of MD entry-type entries
+                                                                                                             requested.
+
+→ 269   MDEntryType                       Char                                Y                              Channel selector — see §4.1.
+
+146     NoRelatedSym                      NumInGroup                          C                              Number of instruments. require ≥
+                                                                                                             0 (0 if subscribe all instruments).
+                                                                                                             Accepts 0 only when tag 269 is
+Tag                      Name                                 Type                                Req                                  Description
+
+                                                                                                                                       not 0/1. Orderbook subscription
+                                                                                                                                       can only be per-instrument
+
+→ 55                     Symbol                               String                              C                                    Instrument symbol (e.g.
+                                                                                                                                       NFL-GAMEWINNER-26NOV28LA
+                                                                                                                                       RSF-LAR). Required when 146 >
+                                                                                                                                       0
+
+→ 48                     SecurityID                           String                              C                                    Numeric instrument ID (alternate
+                                                                                                                                       to Symbol).
+
+
+                             4.1 MDEntryType (269) → channel mapping
+       MDEntryType                          Channel                             WebSocket equivalent                Response messages
+
+       0 Bid                                Order book — YES bids               orderbook                           W snapshot then X deltas
+
+       1 Ask                                Order book — NO bids                orderbook                           W snapshot then X deltas
+
+       2 Trade                              Public trades                       trade                               X incremental only
+
+       B Trade volume                       Trade volume                        None, included in ticker channel    W snapshot then X deltas
+
+       C Open interest                      Open interest                       None, included in ticker channel    W snapshot then X deltas
+
+       L (custom) InstrumentLifecycle       Instrument lifecycle                instrument_lifecycle                f SecurityStatus
+
+
+                             Subscription scoping :
+
+                                  -​   L1 & L2 Order book: subscribe by instrument only
+                                  -​   Trade, Trade volume, Open Interest, Instrument lifecycle: subscribe by instrument(s)
+                                       or all-instruments subscription..
+
+
+                             4.2 Snapshot behavior
+                                  -​   Order book, Trade volume, Open Interest: an initial W MarketDataSnapshotFullRefresh
+                                       is sent on subscribe, followed by X MarketDataIncrementalRefresh updates.
+                                  -​   Trade, Instrument lifecycle: no snapshot is sent; only live updates are delivered after
+                                       subscribe.
+             4.3 MarketDataRequestReject (35=Y) — SERVER → CLIENT
+Tag   Name                       Type                      Req                              Description
+
+262   MDReqID                    String                    Y                                Echo of the rejected request.
+
+281   MDReqRejReason             Char                      N                                See below.
+
+58    Text                       String                    N                                Human-readable reason.
+                                                                                            Distinguishes conditions that
+                                                                                            share a 281 value.
+
+
+      281                        Meaning                   Triggers
+
+      0                          Unknown symbol            A Symbol(55) did not resolve;
+                                                           unsubscribe named an unknown
+                                                           MDReqID
+
+      1                          Duplicate MDReqID         MDReqID already active on this
+                                                           session
+
+      4                          Unsupported               263 is neither 1 nor 2
+                                 SubscriptionRequestType
+
+      5                          Unsupported MarketDepth   264 absent on an order-book
+                                                           request; 264 not 1 or 10; 264
+                                                           present on a non-order-book
+                                                           request
+
+      8                          Unsupported MDEntryType   Unknown or unserved 269;
+                                                           267=0
+
+      9                          Unsupported scoping       146 absent; 146 < 0; distinct
+                                                           Symbol(55) count ≠ 146;
+                                                           146=0 with a requested 269 of
+                                                           0/1
+          5. Order Book (L1 and L2) & Trades
+          The channel that emits messages for L1, L2 orderbook and trade information. Message type
+          can be distinguished by tag 264 market depth and tag 269 market data entry type and tag 1023
+          price level.
+
+                1.​ Real-time order book — L1, L2 market data, depth of market. WebSocket equivalent: the
+                    orderbook channel. Delivered as W orderbook_snapshot on subscribe (up to 10
+                   levels per side), then X orderbook_delta updates.
+                2.​ Trade feed for volume analysis. WebSocket equivalent: the trade channel. Delivered as
+                   X MarketDataIncrementalRefresh only (no snapshot), immediately after trade execution.
+
+          The ticker is carried in the standard MD entries. CPM maps ticker fields to MD entry types as
+          follows:
+
+
+      MDEntryType (269)                   Meaning                            Fields
+
+      2 Trade                             Last trade                         MDEntryPx(270) = last_price,
+                                                                             MDEntrySize(271) =
+                                                                             last_trade_size
+
+      0 Bid                               Best YES bid                       MDEntryPx(270) = yes_bid,
+                                                                             MDEntrySize(271) =
+                                                                             yes_bid_size
+
+      1 Ask                               Best NO bid                        MDEntryPx(270) = no_bid,
+                                                                             MDEntrySize(271) = no_bid_size
+
+      B Trade volume                      Total contracts traded             MDEntrySize(271) = total
+                                                                             contracts traded
+
+      C Open interest                     Open interest, number of open      MDEntrySize(271) = number of
+                                          contracts                          open contracts
+
+
+          5.1 Snapshot (35=W)
+Tag   Name                                Type                               Req                              Description
+
+262   MDReqID                             String                             Y                                Echo of the subscription request.
+
+55    Symbol                              String                             Y                                Instrument symbol.
+
+48    SecurityID                          String                             Y                                Numeric instrument ID.
+Tag      Name                               Type                                 Req                           Description
+
+268      NoMDEntries                        NumInGroup                           Y                             Number of price levels (≤ 20; up
+                                                                                                               to 10 per side).
+
+→ 269    MDEntryType                        Char                                 Y                             0 = YES bid, 1 = NO bid (ask
+                                                                                                               side) 2 = trade, B = trade volume,
+                                                                                                               C = open interest
+
+→ 270    MDEntryPx                          Price                                C                             Price level, 3 dp. Can be absent
+                                                                                                               if 269=B/C, representing trade
+                                                                                                               volume and open interest
+
+→ 271    MDEntrySize                        Qty                                  Y                             quantity at this level, 2 dp.
+
+→ 1023   MDPriceLevel                       Int                                  N                             Level rank, best price = 1.
+
+60       TransactTime                       UTCTimestamp                         N                             Message-level (one per
+                                                                                                               message, not per MDEntry).
+                                                                                                               Timestamp of the snapshot.
+
+
+             5.2 Incremental (35=X)
+             Each delta carries the absolute quantity now resting at the price level. Replace the level with
+             this value — do not add or subtract. A size of 0.00 removes the level.
+
+
+Tag      Name                               Type                                 Req                           Description
+
+262      MDReqID                            String                               Y                             Echo of the subscription request.
+
+268      NoMDEntries                        NumInGroup                           Y                             Number of level updates in this
+                                                                                                               message.
+
+→ 279    MDUpdateAction                     Char                                 Y                             0 New, 1 Change, 2 Delete. 2 (or
+                                                                                                               size 0) removes the level.
+
+→ 269    MDEntryType                        Char                                 Y                             0 = YES bid, 1 = NO bid, 2 =
+                                                                                                               trade, B = trade volume, C =
+                                                                                                               open interest
+
+→ 55     Symbol                             String                               Y                             Instrument symbol.
+
+→ 48     SecurityID                         String                               Y                             Numeric instrument ID.
+Tag      Name                              Type                               Req                            Description
+
+→ 270    MDEntryPx                         Price                              C                              Price level being updated, 3 dp.
+                                                                                                             Can be absent if 269=B/C,
+                                                                                                             representing trade volume and
+                                                                                                             open interest
+
+→ 271    MDEntrySize                       Qty                                Y                              Absolute quantity now resting at
+                                                                                                             this level, 2 dp. 0.00 = level
+                                                                                                             removed.
+
+→ 1023   MDPriceLevel                      Int                                N                              Level rank, best price = 1.
+
+→ 278    MDEntryID                         String                             C                              Required when
+                                                                                                             MDEntryType(269)=2 (Trade).
+                                                                                                             Unique per execution; use for
+                                                                                                             dedup. Absent on orderbook
+                                                                                                             entries (269=0/1).
+
+→ 2446   AggressorSide                     Int                                C                              Aggressor (taker) direction of the
+                                                                                                             trade: 1 = Buy, 2 = Sell, 0 =
+                                                                                                             NoAggressor (opening /
+                                                                                                             uncrossing fill). Present only on
+                                                                                                             trade entries (269=2); absent on
+                                                                                                             order-book entries (269=0/1).
+
+60       TransactTime                      UTCTimestamp                       N                              Message-level (one per
+                                                                                                             message, not per MDEntry).
+                                                                                                             Event timestamp for this batch of
+                                                                                                             updates.
+
+
+             Example Message (per-instrument)
+             Per-instrument subscription indicates tag 146 NoRelatedSym > 0, and requires tag 55 symbol to
+             be presented Subscribe — Order book, top 10 (35=V)
+
+
+                None
+                8=FIXT.1.1|               # BeginString
+                9=190|                  # BodyLength
+                35=V|                   # MsgType = MarketDataRequest
+                34=3|                   # MsgSeqNum
+                49=RO-MD01|             # SenderCompID — client API key
+                56=CPMMD|               # TargetCompID — MD gateway
+                52=20240701-12:00:02.000000|     # SendingTime (UTC)
+  262=req-book-l2-1|           # MDReqID — subscription handle
+  263=1|                     # SubscriptionRequestType 1 = subscribe
+  264=10|                    # MarketDepth — top 10 levels per side
+  266=Y|                     # AggregatedBook Y = price-aggregated levels
+  267=2|                     # NoMDEntryTypes — 2 entry-types follow
+  269=0|                     # MDEntryType 0 = Bid (YES bid side)
+  269=1|                     # MDEntryType 1 = ask (NO bid side)
+  146=1|                     # NoRelatedSym — 1 instrument (book requires a symbol)
+  55=NFL-GAMEWINNER-26NOV28LARSF-LAR|       # Symbol — instrument ticker
+  10=201|                    # CheckSum
+
+
+
+Order book L2 snapshot (35=W)
+
+
+  None
+  8=FIXT.1.1|                # BeginString
+  9=250|                     # BodyLength
+  35=W|                      # MsgType = MarketDataSnapshotFullRefresh
+  34=5|                      # MsgSeqNum — gateway sequence number
+  49=CPMMD|                  # SenderCompID — MD gateway
+  56=RO-MD01|                # TargetCompID — client
+  52=20240701-12:00:02.001000|     # SendingTime (UTC)
+  262=req-book-l2-1|           # MDReqID — echoes the subscription
+  55=NFL-GAMEWINNER-26NOV28LARSF-LAR|       # Symbol
+  48=598471892347|           # SecurityID — numeric instrument id
+  268=20|                    # NoMDEntries — 20 price-level entries follow
+  269=0|270=0.580|271=300.00|1023=1|        # Bid; px 0.580; size 300.00; MDPriceLevel 1
+  (best)
+  269=0|270=0.560|271=333.00|1023=2|        # Bid; px 0.560; size 333.00; level 2
+  269=1|270=0.360|271=20.00|1023=1|         # Ask; px 0.360; size 20.00; level 1 (best)
+  269=1|270=0.340|271=146.00|1023=2|        # Ask; px 0.340; size 146.00; level 2
+  ...
+  10=176|                    # CheckSum
+
+
+
+
+Order book L2 delta (35=X)
+
+
+  None
+  8=FIXT.1.1|                # BeginString — FIXT session version
+  9=180|                     # BodyLength — bytes in body (auto-calc)
+  35=X|                      # MsgType = MarketDataIncrementalRefresh
+  34=6|                      # MsgSeqNum — gateway sequence number
+ 49=CPMMD|               # SenderCompID — MD gateway
+ 56=RO-MD01|             # TargetCompID — client
+ 52=20240701-12:00:05.002000|     # SendingTime (UTC)
+ 262=req-book-l2-1|         # MDReqID — echoes the subscription handle
+ 268=1|                  # NoMDEntries — 1 level update in this message
+ 279=1|                  # MDUpdateAction 1 = Change (0=New, 2=Delete)
+ 269=0|                  # MDEntryType 0 = Bid (YES side); 1 = Ask
+ 55=NFL-GAMEWINNER-26NOV28LARSF-LAR|    # Symbol — instrument ticker
+ 48=598471892347|        # SecurityID — numeric instrument id
+ 270=0.580|              # MDEntryPx — price level being updated (0.580)
+ 271=246.00|             # MDEntrySize — ABSOLUTE resting qty now at this level
+ (was 300.00)
+ 1023=2| ​      ​        # bid level 2 changed
+ 60=20240701-12:00:05.001800|     # TransactTime — event timestamp of the update
+ 10=133|                 # CheckSum — 3-digit integrity check
+
+
+
+
+Subscribe — Orderbook L1 (35=V)
+
+
+ None
+ // client -> server
+ 8=FIXT.1.1|              # BeginString — FIXT session version
+ 9=180|                  # BodyLength — bytes in body (auto-calc)
+ 35=V|                   # MsgType = MarketDataRequest
+ 34=2|                   # MsgSeqNum — client sequence number
+ 49=RO-MD01|             # SenderCompID — client API key
+ 56=CPMMD|               # TargetCompID — MD gateway
+ 52=20240701-12:00:01.000000|     # SendingTime (UTC)
+
+
+ 262=req-book-l1-1|       # MDReqID — subscription handle (echoed on responses)
+ 263=1|                  # SubscriptionRequestType 1 = Snapshot + Updates
+ (subscribe)
+ 264=1|                  # MarketDepth 1 = L1 (best YES bid + best NO bid)
+ 266=Y|                  # AggregatedBook Y = price-aggregated
+ 267=2|                  # NoMDEntryTypes — 1 entry-type follows
+ 269=0|                  # MDEntryType 0 = Bid (YES bid side)
+ 269=1|                  # MDEntryType 1 = Ask (NO bid side)
+ 146=1|                  # NoRelatedSym — 1 instrument follows
+ 55=NFL-GAMEWINNER-26NOV28LARSF-LAR|    # Symbol — instrument ticker
+ 10=118|                 # CheckSum — 3-digit integrity check
+
+
+
+Order book L1 snapshot (35=W)
+  None
+  // server -> client
+  8=FIXT.1.1|                 # BeginString
+  9=230|                     # BodyLength
+  35=W|                      # MsgType = MarketDataSnapshotFullRefresh
+  34=11|                     # MsgSeqNum — gateway sequence number
+  49=CPMMD|                  # SenderCompID — MD gateway
+  56=RO-MD01|                # TargetCompID — client
+  52=20240701-12:01:00.006000|     # SendingTime (UTC)
+
+
+  262=req-book-l1-1|          # MDReqID — echoes the subscription
+  55=NFL-GAMEWINNER-26NOV28LARSF-LAR|       # Symbol
+  48=598471892347|           # SecurityID — numeric instrument id
+
+
+  268=2|                     # NoMDEntries — best YES bid + best NO bid
+  269=0|270=0.560|271=333.00|1023=1|        # best YES bid 0.560; size 333.00
+  269=1|270=0.380|271=150.00|1023=1|        # best NO bid 0.380; size 150.00 → yes_ask =
+  0.620
+
+
+  10=201|                    # CheckSum
+
+
+
+Order book L1 delta (35=X)
+
+
+  None
+  8=FIXT.1.1|                 # BeginString — FIXT session version
+  9=180|                     # BodyLength — bytes in body (auto-calc)
+  35=X|                      # MsgType = MarketDataIncrementalRefresh
+  34=6|                      # MsgSeqNum — gateway sequence number
+  49=CPMMD|                  # SenderCompID — MD gateway
+  56=RO-MD01|                # TargetCompID — client
+  52=20240701-12:00:05.002000|     # SendingTime (UTC)
+  262=req-book-l1-1|            # MDReqID — echoes the subscription handle
+  268=1|                     # NoMDEntries — 1 level update in this message
+  279=1|                     # MDUpdateAction 1 = Change (0=New, 2=Delete)
+  269=0|                     # MDEntryType 0 = Bid (YES side); 1 = Ask
+  55=NFL-GAMEWINNER-26NOV28LARSF-LAR|       # Symbol — instrument ticker
+  48=598471892347|           # SecurityID — numeric instrument id
+  270=0.560|                 # MDEntryPx — price level being updated (0.560)
+  271=200.00|                # MDEntrySize — ABSOLUTE resting qty now at this level
+  (was 333.00)
+  1023=1|​       ​           # Best YES bid changed
+  60=20240701-12:00:05.001800|     # TransactTime — event timestamp of the update
+  10=133|                    # CheckSum — 3-digit integrity check
+Subscribe — Public trades (35=V)
+
+
+  None
+  8=FIXT.1.1|                # BeginString
+  9=150|                    # BodyLength
+  35=V|                     # MsgType = MarketDataRequest
+  34=4|                     # MsgSeqNum
+  49=RO-MD01|               # SenderCompID — client API key
+  56=CPMMD|                 # TargetCompID — MD gateway
+  52=20240701-12:00:03.000000|     # SendingTime (UTC)
+
+
+  262=req-trade-1|          # MDReqID — subscription handle
+  263=1|                    # SubscriptionRequestType 1 = subscribe
+  267=1|                    # NoMDEntryTypes — 1 entry-type
+  269=2|                    # MDEntryType 2 = Trade (public-trades channel)
+  146=1|                    # NoRelatedSym — 1 instrument (trade requires a symbol)
+  55=NFL-GAMEWINNER-26NOV28LARSF-LAR|      # Symbol — instrument ticker
+  10=095|                   # CheckSum
+
+
+
+Server -> client —- Public trade (35=X)
+
+
+  None
+  8=FIXT.1.1|                # BeginString
+  9=210|                    # BodyLength
+  35=X|                     # MsgType = MarketDataIncrementalRefresh
+  34=7|                     # MsgSeqNum — gateway sequence number
+  49=CPMMD|                 # SenderCompID — MD gateway
+  56=RO-MD01|               # TargetCompID — client
+  52=20240701-12:01:00.005000|     # SendingTime (UTC)
+
+
+  262=req-trade-1|          # MDReqID — echoes the subscription
+  55=NBA-25JAN15-LAL-BOS| # Symbol — instrument the trade occurred in
+  48=398471892345|          # SecurityID — numeric instrument id
+
+
+  268=1|                    # NoMDEntries — 1 trade entry
+  279=0|                    # MDUpdateAction 0 = New (a new trade print)
+  269=2|                    # MDEntryType 2 = Trade
+  270=0.620|                # MDEntryPx — YES trade price 0.620 (NO = 1.000 − 0.620)
+  271=136.00|               # MDEntrySize — contracts traded (136.00)
+  278=398471892346|        # MDEntryID — unique per execution, use for dedup
+  2446=1|                   # AggressorSide — 1 = Buy (aggressor bought); 2 = Sell; 0
+  = NoAggressor
+  60=20240701-12:01:00.004800|    # TransactTime — trade event timestamp
+  10=214|                   # CheckSum
+
+
+
+Subscribe — Trade volume & open interest (35=V)
+
+
+  None
+  // client -> server
+  8=FIXT.1.1|               # BeginString — FIXT session version
+  9=180|                    # BodyLength — bytes in body (auto-calc)
+  35=V|                     # MsgType = MarketDataRequest
+  34=2|                     # MsgSeqNum — client sequence number
+  49=RO-MD01|               # SenderCompID — client API key
+  56=CPMMD|                 # TargetCompID — MD gateway
+  52=20240701-12:00:01.000000|    # SendingTime (UTC)
+
+
+  262=req-trade-vol-oi-1|         # MDReqID — subscription handle (echoed on
+  responses)
+  263=1|                    # SubscriptionRequestType 1 = Snapshot + Updates
+  (subscribe)
+  267=2|                    # NoMDEntryTypes — 1 entry-type follows
+  269=B|                    # MDEntryType B = trade volme
+  269=C|                    # MDEntryType C = open interest
+  146=1|                    # NoRelatedSym — 1 instrument follows
+  55=NFL-GAMEWINNER-26NOV28LARSF-LAR|      # Symbol — instrument ticker
+  10=118|                   # CheckSum — 3-digit integrity check
+
+
+
+Trade volume & open interest snapshot (35=W)
+
+
+  None
+  // server -> client
+  8=FIXT.1.1|               # BeginString
+  9=230|                    # BodyLength
+  35=W|                     # MsgType = MarketDataSnapshotFullRefresh
+  34=11|                    # MsgSeqNum — gateway sequence number
+  49=CPMMD|                 # SenderCompID — MD gateway
+  56=RO-MD01|               # TargetCompID — client
+  52=20240701-12:01:00.006000|    # SendingTime (UTC)
+
+
+  262=req-trade-vol-oi-1|         # MDReqID — echoes the subscription
+  55=NFL-GAMEWINNER-26NOV28LARSF-LAR|      # Symbol
+  48=598471892347|          # SecurityID — numeric instrument id
+  268=2|                    # NoMDEntries — vol and oi
+  269=B|271=333145.00|      # traded contract number
+  269=C|271=152480.00|      # resting contracts
+
+
+  10=201|                   # CheckSum
+
+
+
+Trade volume & open interest delta (35=X)
+
+
+  None
+  8=FIXT.1.1|                # BeginString — FIXT session version
+  9=180|                    # BodyLength — bytes in body (auto-calc)
+  35=X|                     # MsgType = MarketDataIncrementalRefresh
+  34=6|                     # MsgSeqNum — gateway sequence number
+  49=CPMMD|                 # SenderCompID — MD gateway
+  56=RO-MD01|               # TargetCompID — client
+  52=20240701-12:00:05.002000|     # SendingTime (UTC)
+  262=req-trade-vol-oi-1|           # MDReqID — echoes the subscription handle
+  279=1|                    # MDUpdateAction 1 = Change (0=New, 2=Delete)
+  55=NFL-GAMEWINNER-26NOV28LARSF-LAR|       # Symbol — instrument ticker
+  48=598471892347|          # SecurityID — numeric instrument id
+
+
+  268=1|                    # NoMDEntries — 1 level update in this message
+  269=B|271=200134.00|      # traded contract number
+  269=C|271=152511.00|      # resting contracts
+  60=20240701-12:00:05.001800|     # TransactTime — event timestamp of the update
+  10=133|                   # CheckSum — 3-digit integrity check
+
+
+
+
+Example Message (all-instrument)
+All-instrument subscription indicates tag 146 NoRelatedSym = 0, and does not require tag 55
+symbol to be presented. Below is an example of subscribing to trades of all instruments
+
+Subscribe — Public trades (35=V)
+
+
+  None
+  8=FIXT.1.1|                # BeginString
+  9=150|                    # BodyLength
+  35=V|                     # MsgType = MarketDataRequest
+  34=4|                     # MsgSeqNum
+  49=RO-MD01|               # SenderCompID — client API key
+  56=CPMMD|                 # TargetCompID — MD gateway
+  52=20240701-12:00:03.000000|     # SendingTime (UTC)
+
+
+  262=req-trade-1|          # MDReqID — subscription handle
+  263=1|                    # SubscriptionRequestType 1 = subscribe
+  267=1|                    # NoMDEntryTypes — 1 entry-type
+  269=2|                    # MDEntryType 2 = Trade (public-trades channel)
+  146=0|                    # NoRelatedSym — all instrument (requires no symbol)
+  10=095|                   # CheckSum
+
+
+
+Server -> client —- Public trade (35=X)
+
+
+  None
+  // Instrument 1
+
+
+  8=FIXT.1.1|                # BeginString
+  9=210|                    # BodyLength
+  35=X|                     # MsgType = MarketDataIncrementalRefresh
+  34=7|                     # MsgSeqNum — gateway sequence number
+  49=CPMMD|                 # SenderCompID — MD gateway
+  56=RO-MD01|               # TargetCompID — client
+  52=20240701-12:01:00.005000|     # SendingTime (UTC)
+
+
+  262=req-trade-1|          # MDReqID — echoes the subscription
+  55=NBA-25JAN15-LAL-BOS| # Symbol — instrument the trade occurred in
+  48=398471892345|          # SecurityID — numeric instrument id
+
+
+  268=1|                    # NoMDEntries — 1 trade entry
+  279=0|                    # MDUpdateAction 0 = New (a new trade print)
+  269=2|                    # MDEntryType 2 = Trade
+  270=0.620|                # MDEntryPx — YES trade price 0.620 (NO = 1.000 − 0.620)
+  271=136.00|               # MDEntrySize — contracts traded (136.00)
+  278=398471892346|        # MDEntryID — unique per execution, use for dedup
+  2446=1|                   # AggressorSide — 1 = Buy (aggressor bought); 2 = Sell; 0
+  = NoAggressor
+
+
+  60=20240701-12:01:00.004800|     # TransactTime — trade event timestamp
+  10=214|                   # CheckSum
+
+
+  // Instrument 2
+
+
+  8=FIXT.1.1|                # BeginString
+  9=210|                   # BodyLength
+  35=X|                    # MsgType = MarketDataIncrementalRefresh
+  34=7|                    # MsgSeqNum — gateway sequence number
+  49=CPMMD|                # SenderCompID — MD gateway
+  56=RO-MD01|              # TargetCompID — client
+  52=20240701-12:01:00.005000|   # SendingTime (UTC)
+
+
+  262=req-trade-1|         # MDReqID — echoes the subscription
+  55=NFL-GAMEWINNER-26NOV28LARSF-LAR | # Symbol — instrument the trade occurred in
+  48=398471892345|         # SecurityID — numeric instrument id
+
+
+  268=1|                   # NoMDEntries — 1 trade entry
+  279=0|                   # MDUpdateAction 0 = New (a new trade print)
+  269=2|                   # MDEntryType 2 = Trade
+  270=0.620|               # MDEntryPx — YES trade price 0.620 (NO = 1.000 − 0.620)
+  271=136.00|              # MDEntrySize — contracts traded (136.00)
+  278=398471892346|       # MDEntryID — unique per execution, use for dedup
+  2446=1|                  # AggressorSide — 1 = Buy (aggressor bought); 2 = Sell; 0
+  = NoAggressor
+
+
+  60=20240701-12:01:00.004800|   # TransactTime — trade event timestamp
+  10=214|                  # CheckSum
+
+
+  // ... All other instruments
+
+
+
+
+6. Instrument Lifecycle
+Tracks lifecycle changes: creation, (de)activation, close-date changes, determination,
+settlement. This is the FIX counterpart of the WebSocket instrument_lifecycle channel,
+but slimmed to the trading-status fields below: the WebSocket channel emits the complete
+Instrument resource (every field, including additional_metadata), whereas the FIX
+SecurityStatus(f) carries only Symbol(55) + SecurityID(48) +
+SecurityTradingStatus(326) + TransactTime(60). Per-instrument and all-instruments
+subscriptions supported.
+
+Instrument symbol and statuses are delivered as SecurityStatus (35=f).
+             SecurityStatus (35=f) — instrument status
+Tag   Name                              Type                              Req              Description
+
+324   SecurityStatusReqID               String                            N                Optional; echoes the originating
+                                                                                           MDReqID(262) when present.
+
+55    Symbol                            String                            Y                Instrument ticker (e.g.
+                                                                                           NFL-GAMEWINNER-26NOV28LA
+                                                                                           RSF-LAR).
+
+48    SecurityID                        String                            Y                Numeric instrument id as a string.
+
+326   SecurityTradingStatus             Int                               Y                Trading status lifecycle (values
+                                                                                           below).
+
+60    TransactTime                      UTCTimestamp                      N                Time of the lifecycle transition.
+
+58    Text                              String                            N                Optional free-text.
+
+
+             Example Message
+              None
+              Client → Server: Subscribe one instruments (35=V)
+
+
+              8=FIXT.1.1|              # BeginString
+              9=140|                  # BodyLength
+              35=V|                   # MsgType = MarketDataRequest
+              34=5|                   # MsgSeqNum
+              49=RO-MD01|             # SenderCompID — client API key
+              56=CPMMD|               # TargetCompID — MD gateway
+              52=20240701-12:00:04.000000|    # SendingTime (UTC)
+              262=req-lifecycle-1|    # MDReqID — subscription handle
+              263=1|                  # SubscriptionRequestType 1 = subscribe
+              267=1|                  # NoMDEntryTypes — 1 entry-type
+              269=L|                  # MDEntryType L = InstrumentLifecycle (CPM custom)
+              146=1|                  # NoRelatedSym 1 = one instrument
+              55=NFL-GAMEWINNER-26NOV28LARSF-LAR|    # Symbol — instrument ticker
+              10=077|                 # CheckSum
+
+
+              Server → Client: Instrument status / settlement (35=f)
+
+
+              8=FIXT.1.1|              # BeginString
+              9=470|                  # BodyLength
+              35=f|                   # MsgType = SecurityStatus
+  34=42|                         # MsgSeqNum — gateway sequence number
+  49=CPMMD|                      # SenderCompID — MD gateway
+  56=RO-MD01|                    # TargetCompID — client
+  52=20240701-12:30:00.001000|         # SendingTime (UTC)
+
+
+  55=NFL-GAMEWINNER-26NOV28LARSF-LAR|         # Symbol — instrument ticker
+  48=200001|                     # SecurityID — numeric instrument id
+  326=17|                        # SecurityTradingStatus — 17 = Open
+  60=20240701-12:30:00.001000|         # TransactTime — time of the transition
+
+
+  10=214|                        # CheckSum
+
+
+
+Trading status lifecycle (326)
+
+Reused some tags from FIX 5.0 SP2, created new tags for determined and settled statuses 21
+= Listed 29 = Delisted 17 = Open 2 = Pause 18 = Closed 27 = Determined 28 = Settled 26 =
+Amended
+

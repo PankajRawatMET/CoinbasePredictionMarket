@@ -1,0 +1,31 @@
+# Credentials - never commit. The sandbox/production API keys live in
+# creds.env (market data) and creds-oe.env (order entry), both chmod 600.
+*.env
+# ...except the simulator settings, which are fake and belong in the project.
+!config/*.env
+
+# Build output
+build/
+*.o
+*.a
+*.so
+compile_commands.json
+CMakeUserPresets.json
+
+# QuickFIX runtime state, if a session is ever configured with file
+# persistence instead of the in-memory store.
+log/
+store/
+
+# Client runtime state: the last ExecID / ClOrdID counter each app resumes
+# from (--bookmark).
+*-bookmark.txt
+
+# Editor and OS noise
+*.swp
+*~
+.idea/
+.vscode/
+.DS_Store
+core
+core.*

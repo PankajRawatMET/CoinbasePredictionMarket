@@ -1,0 +1,570 @@
+FIX Dropcopy
+          FIX DropCopy Gateway API Reference
+          FIX wire spec for the CPM (Prediction Markets) drop-copy feed: the message structure and the
+          field data provided. Drop-copy is a read-only feed — it delivers execution reports and market
+          settlement reports for activity in the session's subscription scope (firm or FCM).
+
+              -​    Session layer: FIXT.1.1
+              -​    Application layer: FIX 5.0 SP2 (DefaultApplVerID = 9)
+              -​    Baseline: FIX 5.0 SP2, with CPM-specific extensions in the 20000+ / F1–F5 / UMS
+                    ranges.
+
+          Supported inbound application messages: LastExecIDRequest (F1) and
+          EventResendRequest (F3) only. Other application message types receive a
+          BusinessMessageReject(j).
+
+
+
+
+          1. Header
+          Standard FIXT.1.1 header on every message, both directions.
+
+
+Tag   Field                               Type                               Req                          Notes
+
+8     BeginString                         String                             Y                            FIXT.1.1
+
+9     BodyLength                          Length                             Y
+
+35    MsgType                             String                             Y                            See message catalog below
+
+49    SenderCompID                        String                             Y                            The client's API key (used for
+                                                                                                          Logon credential lookup)
+
+56    TargetCompID                        String                             Y                            Server comp-id — CBPMDC
+
+34    MsgSeqNum                           SeqNum                             Y
+
+52    SendingTime                         UTCTimestamp                       Y
+
+43    PossDupFlag                         Boolean                            C
+
+97    PossResend                          Boolean                            N                            Set Y on resent application
+                                                                                                          messages (ER / UMS; see §5)
+Tag                         Field                               Type                            Req                             Notes
+
+50 / 57 / 142 / 143         SenderSubID / TargetSubID /         String                          N
+                            SenderLocationID /
+                            TargetLocationID
+
+122                         OrigSendingTime                     UTCTimestamp                    N
+
+369                         LastMsgSeqNumProcessed              SeqNum                          N
+
+1128                        ApplVerID                           String                          C                               9 = FIX50SP2
+
+
+                                Trailer: CheckSum(10).
+
+
+                                Message catalog (MsgType)
+                  MsgType                     Name                             Direction(client -> server)   Notes
+
+                  A                           Logon                            ⇄
+
+                  0/1                         Heartbeat / TestRequest          ⇄
+
+                  2/4                         ResendRequest /                  ⇄                             Session-level recovery
+                                              SequenceReset
+
+                  3                           Reject                           ←                             Session-level reject
+
+                  5                           Logout                           ⇄
+
+                  8                           ExecutionReport                  ←                             Order / trade lifecycle (§3)
+
+                  UMS                         MarketSettlementReport           ←                             Instrument settlement (§3.6)
+
+                  j                           BusinessMessageReject            ←                             App-level reject (unknown/invalid
+                                                                                                             inbound)
+
+                  F1                          LastExecIDRequest                →                             §5
+
+                  F2                          LastExecID                       ←                             §5
+
+                  F3                          EventResendRequest               →                             §5
+
+                  F4                          EventResendComplete              ←                             §5
+
+                  F5                          EventResendReject                ←                             §5
+              2. Logon (35=A)
+Tag    Field                                  Type                                  Req                          Notes
+
+98     EncryptMethod                          Int                                   Y                            0 (None)
+
+108    HeartBtInt                             Int                                   Y                            Server-capped heartbeat interval
+
+141    ResetSeqNumFlag                        Boolean                               N
+
+789    NextExpectedMsgSeqNum                  SeqNum                                N
+
+554    Password                               String                                C                            Passphrase
+
+96     RawData                                String                                C                            HMAC signature (alternate to
+                                                                                                                 Text)
+
+58     Text                                   String                                C                            Signature (alternate to RawData)
+
+1137   DefaultApplVerID                       String                                Y                            9 (FIX 5.0 SP2)
+
+
+              Authentication uses an API key carried in SenderCompID(49) + passphrase
+              (Password(554)) + an HMAC signature (RawData(96) or Text(58)). All three are verified
+              on every Logon:
+
+                 -​   the passphrase must match the API key's stored passphrase;
+                 -​   the signature must be a valid HMAC-SHA256 (44-character Base64 of a 32-byte digest)
+                      over SendingTime + ApiKey + TargetCompID + Password (UTF-8, no
+                      separators; ApiKey = SenderCompID(49); SendingTime re-encoded at millisecond
+                      precision, TargetCompID = CBPMDC), verified against the API key's secret;
+                 -​   SendingTime(52) must be within a ±30-second window;
+                 -​   the API key must resolve to an ACTIVE trading user carrying the DROP_COPY
+                      permission, and resolve to a firm or FCM subscription scope.
+
+              Any failure disconnects the session. A live session is also disconnected if its authorization is
+              later revoked (API key disabled/deleted, or its firm/FCM scope parent changes).
+          3. Execution Report (35=8)
+          Emitted for order lifecycle events in the session's scope: speed-bumped (PendingNew),
+          submitted, rejected or FOK-expired, canceled or time-expired, and per-fill trades. Each trade
+          produces separate aggressor and resting reports. Each report is routed according to the
+          originating order's firm and FCM identity; both sides of a trade are reported when both are in
+          scope.
+
+          Req convention: Y and N reflect the gateway FIX dictionary. C highlights an optional dictionary
+          field that the implementation populates only under the condition described in the Notes column.
+
+
+Tag   Field                              Type                                 Req                           Notes
+
+37    OrderID                            String                               Y                             Exchange order id
+
+17    ExecID                             String                               Y                             Composed id — see §3.1.
+                                                                                                            Unique and monotonically
+                                                                                                            ordered for resend ranges.
+
+11    ClOrdID                            String                               Y                             For normal lifecycle events and
+                                                                                                            unsolicited cancels, the order's
+                                                                                                            client id. For a successful
+                                                                                                            individual
+                                                                                                            OrderCancelRequest, this is
+                                                                                                            the cancel request's new client id
+                                                                                                            and OrigClOrdID(41)
+                                                                                                            identifies the original order.
+
+41    OrigClOrdID                        String                               N                             Present only when the source
+                                                                                                            cancel event carries a non-zero
+                                                                                                            newClientOrderId, currently
+                                                                                                            successful individual client cancel
+                                                                                                            requests. Per-order mass-cancel
+                                                                                                            reports omit it.
+
+150   ExecType                           Char                                 Y                             Emitted today: 0 New, 4
+                                                                                                            Canceled, 8 Rejected, A
+                                                                                                            PendingNew, C Expired, F Trade
+
+39    OrdStatus                          Char                                 Y                             Emitted today: 0 New, 1
+                                                                                                            PartiallyFilled, 2 Filled, 4
+                                                                                                            Canceled, 8 Rejected, A
+                                                                                                            PendingNew, C Expired
+Tag   Field       Type     Req   Notes
+
+55    Symbol      String   Y     Instrument symbol. Sentinel
+                                 deleted_instrument if
+                                 instrument metadata is
+                                 unavailable.
+
+54    Side        Char     Y     1 Buy, 2 Sell. The gateway
+                                 reports the side carried by the
+                                 source event; it does not
+                                 independently normalize contract
+                                 sides.
+
+40    OrdType     Char     N     1 Market or 2 Limit (from the
+                                 order's market-order flag)
+
+44    Price       Price    N     Order price, encoded with price
+                                 scale 3. Emitted whenever the
+                                 source event contains a price,
+                                 including the resolved/booked
+                                 price of an order whose
+                                 OrdType(40)=Market.
+
+38    OrderQty    Qty      N     Original order quantity, encoded
+                                 with quantity scale 2, when
+                                 available from the source event.
+
+151   LeavesQty   Qty      Y     Remaining quantity, encoded with
+                                 quantity scale 2.
+
+14    CumQty      Qty      Y     Cumulative filled quantity,
+                                 encoded with quantity scale 2.
+
+6     AvgPx       Price    N     Trade reports carry the running
+                                 filled VWAP. PendingNew, New,
+                                 Rejected, and unfilled Cancel
+                                 reports emit zero. A Cancel after
+                                 prior fills omits AvgPx because
+                                 the cancel event does not carry
+                                 the running VWAP.
+
+32    LastQty     Qty      C     Fill qty — ExecType=F only (2
+                                 dp)
+Tag           Field                         Type             Req   Notes
+
+31            LastPx                        Price            C     Fill price — ExecType=F only (3
+                                                                   dp)
+
+59            TimeInForce                   Char             N     1 GTC, 3 IOC, 4 FOK. Populated
+                                                                   across lifecycle and trade reports
+                                                                   whenever the source value maps
+                                                                   to a supported FIX value.
+
+18            ExecInst                      MultiCharValue   N     6 PostOnly, A PostOnlyReject
+
+1028          ManualOrderIndicator          Boolean          Y     From the order's manual-order
+                                                                   flag. Always emitted; defaults to N
+                                                                   when flags are unavailable.
+
+880           TrdMatchID                    String           C     Trade id — ExecType=F only
+
+1057          AggressorIndicator            Boolean          C     Y taker / N maker —
+                                                                   ExecType=F only
+
+60            TransactTime                  UTCTimestamp     Y     Event timestamp (µs resolution)
+
+103           OrdRejReason                  Int              N     On reject — see §3.2
+
+378           ExecRestatementReason         Int              N     On cancel — see §3.3
+
+58            Text                          String           N     Reject / cancel / FOK-expiry
+                                                                   detail
+
+7928 / 8000   SelfMatchPreventionId /       Int / Char       C     SelfMatchPreventionId(79
+              SelfMatchPreventionStrategy                          28) echoes the raw value
+                                                                   submitted on the order and is
+                                                                   omitted when absent (0 is a valid
+                                                                   value).
+                                                                   SelfMatchPreventionStrat
+                                                                   egy(8000) reports the effective
+                                                                   order-level mode after resolving
+                                                                   order override → user default →
+                                                                   firm default, and is omitted only
+                                                                   when no effective mode exists: N
+                                                                   CANCEL_AGGRESSING, O
+                                                                   CANCEL_RESTING, Q
+                                                                   CANCEL_BOTH. Trade reports
+Tag   Field                               Type                                Req                           Notes
+
+                                                                                                            use the corresponding aggressor
+                                                                                                            or resting order's values.
+
+136   NoMiscFees → 137/138/139            Group                               C                             Fee group — see §3.4
+
+453   Parties → 448/452                   Group                               N                             5 entries — see §3.5.
+                                                                                                            PartyIDSource(447) is not
+                                                                                                            emitted.
+
+
+          3.1 ExecID composition
+          ExecID = (seqId << 1) | sideBit, rendered as the decimal string of that long.
+
+              -​   seqId — the event's monotonic sequence id (so ExecIDs are chronologically ordered,
+                   which the resend range in §5 relies on).
+              -​   sideBit — 0 for lifecycle events and aggressor/taker fills; 1 for resting/maker fills.
+
+          The side bit disambiguates the two fills produced from a single trade (which share one seqId).
+          Lifecycle reports — including speed-bumped, submitted, rejected, canceled, and settlement
+          reports — use sideBit = 0. Aggressor fills also use bit 0; resting fills use bit 1.
+
+
+          3.2 OrdRejReason mapping (order reject reason → tag 103)
+          Text(58) is the CPM rejection enum name, optionally followed by " - " and source-provided
+          details. For example: MAX_EXECUTION_COST_EXCEEDED - insufficient liquidity.
+
+
+
+
+      Reject reason                       OrdRejReason(103)                   Wire Text(58)
+
+      INSTRUMENT_NOT_ACTIVE               44                                  INSTRUMENT_NOT_ACTIVE[ -
+                                          NOT_ALLOWED_BY_MARKET_              details]
+                                          STATE
+
+      INVALID_PRICE                       16 PRICE_EXCEEDS_BAND               INVALID_PRICE[ -
+                                                                              details]
+
+      INVALID_QUANTITY                    13 INCORRECT_QUANTITY               INVALID_QUANTITY[ -
+                                                                              details]
+Reject reason               OrdRejReason(103)           Wire Text(58)
+
+INSUFFICIENT_BALANCE        25                          INSUFFICIENT_BALANCE[ -
+                            INSUFFICIENT_CREDIT_LIMIT   details]
+
+DUPLICATE_CLIENT_ORDER_I    6 DUPLICATE_ORDER           DUPLICATE_CLIENT_ORDER_I
+D                                                       D[ - details]
+
+POST_ONLY_WOULD_CROSS /     11                          Exact reason name, optionally
+INVALID_TIME_IN_FORCE       UNSUPPORTED_ORDER_CHA       followed by details
+                            RACTERISTIC
+
+INVALID_USER                42 INVALID_CLIENT           INVALID_USER[ - details]
+
+INVALID_INSTRUMENT          1 UNKNOWN_SYMBOL            INVALID_INSTRUMENT[ -
+                                                        details]
+
+USER_TRADING_LOCKED         43                          USER_TRADING_LOCKED[ -
+                            CLIENT_PERMISSION_ERROR     details]
+
+MAX_ACTIVE_ORDERS_EXCE      3 ORDER_EXCEEDS_LIMIT       Exact reason name, optionally
+EDED /                                                  followed by details
+MAX_ORDER_SIZE_EXCEEDE
+D/
+MAX_EXECUTION_COST_EXC
+EEDED
+
+REDUCE_ONLY_VIOLATION       48 REDUCE_ONLY              REDUCE_ONLY_VIOLATION[ -
+                                                        details]
+
+POSITION_LIMIT_EXCEEDED /   41                          Exact reason name, optionally
+POSITION_LIMIT_PER_INSTRU   EXCEEDED_POSITION_LIMIT     followed by details
+MENT_EXCEEDED
+
+INVALID_SUBACCOUNT          15 UNKNOWN_ACCOUNT          INVALID_SUBACCOUNT[ -
+                                                        details]
+
+INVALID_PRICE_TICK          18                          INVALID_PRICE_TICK[ -
+                            INVALID_PRICE_INCREMENT     details]
+
+SELF_MATCH_PREVENTION       99 OTHER                    SELF_MATCH_PREVENTION[ -
+                                                        details]
+                Reject reason                   OrdRejReason(103)             Wire Text(58)
+
+                INVALID_FIELD_VALUE             99 OTHER                      INVALID_FIELD_VALUE[ -
+                                                                              details]
+
+                SPEED_BUMP_QUEUE_FULL           99 OTHER                      SPEED_BUMP_QUEUE_FULL[ -
+                                                                              details]
+
+                FOK_NOT_FILLED                  —                             No tag 103;
+                                                                              ExecType/OrdStatus =
+                                                                              Expired, Text =
+                                                                              FOK_NOT_FILLED[ -
+                                                                              details]
+
+                UNKNOWN / other                 99 OTHER                      Exact reason name, or UNKNOWN
+                                                                              if no reason is available
+
+
+                    3.3 Cancel mapping (cancel reason → ExecType / OrdStatus /
+                    ExecRestatementReason)
+Cancel reason                   ExecType(150)                 OrdStatus(39)                   ExecRestatementReason(378)
+
+USER_REQUEST /                  4 Canceled                    4 Canceled                      —
+USER_MASS_CANCEL /
+CANCEL_PENDING_IOC
+
+TIME_IN_FORCE                   C Expired                     C Expired                       —
+
+SELF_MATCH_PREVENTION           4 Canceled                    4 Canceled                      7
+                                                                                              CANCEL_SELF_MATCH_PREV
+                                                                                              ENTION
+
+ADMIN_CANCEL                    4 Canceled                    4 Canceled                      105
+                                                                                              CANCEL_EXCHANGE_WEBSIT
+                                                                                              E
+
+INSTRUMENT_DETERMINED /         4 Canceled                    4 Canceled                      2 MARKET_OPTION
+INSTRUMENT_CLOSED /
+INSTRUMENT_PAUSED
+
+CLIENT_DISCONNECT               4 Canceled                    4 Canceled                      1 CANCEL_ON_DISCONNECT
+      Text(58) carries the exact cancel-reason name on every cancel/expiry report.
+      OrigClOrdID(41) is controlled by the presence of a new cancel-request client id, not directly
+      by the cancel-reason enum.
+
+
+      3.4 Fees (NoMiscFees group)
+      Emitted on fills when a fee value is present. The current engine path supplies a value for every
+      fill, including zero. A zero fee therefore still emits the group (MiscFeeAmt=0). The group is
+      omitted only when the fee is absent; negative values represent maker rebates:
+
+
+Tag                                   Field                                  Value
+
+137                                   MiscFeeAmt                             Signed USDC fee encoded with
+                                                                             amount scale 6. Trailing zeroes
+                                                                             are not guaranteed in the textual
+                                                                             FIX representation.
+
+138                                   MiscFeeCurr                            USDC
+
+139                                   MiscFeeType                            4 EXCHANGE_FEES
+
+
+      Fees are informational — reported as received.
+
+
+      3.5 Parties (453) group
+      Each execution report carries a five-entry Parties(453) group containing PartyID(448)
+      and PartyRole(452).
+
+
+  PartyRole(452)                                         PartyID(448)
+
+  4 CLEARING_FIRM                                        FCM code
+
+  1 EXECUTING_FIRM                                       Trading-firm code
+
+  24 CUSTOMER_ACCOUNT                                    Sub-account identifier
+
+  11 ORDER_ORIGINATION_TRADER                            User name
+
+  55 SESSION_ID                                          API key
+
+
+      If a firm, FCM, user, or API-key lookup unexpectedly fails, the report is still emitted and the
+      affected PartyID is the literal value unknown.
+            3.6 Market Settlement Report (35=UMS)
+            Emitted for each resolvable firm-instrument SETTLEMENT position event. The report is stored
+            and routed to the corresponding firm and FCM drop-copy scopes. If the gateway cannot resolve
+            the instrument symbol, firm, or FCM metadata, it suppresses the report rather than emitting a
+            malformed UMS. The report uses the same ExecID / resend space as execution reports
+            (MarketSettlementReportID is composed like a lifecycle ExecID — see §3.1). Resent
+            settlements carry PossResend(97)=Y.
+
+
+Tag     Field                             Type                               Req                            Notes
+
+20105   MarketSettlementReportID          String                             Y                              Composed like ExecID (seqId
+                                                                                                            << 1, lifecycle side bit)
+
+55      Symbol                            String                             Y                              Settled instrument
+
+453     Parties → 448/452                 Group                              Y                              2 legs: CLEARING_FIRM (FCM
+                                                                                                            code), EXECUTING_FIRM (firm
+                                                                                                            code)
+
+21052   SettlementOutcome                 Char                               Y                              Y YES, N NO, S SCALAR
+
+730     SettlementPrice                   Price                              Y                              Encoded with price scale 3. 1
+                                                                                                            represents YES, 0 represents
+                                                                                                            NO, and intermediate values
+                                                                                                            represent SCALAR. Textual
+                                                                                                            trailing zeroes are not
+                                                                                                            guaranteed.
+
+21053   PositionAggregationMode           Char                               Y                              N NET, G GROSS
+
+21054   LongQty                           Qty                                Y                              Firm-level long quantity encoded
+                                                                                                            with quantity scale 2.
+
+21055   ShortQty                          Qty                                Y                              Firm-level short quantity encoded
+                                                                                                            with quantity scale 2.
+
+21056   PayoutAmount                      Amt                                Y                              Gross settlement payout on the
+                                                                                                            closing position for this (firm,
+                                                                                                            instrument) in USDC, 6 dp:
+                                                                                                            SettlementPrice ×
+                                                                                                            LongQty + (1.000 −
+                                                                                                            SettlementPrice) ×
+                                                                                                            ShortQty — what the position
+Tag   Field                               Type                                  Req                                   Notes
+
+                                                                                                                      pays out, independent of what
+                                                                                                                      was paid to open it. Never
+                                                                                                                      negative.
+
+60    TransactTime                        UTCTimestamp                          Y                                     Settlement timestamp (µs
+                                                                                                                      resolution)
+
+
+
+
+          4. Fixed-point conventions
+          Internal CPM fixed-point values are converted to ordinary FIX decimal numbers using the
+          following scales. These scales define numeric precision, not fixed-width text; insignificant trailing
+          zeroes may be omitted.
+
+
+      Quantity                            Decimals                              Range / notes and possible FIX
+                                                                                text
+
+      Price                               3                                     0.001–0.999 (YES price; YES +
+                                                                                NO = 1.000). Settlement price
+                                                                                may be 0 or 1. Possible text:
+                                                                                0.55, 0.550, 1.
+
+      Quantity                            2                                     e.g. 1.25 contracts. Possible text:
+                                                                                1, 1.25.
+
+      Amount (fees / payout)              6                                     USDC amount. Possible text: 0,
+                                                                                0.0495, -2.5.
+
+
+
+
+          5. Event resend (F1–F5)
+          Clients recover missed events by ExecID range — not via a session-level
+          ResendRequest(2) of application messages. Resent ExecutionReport(8) and
+          MarketSettlementReport(UMS) messages carry PossResend(97)=Y.
+
+          Replayed ER and UMS messages preserve the stored application body verbatim, including the
+          original TransactTime(60) and report identifiers. The gateway creates a fresh session
+                               header, advances the outbound MsgSeqNum(34), refreshes SendingTime(52), and sets
+                               PossResend(97)=Y.
+
+                               The resend cursor is scoped to the session's subscription (firm or FCM). ResentEventCount
+                               counts every resent application message in the requested range (ER and UMS).
+
+                               LastExecIDRequest (F1) → LastExecID (F2) — query the last ExecID available for the
+                               session's scope.
+
+
+Msg                      Tag                                 Field                             Req                         Notes
+
+F1 LastExecIDRequest     112                                 TestReqID                         N                           Accepted; not echoed on F2
+
+F2 LastExecID            45 / 17                             RefSeqNum / ExecID                Y/Y                         ExecID=0 when the store is
+                                                                                                                           empty
+
+
+                               EventResendRequest (F3) — replay a range; the server re-emits the stored application
+                               messages in ExecID order, then a terminal F4 or F5.
+
+
+Msg                      Tag                                 Field                             Req                         Notes
+
+F3 EventResendRequest    22003                               BeginExecId                       Y                           Must be ≥ earliest retained
+                                                                                                                           ExecID and > 0
+
+                         22004                               EndExecId                         N                           Defaults to the current last
+                                                                                                                           ExecID for the scope; must be ≥
+                                                                                                                           begin and ≤ last
+
+F4 EventResendComplete   45 / 22005                          RefSeqNum / ResentEventCount      Y                           Sent after the last replayed event
+
+F5 EventResendReject     45 / 22006 / 58                     RefSeqNum /                       Y/Y/N
+                                                             EventResendRejectReason /
+                                                             Text
+
+
+                               EventResendRejectReason(22006):
+
+                                   1.​ BEGIN_EXEC_ID_TOO_SMALL — begin before the retained window, non-positive begin,
+                                       or empty store
+                                   2.​ END_EXEC_ID_TOO_LARGE — end past last ExecID, or end < begin
+                                   3.​ RESEND_ALREADY_IN_PROGRESS — another resend is already active for this scope
+                                   4.​ TOO_MANY_RESEND_REQUESTS — defined in the dictionary (not currently emitted)
+                                   5.​ SERVER_ERROR — invalid ExecID format, or the server could not complete the resend
+Only one resend may be in progress per scope (firm or FCM) at a time. Events are retained for
+a bounded window; a BeginExecId older than the earliest retained event is rejected with
+BEGIN_EXEC_ID_TOO_SMALL.
+
+
+
+
+6. Administrative messages
+Standard FIXT.1.1 session messages: Heartbeat(0), TestRequest(1),
+ResendRequest(2), Reject(3), SequenceReset(4), Logout(5). Reject(3) carries a
+SessionRejectReason(373); app-level invalid/unknown inbound messages get a
+BusinessMessageReject(j) with BusinessRejectReason(380).

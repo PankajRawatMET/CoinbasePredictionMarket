@@ -1,0 +1,376 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  CPM FIX Order Entry gateway (TargetCompID=CPMOE) - application dictionary, FIX 5.0 SP2.
+  Source: docs/spec/fix-order-entry.txt. See docs/design-oms.md.
+
+  Message catalog, and nothing else:
+    client -> server  D NewOrderSingle, F OrderCancelRequest,
+                      q OrderMassCancelRequest, F1 LastExecIDRequest,
+                      F3 EventResendRequest
+    server -> client  8 ExecutionReport, 9 OrderCancelReject,
+                      r OrderMassCancelReport, UMS MarketSettlementReport,
+                      F2 LastExecID, F4 EventResendComplete,
+                      F5 EventResendReject, j BusinessMessageReject
+  Deliberately absent: G OrderCancelReplaceRequest and H OrderStatusRequest,
+  which the spec lists as not supported, and the market data types, which live
+  in FIX50SP2-CPMMD.xml.
+
+  CPM extensions: 1028 ManualOrderIndicator (required on D and F), 7928/8000
+  self-match prevention, 21009 MaxExecutionCost, 22003-22006 event resend,
+  20105/21052-21056 settlement, 1369 mass action report id.
+
+  Conditional ("C") fields in the spec are required="N" here and enforced in
+  application code, so the gateway's own reject path (BusinessMessageReject(j)
+  or ExecutionReport with 150=8) is what answers a bad request, rather than a
+  session-level Reject(3) from our engine.
+
+  Values the spec says are "defined but never emitted" are still declared, so a
+  message carrying one parses rather than failing validation: ExecType(150) 5
+  and 6, OrdStatus(39) 6, CxlRejResponseTo(434) 2, MassCancelResponse(531) 1.
+-->
+<fix type="FIX" major="5" minor="0" servicepack="2">
+  <header/>
+  <trailer/>
+  <messages>
+
+    <!-- Client -> server -->
+
+    <message name="NewOrderSingle" msgtype="D" msgcat="app">
+      <field name="ClOrdID" required="Y"/>
+      <field name="Symbol" required="Y"/>
+      <field name="Side" required="Y"/>
+      <field name="OrderQty" required="Y"/>
+      <!-- C: required for OrdType=LIMIT(2), forbidden for MARKET(1). -->
+      <field name="Price" required="N"/>
+      <field name="OrdType" required="Y"/>
+      <field name="TimeInForce" required="N"/>
+      <field name="ExecInst" required="N"/>
+      <!-- C: FOK only, and must be positive. -->
+      <field name="MaxExecutionCost" required="N"/>
+      <field name="SelfMatchPreventionId" required="N"/>
+      <field name="SelfMatchPreventionStrategy" required="N"/>
+      <field name="ManualOrderIndicator" required="Y"/>
+      <!-- Exactly one entry with PartyRole=24 (CustomerAccount) is required. -->
+      <group name="NoPartyIDs" required="Y">
+        <field name="PartyID" required="N"/>
+        <field name="PartyRole" required="N"/>
+      </group>
+    </message>
+
+    <message name="OrderCancelRequest" msgtype="F" msgcat="app">
+      <field name="ClOrdID" required="Y"/>
+      <!-- C: either OrigClOrdID or OrderID; OrderID wins when both are sent. -->
+      <field name="OrigClOrdID" required="N"/>
+      <field name="OrderID" required="N"/>
+      <field name="Symbol" required="Y"/>
+      <field name="Side" required="Y"/>
+      <field name="ManualOrderIndicator" required="Y"/>
+    </message>
+
+    <message name="OrderMassCancelRequest" msgtype="q" msgcat="app">
+      <field name="ClOrdID" required="Y"/>
+      <field name="MassCancelRequestType" required="Y"/>
+      <!-- C: required when MassCancelRequestType=1. -->
+      <field name="Symbol" required="N"/>
+      <field name="Side" required="N"/>
+      <group name="NoPartyIDs" required="N">
+        <field name="PartyID" required="N"/>
+        <field name="PartyRole" required="N"/>
+      </group>
+    </message>
+
+    <!-- F1 carries no parameters; TestReqID is declared only because a FIX
+         dictionary needs at least one field, and the gateway ignores it. -->
+    <message name="LastExecIDRequest" msgtype="F1" msgcat="app">
+      <field name="TestReqID" required="N"/>
+    </message>
+
+    <message name="EventResendRequest" msgtype="F3" msgcat="app">
+      <field name="BeginExecId" required="Y"/>
+      <field name="EndExecId" required="N"/>
+    </message>
+
+    <!-- Server -> client -->
+
+    <message name="ExecutionReport" msgtype="8" msgcat="app">
+      <field name="ClOrdID" required="Y"/>
+      <field name="OrigClOrdID" required="N"/>
+      <field name="OrderID" required="Y"/>
+      <field name="ExecID" required="Y"/>
+      <field name="ExecType" required="Y"/>
+      <field name="OrdStatus" required="Y"/>
+      <field name="Symbol" required="Y"/>
+      <field name="Side" required="Y"/>
+      <field name="OrderQty" required="N"/>
+      <field name="Price" required="N"/>
+      <field name="LeavesQty" required="Y"/>
+      <field name="CumQty" required="Y"/>
+      <field name="AvgPx" required="N"/>
+      <!-- Present when ExecType=F. -->
+      <field name="LastQty" required="N"/>
+      <field name="LastPx" required="N"/>
+      <field name="TrdMatchID" required="N"/>
+      <field name="AggressorIndicator" required="N"/>
+      <field name="TimeInForce" required="N"/>
+      <field name="ExecInst" required="N"/>
+      <field name="OrdType" required="N"/>
+      <field name="SelfMatchPreventionId" required="N"/>
+      <field name="SelfMatchPreventionStrategy" required="N"/>
+      <field name="ManualOrderIndicator" required="Y"/>
+      <field name="TransactTime" required="Y"/>
+      <field name="ExecRestatementReason" required="N"/>
+      <!-- Present on ExecType=8 only; never on Expired or Canceled. -->
+      <field name="OrdRejReason" required="N"/>
+      <field name="Text" required="N"/>
+      <!-- Exactly one entry, present when ExecType=F. -->
+      <group name="NoMiscFees" required="N">
+        <field name="MiscFeeAmt" required="N"/>
+        <field name="MiscFeeCurr" required="N"/>
+        <field name="MiscFeeType" required="N"/>
+      </group>
+      <!-- Always 5 entries, populated by the exchange, not an echo. -->
+      <group name="NoPartyIDs" required="N">
+        <field name="PartyID" required="N"/>
+        <field name="PartyRole" required="N"/>
+      </group>
+    </message>
+
+    <message name="OrderCancelReject" msgtype="9" msgcat="app">
+      <field name="ClOrdID" required="Y"/>
+      <field name="OrigClOrdID" required="N"/>
+      <!-- Sentinel 0 when the order is unknown. -->
+      <field name="OrderID" required="N"/>
+      <!-- Always U: the reject carries no order state. -->
+      <field name="OrdStatus" required="Y"/>
+      <field name="CxlRejReason" required="N"/>
+      <field name="CxlRejResponseTo" required="Y"/>
+      <field name="Text" required="Y"/>
+    </message>
+
+    <message name="OrderMassCancelReport" msgtype="r" msgcat="app">
+      <field name="ClOrdID" required="Y"/>
+      <!-- 0 when the request was rejected on receipt. -->
+      <field name="MassActionReportID" required="Y"/>
+      <field name="MassCancelRequestType" required="Y"/>
+      <field name="MassCancelResponse" required="Y"/>
+      <field name="MassCancelRejectReason" required="N"/>
+      <!-- The authoritative signal for what was actually canceled. -->
+      <field name="TotalAffectedOrders" required="N"/>
+      <field name="TransactTime" required="Y"/>
+      <field name="Text" required="N"/>
+    </message>
+
+    <message name="MarketSettlementReport" msgtype="UMS" msgcat="app">
+      <field name="MarketSettlementReportID" required="Y"/>
+      <field name="Symbol" required="Y"/>
+      <!-- 2 entries: ClearingFirm(4) then ExecutingFirm(1). -->
+      <group name="NoPartyIDs" required="Y">
+        <field name="PartyID" required="N"/>
+        <field name="PartyRole" required="N"/>
+      </group>
+      <field name="SettlementOutcome" required="Y"/>
+      <field name="SettlementPrice" required="Y"/>
+      <field name="PositionAggregationMode" required="Y"/>
+      <field name="LongQty" required="Y"/>
+      <field name="ShortQty" required="Y"/>
+      <field name="PayoutAmount" required="Y"/>
+      <field name="TransactTime" required="Y"/>
+    </message>
+
+    <message name="LastExecID" msgtype="F2" msgcat="app">
+      <field name="RefSeqNum" required="Y"/>
+      <!-- Sentinel 0 when the retention window holds no events. -->
+      <field name="ExecID" required="Y"/>
+    </message>
+
+    <message name="EventResendComplete" msgtype="F4" msgcat="app">
+      <field name="RefSeqNum" required="Y"/>
+      <field name="ResentEventCount" required="Y"/>
+    </message>
+
+    <message name="EventResendReject" msgtype="F5" msgcat="app">
+      <field name="RefSeqNum" required="Y"/>
+      <field name="EventResendRejectReason" required="Y"/>
+      <field name="Text" required="N"/>
+    </message>
+
+    <message name="BusinessMessageReject" msgtype="j" msgcat="app">
+      <field name="RefSeqNum" required="N"/>
+      <field name="RefMsgType" required="Y"/>
+      <field name="BusinessRejectRefID" required="N"/>
+      <field name="BusinessRejectReason" required="Y"/>
+      <field name="Text" required="N"/>
+    </message>
+
+  </messages>
+  <components/>
+  <fields>
+    <field number="6" name="AvgPx" type="PRICE"/>
+    <field number="11" name="ClOrdID" type="STRING"/>
+    <field number="14" name="CumQty" type="QTY"/>
+    <field number="17" name="ExecID" type="STRING"/>
+    <field number="18" name="ExecInst" type="MULTIPLECHARVALUE">
+      <!-- CPM post-only modes. Reject mode wins if both are set. -->
+      <value enum="6" description="POST_ONLY_SLIDE"/>
+      <value enum="A" description="POST_ONLY_REJECT"/>
+    </field>
+    <field number="31" name="LastPx" type="PRICE"/>
+    <field number="32" name="LastQty" type="QTY"/>
+    <field number="37" name="OrderID" type="STRING"/>
+    <field number="38" name="OrderQty" type="QTY"/>
+    <field number="39" name="OrdStatus" type="CHAR">
+      <value enum="0" description="NEW"/>
+      <value enum="1" description="PARTIALLY_FILLED"/>
+      <value enum="2" description="FILLED"/>
+      <value enum="4" description="CANCELED"/>
+      <!-- Declared for parsing only: the gateway never emits 6. -->
+      <value enum="6" description="PENDING_CANCEL"/>
+      <value enum="8" description="REJECTED"/>
+      <value enum="A" description="PENDING_NEW"/>
+      <value enum="C" description="EXPIRED"/>
+      <!-- OrderCancelReject(9) always carries U. -->
+      <value enum="U" description="UNDEFINED"/>
+    </field>
+    <field number="40" name="OrdType" type="CHAR">
+      <value enum="1" description="MARKET"/>
+      <value enum="2" description="LIMIT"/>
+    </field>
+    <field number="41" name="OrigClOrdID" type="STRING"/>
+    <field number="44" name="Price" type="PRICE"/>
+    <field number="45" name="RefSeqNum" type="SEQNUM"/>
+    <field number="54" name="Side" type="CHAR">
+      <!-- Both refer to the YES contract: BUY_NO at P = SELL YES at 1.000 - P. -->
+      <value enum="1" description="BUY"/>
+      <value enum="2" description="SELL"/>
+    </field>
+    <field number="55" name="Symbol" type="STRING"/>
+    <field number="58" name="Text" type="STRING"/>
+    <field number="59" name="TimeInForce" type="CHAR">
+      <value enum="1" description="GOOD_TILL_CANCEL"/>
+      <value enum="3" description="IMMEDIATE_OR_CANCEL"/>
+      <value enum="4" description="FILL_OR_KILL"/>
+    </field>
+    <field number="60" name="TransactTime" type="UTCTIMESTAMP"/>
+    <field number="102" name="CxlRejReason" type="INT">
+      <value enum="0" description="TOO_LATE_TO_CANCEL"/>
+      <value enum="1" description="UNKNOWN_ORDER"/>
+      <value enum="3" description="ORDER_ALREADY_PENDING_CANCEL"/>
+    </field>
+    <field number="103" name="OrdRejReason" type="INT">
+      <value enum="1" description="UNKNOWN_SYMBOL"/>
+      <value enum="3" description="ORDER_EXCEEDS_LIMIT"/>
+      <value enum="6" description="DUPLICATE_ORDER"/>
+      <value enum="11" description="UNSUPPORTED_ORDER_CHARACTERISTIC"/>
+      <value enum="13" description="INCORRECT_QUANTITY"/>
+      <value enum="15" description="UNKNOWN_ACCOUNT"/>
+      <value enum="16" description="PRICE_EXCEEDS_BAND"/>
+      <value enum="18" description="INVALID_PRICE_INCREMENT"/>
+      <value enum="25" description="INSUFFICIENT_CREDIT_LIMIT"/>
+      <value enum="41" description="EXCEEDED_POSITION_LIMIT"/>
+      <value enum="42" description="INVALID_CLIENT"/>
+      <value enum="43" description="CLIENT_PERMISSION_ERROR"/>
+      <value enum="44" description="NOT_ALLOWED_BY_MARKET_STATE"/>
+      <value enum="48" description="REDUCE_ONLY"/>
+      <value enum="99" description="OTHER"/>
+    </field>
+    <field number="136" name="NoMiscFees" type="NUMINGROUP"/>
+    <field number="137" name="MiscFeeAmt" type="AMT"/>
+    <field number="138" name="MiscFeeCurr" type="CURRENCY"/>
+    <field number="139" name="MiscFeeType" type="INT">
+      <value enum="4" description="EXCHANGE_FEES"/>
+    </field>
+    <field number="112" name="TestReqID" type="STRING"/>
+    <field number="150" name="ExecType" type="CHAR">
+      <value enum="0" description="NEW"/>
+      <value enum="4" description="CANCELED"/>
+      <!-- Declared for parsing only: no amend, and cancels have no pending state. -->
+      <value enum="5" description="REPLACED"/>
+      <value enum="6" description="PENDING_CANCEL"/>
+      <value enum="8" description="REJECTED"/>
+      <value enum="A" description="PENDING_NEW"/>
+      <value enum="C" description="EXPIRED"/>
+      <value enum="F" description="TRADE"/>
+    </field>
+    <field number="151" name="LeavesQty" type="QTY"/>
+    <field number="372" name="RefMsgType" type="STRING"/>
+    <field number="378" name="ExecRestatementReason" type="INT">
+      <!-- CPM meanings; only emitted on unsolicited cancels that have one. -->
+      <value enum="1" description="CANCEL_ON_DISCONNECT"/>
+      <value enum="2" description="INSTRUMENT_LIFECYCLE"/>
+      <value enum="7" description="CANCEL_SELF_MATCH_PREVENTION"/>
+      <value enum="105" description="ADMIN_CANCEL"/>
+    </field>
+    <field number="379" name="BusinessRejectRefID" type="STRING"/>
+    <field number="380" name="BusinessRejectReason" type="INT">
+      <value enum="0" description="OTHER"/>
+      <value enum="2" description="UNKNOWN_ID"/>
+    </field>
+    <field number="434" name="CxlRejResponseTo" type="CHAR">
+      <value enum="1" description="ORDER_CANCEL_REQUEST"/>
+      <!-- Declared for parsing only: there is no amend. -->
+      <value enum="2" description="ORDER_CANCEL_REPLACE_REQUEST"/>
+    </field>
+    <field number="448" name="PartyID" type="STRING"/>
+    <field number="452" name="PartyRole" type="INT">
+      <value enum="1" description="EXECUTING_FIRM"/>
+      <value enum="4" description="CLEARING_FIRM"/>
+      <value enum="11" description="ORDER_ORIGINATION_TRADER"/>
+      <value enum="24" description="CUSTOMER_ACCOUNT"/>
+      <value enum="55" description="SESSION_ID"/>
+    </field>
+    <field number="453" name="NoPartyIDs" type="NUMINGROUP"/>
+    <field number="530" name="MassCancelRequestType" type="CHAR">
+      <value enum="1" description="CANCEL_ORDERS_FOR_A_SECURITY"/>
+      <!-- 6 and 7 behave identically: an API key has one active session. -->
+      <value enum="6" description="CANCEL_ORDERS_FOR_A_TRADING_SESSION"/>
+      <value enum="7" description="CANCEL_ALL_ORDERS"/>
+    </field>
+    <field number="531" name="MassCancelResponse" type="CHAR">
+      <value enum="0" description="CANCEL_REQUEST_REJECTED"/>
+      <!-- Declared for parsing only: an accepted mass cancel always reports 7. -->
+      <value enum="1" description="CANCEL_ORDERS_FOR_A_SECURITY"/>
+      <value enum="7" description="CANCEL_ALL_ORDERS"/>
+    </field>
+    <field number="532" name="MassCancelRejectReason" type="INT">
+      <value enum="0" description="MASS_CANCEL_NOT_SUPPORTED"/>
+      <value enum="1" description="INVALID_OR_UNKNOWN_SECURITY"/>
+      <value enum="99" description="OTHER"/>
+    </field>
+    <field number="533" name="TotalAffectedOrders" type="INT"/>
+    <field number="730" name="SettlementPrice" type="PRICE"/>
+    <field number="880" name="TrdMatchID" type="STRING"/>
+    <field number="1028" name="ManualOrderIndicator" type="BOOLEAN"/>
+    <field number="1057" name="AggressorIndicator" type="BOOLEAN"/>
+    <field number="1369" name="MassActionReportID" type="STRING"/>
+    <field number="7928" name="SelfMatchPreventionId" type="INT"/>
+    <field number="8000" name="SelfMatchPreventionStrategy" type="CHAR">
+      <value enum="N" description="CANCEL_AGGRESSING"/>
+      <value enum="O" description="CANCEL_RESTING"/>
+      <value enum="Q" description="CANCEL_BOTH"/>
+    </field>
+    <field number="20105" name="MarketSettlementReportID" type="STRING"/>
+    <field number="21009" name="MaxExecutionCost" type="AMT"/>
+    <field number="21052" name="SettlementOutcome" type="CHAR">
+      <value enum="Y" description="YES_WINS"/>
+      <value enum="N" description="NO_WINS"/>
+      <value enum="S" description="SCALAR"/>
+    </field>
+    <field number="21053" name="PositionAggregationMode" type="CHAR">
+      <value enum="N" description="NET"/>
+      <value enum="G" description="GROSS"/>
+    </field>
+    <field number="21054" name="LongQty" type="QTY"/>
+    <field number="21055" name="ShortQty" type="QTY"/>
+    <field number="21056" name="PayoutAmount" type="AMT"/>
+    <field number="22003" name="BeginExecId" type="STRING"/>
+    <field number="22004" name="EndExecId" type="STRING"/>
+    <field number="22005" name="ResentEventCount" type="INT"/>
+    <field number="22006" name="EventResendRejectReason" type="INT">
+      <value enum="1" description="BEGIN_EXEC_ID_TOO_SMALL"/>
+      <value enum="2" description="END_EXEC_ID_TOO_LARGE"/>
+      <value enum="3" description="RESEND_ALREADY_IN_PROGRESS"/>
+      <value enum="4" description="TOO_MANY_RESEND_REQUESTS"/>
+      <value enum="5" description="SERVER_ERROR"/>
+    </field>
+  </fields>
+</fix>
