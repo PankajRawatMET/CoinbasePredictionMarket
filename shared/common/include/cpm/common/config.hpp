@@ -91,6 +91,19 @@ Credentials load_credentials(const EnvLookup& env, const std::string& prefix = "
 // CPM_FIX_TARGET_COMP_ID (optional, default CPMMD), then validates it. Error messages name variables, never their values.
 MdConfig load_md_config(const EnvLookup& env);
 
+// The REST instrument catalog's credentials (creds-rest.env, CPM_REST_*).
+// Unlike the two FIX sets this one is optional: without it a series cannot be
+// resolved at startup, but everything that names a full ticker still works.
+// So missing values are not an error here - the caller asks configured().
+struct RestCredentials {
+    std::string api_key;
+    std::string passphrase;
+    std::string secret_b64;
+    std::string url;
+    std::string ca_file;
+};
+RestCredentials load_rest_config(const EnvLookup& env);
+
 // Builds OeConfig from CPM_OE_API_KEY, CPM_OE_PASSPHRASE, CPM_OE_SECRET,
 // CPM_OE_HOST, CPM_OE_PORT, CPM_OE_TLS (default 1), CPM_OE_CA_FILE (optional),
 // CPM_OE_SUBACCOUNT (optional until an order is sent),

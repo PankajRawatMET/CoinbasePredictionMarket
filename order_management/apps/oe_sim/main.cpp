@@ -3,7 +3,7 @@
 // the sandbox where they are known (OE-O2) and the spec's where they are not.
 //
 //   terminal 1:  source config/oe-sim.env && ./build/order_management/oe_sim
-//   terminal 2:  source config/oe-sim.env && ./build/order_management/oe_client \
+//   terminal 2:  source config/oe-sim.env && ./build/order_management/oe_client
 //                  --allow-orders --test-order SIMOE-26NOV01HOMAWY-HOM --price 0.5
 #include "cpm/common/config.hpp"
 #include "cpm/common/logging.hpp"

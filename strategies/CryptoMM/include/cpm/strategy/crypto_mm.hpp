@@ -1,13 +1,15 @@
 #pragma once
 
-#include "cpm/md/market_state.hpp"
-#include "cpm/oms/order_state.hpp"
-#include "cpm/oms/orders.hpp"
+#include "cpm/md/ticker.hpp"
+#include "cpm/md/ticks.hpp"
+#include "cpm/strategy/registry.hpp"
 
 #include <functional>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 // CryptoMM: a two-sided quoting strategy. It quotes a bid and an ask a fixed
 // number of ticks either side of the mid, each for a fixed quantity, and
@@ -17,24 +19,17 @@
 // from order_management - and on neither of them depending on it.
 namespace cpm::strategy {
 
-using cpm::md::InstrumentView;
-using cpm::oms::CancelOrder;
-using cpm::oms::ExecutionReport;
-using cpm::oms::NewOrder;
-using cpm::oms::Position;
-using Clock = cpm::oms::Clock;
+// InstrumentView, Position, ExecutionReport, NewOrder, CancelOrder and Clock
+// all come from cpm/strategy/strategy.hpp, via registry.hpp.
 
 // The tick grid, from the REST PriceLevelStructure values (docs/design.md O5).
-// The client cannot read an instrument's structure over FIX, so it is
-// configured; TAPERED_DECI_CENT is what the crypto series use.
-enum class TickStructure {
-    LinearCent,       // 0.01 everywhere
-    DeciCent,         // 0.001 everywhere
-    TaperedDeciCent,  // 0.001 below 0.100 and above 0.900, 0.01 between
-};
-
-// The tick size at a price, in thousandths.
-Price tick_at(Price price, TickStructure structure);
+// TAPERED_DECI_CENT is what the crypto series use.
+//
+// It now belongs to the instrument rather than to this strategy - a grid
+// decides what any order may be priced at, and what rungs a ladder has - so
+// the definition lives in cpm/md/ticks.hpp and these names stay as they were.
+using TickStructure = cpm::md::TickStructure;
+using cpm::md::tick_at;
 
 struct Params {
     std::string symbol;
@@ -49,6 +44,26 @@ struct Params {
     // Re-quote only when the target has moved at least this many ticks, so a
     // one-tick flicker does not cause a cancel and replace on every update.
     int requote_threshold_ticks = 1;
+    // Stop quoting this many seconds before the window ends, cancelling what
+    // is resting while the market is still open.
+    //
+    // Zero - the default - means quote to the bell and let the venue cancel
+    // at the close, which it does (ExecRestatementReason=2). That is safe
+    // mechanically: what it accepts is the trading risk of resting through
+    // the last seconds of a binary, where the informed flow is.
+    //
+    // It needs a window end to act on, which comes from the instrument's own
+    // name ([MD] O2). On an instrument whose name carries no end - a sports
+    // market, a simulator symbol - there is nothing to count back from and
+    // this does nothing.
+    std::chrono::seconds withdraw_before{0};
+    // The speed bump (GUI column PricingMidMoveThreshold, B-Q2). If the
+    // reference venue's mid moves this many of ITS ticks away from where it
+    // was when these quotes were placed, the quotes are stale: cancel them
+    // and do not come back until this market has repriced.
+    //
+    // 0 - the default - is off, and the strategy is exactly what it was.
+    std::int64_t mid_move_threshold_ticks = 0;
 };
 
 // One side's target, or nothing when that side should not be quoted.
@@ -79,27 +94,34 @@ DesiredQuotes desired_quotes(const InstrumentView& book, const Position& positio
 class QuoteManager {
 public:
     // Everything it needs from the outside, so it can be driven by a test.
-    struct Hooks {
-        // False while reconciling or after a halt: nothing may be submitted.
-        std::function<bool()> can_submit;
-        std::function<std::string(const NewOrder&)> send;  // returns the ClOrdID
-        std::function<bool(const CancelOrder&)> cancel;
-        std::function<std::string()> next_cl_ord_id;
-        std::function<void(const std::string&)> log;
-    };
+    // The host composes these - arming and the halt are folded into
+    // can_submit before they get here - so this is the host's StrategyHooks.
+    using Hooks = StrategyHooks;
 
     QuoteManager(Params params, Hooks hooks);
 
     // One pass: compare the desired quotes with the live ones and act.
     void on_market(const InstrumentView& book, const Position& position, Clock::time_point now);
+    // The reference venue moved. Called on every update from it, which is
+    // many times a second and not on this market's cadence, so it does as
+    // little as it can: compare, and cancel if the comparison says to.
+    void on_reference(const cpm::binance::ReferenceView& reference, Clock::time_point now);
     // Keeps track of which quotes are live. Must be fed every report for this
     // instrument, including the unsolicited ones.
     void on_report(const ExecutionReport& report);
     // Cancels both quotes and stops quoting until the next on_market().
     void withdraw(const std::string& why);
+    // Drop the quotes without sending anything: the window has closed and the
+    // venue has already cancelled them (ExecRestatementReason=2).
+    void abandon(const std::string& why);
 
     std::optional<Quote> live_bid() const;
     std::optional<Quote> live_ask() const;
+    // Both quotes as the host reports them, with the ids and the pending
+    // cancels that live_bid()/live_ask() leave out.
+    std::vector<LiveLeg> legs() const;
+    // Nothing of ours is left at the venue.
+    bool quiescent() const { return !bid_ && !ask_; }
     std::size_t quotes_placed() const { return placed_; }
     std::size_t quotes_cancelled() const { return cancelled_; }
     std::size_t fills() const { return fills_; }
@@ -145,6 +167,64 @@ private:
     std::size_t passes_without_quotes_ = 0;
     std::string last_reason_;
     std::string last_announcement_;
+
+    // --- the speed bump ---------------------------------------------------
+    // Where the reference was when these quotes were placed. The measure is
+    // always "since we priced", never a drift summed across re-quotes
+    // (B-Q9), so this is refreshed on every place and replace.
+    std::optional<Price> reference_at_quote_;
+    // The latest the reference feed has said, and whether it can be trusted.
+    cpm::binance::ReferenceView reference_;
+    // Sitting out after a breach, until this market moves a tick from where
+    // it was when we left (B-Q3).
+    bool held_ = false;
+    std::optional<Price> mid_at_withdraw_;
+    // The mid of the last book we were shown, which is what the release
+    // above is measured against.
+    std::optional<Price> last_market_mid_;
 };
+
+// CryptoMM as the host runs it: a QuoteManager, its parameters, and nothing
+// else. The decision still lives in desired_quotes() and the driving still
+// lives in QuoteManager; this only adapts them to IStrategy.
+class CryptoMm final : public IStrategy {
+public:
+    CryptoMm(Params params, StrategyHooks hooks);
+
+    void on_market(const InstrumentView& book, const Position& position,
+                   Clock::time_point now) override;
+    void on_reference(const cpm::binance::ReferenceView& reference,
+                      Clock::time_point now) override;
+    void on_report(const ExecutionReport& report) override;
+    void withdraw(const std::string& why) override;
+    void abandon(const std::string& why) override;
+    bool quiescent() const override;
+    std::vector<std::string> symbols() const override;
+    StrategyStatus status() const override;
+
+    const Params& params() const { return params_; }
+
+private:
+    Params params_;
+    QuoteManager manager_;
+    // The instrument's own window end, parsed once. The outer optional is
+    // "not looked at yet"; the inner one is "this name has no end", which is
+    // the answer for a sports market or a simulator symbol.
+    std::optional<std::optional<cpm::md::Ticker>> window_end_;
+    bool withdrawn_for_close_ = false;
+};
+
+// The parameters CryptoMM takes, described once. The GUI renders a form from
+// this and crypto_mm validates its flags against it, so the two cannot
+// disagree about what --width-ticks 0 means.
+ParamSchema crypto_mm_schema();
+// Turns an already validated value set into Params.
+Params crypto_mm_params(const ParamValues& values);
+// The "tapered" / "cent" / "deci" spelling the schema, the CLI and the GUI
+// share, from cpm/md/ticks.hpp.
+using cpm::md::tick_structure_from;
+using cpm::md::to_string;
+
+void register_crypto_mm(StrategyRegistry& registry);
 
 }  // namespace cpm::strategy

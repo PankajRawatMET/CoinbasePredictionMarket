@@ -1,0 +1,297 @@
+CPM AUTO-ROLL - OPEN QUESTIONS (Stage R0)
+=========================================
+Raised 2026-10-28, from: "handle auto roll, for now I am just quoting BTCD15M
+and ETHD15M, so in symbol I will put these two and it should automatically
+fetch the current ticker and then roll as time goes".
+
+Same format as the other open-question files: the question, the reference, and
+the proposed answer, which is what gets built unless you say otherwise.
+
+R-Q2 is the one that needs you before R2 is written. R-Q1 turned out to be
+answerable from the spec and is recorded below as resolved. Everything else
+has a default that is safe to build.
+
+References:
+  [MD]   = docs/open-questions.txt (market data)
+  [OMS]  = docs/open-questions-oms.txt (order entry)
+  "O6"   = the all-instrument lifecycle capture, docs/spec/capture-sandbox-20261023T1117.log
+  "roll" = docs/spec/capture-sandbox-20261026T0607-roll.log
+
+=============================================================================
+A. THE TWO THAT DECIDE R2
+=============================================================================
+
+R-Q1  What happens to a resting order when a window closes?
+-----------------------------------------------------------------------------
+Question : If our quotes are still resting when the window closes, what does
+           the venue do - and what should we do?
+Answer   : ANSWERED BY THE SPEC 2026-10-28, and it inverts the proposal R0 was
+           written with.
+
+           The venue cancels them itself. ExecRestatementReason(378) is
+           "present on unsolicited cancels" and 2 = "Instrument lifecycle
+           (closed/determined/paused)" (OE spec, ExecutionReport field table).
+           So a resting order at the close terminates as an ordinary
+           unsolicited ExecType=CANCELED(4) report carrying 378=2.
+
+           Every layer already handles that, today, with no new code:
+             - oe_decoder maps 378=2 to CancelReason::InstrumentLifecycle;
+             - the reconciler halts on ExecType=REJECTED only, not on a
+               cancel;
+             - QuoteManager::on_report resets the quote on Canceled whether or
+               not it was the one who asked.
+
+           The danger is the opposite of what was assumed. Cancelling INTO the
+           close is what breaks: if our cancel reaches the gateway after the
+           lifecycle cancel has already terminated the order, the reply is
+           OrderCancelReject with CxlRejReason(102)=1 UNKNOWN_ORDER - "an
+           order that was already canceled ... reports UNKNOWN_ORDER(1)" - and
+           any OrderCancelReject halts the daemon (OE-Q6). Leaving an order
+           alone at the close is safe; racing the close with a cancel is not.
+
+Built    : BUILT 2026-10-28, ahead of R2, because the default the operator
+           asked for would otherwise have raced the venue at every close:
+             - IStrategy gained abandon(), which drops the quotes and sends
+               nothing; the host calls it instead of withdraw() when an
+               instrument stops being tradable, and withdraw() everywhere
+               else (operator stop, halt, withdraw-before);
+             - CryptoMM gained the withdraw-before parameter, default 0;
+             - cpm::md::parse_ticker reads the window end out of the
+               instrument name, so the strategy can count back from it.
+           So R2 does both halves of "cancel early, never cancel late":
+           (a) withdraw --withdraw-before seconds ahead of the window end -
+               now for a trading reason rather than a plumbing one, since the
+               last seconds of a binary are where the informed flow is;
+           (b) send no cancel at all inside that window, and none once Closed
+               is seen. Anything still resting is the venue's to cancel, and
+               it will.
+
+Residual : One case survives: a fill in the final second can leave a new quote
+           in flight that the lifecycle cancel then terminates, and our own
+           cancel could still cross it. The spec says how to tell that case
+           from a real one - "correlate against the ExecutionReports you have
+           already received for that ClOrdID (a prior Canceled/Expired report
+           means it had already terminated)" - and OrderState already holds
+           exactly that. If R4 sees it happen, the narrow fix is: an
+           OrderCancelReject of UNKNOWN_ORDER for an order we have already
+           seen terminate is logged rather than halted. That is not a hole in
+           fail-stop; it is the one case the spec itself defines as benign.
+           Nothing else about the halt rule changes.
+Status   : RESOLVED from the spec; R4 confirms the residual case at the venue.
+
+R-Q2  How does the daemon learn the current window at startup?
+-----------------------------------------------------------------------------
+Question : You will type BTCD15M. Which instrument is that, right now?
+Evidence : It cannot be learned over FIX. The all-instrument lifecycle feed is
+           changes-only: in O6 the subscription was sent at 11:17:17 and the
+           first message arrived at 11:20:00, the next boundary. Per-symbol
+           lifecycle behaves the same, which is why a status is Unknown until
+           something changes ([MD] Q13). Neither fix-market-data.txt nor
+           fix-order-entry.txt defines a SecurityList or any other "what is
+           listed" request.
+Options  : (a) WAIT. The strategy sits on its series doing nothing until the
+               next window opens - at most 15 minutes for D15M, and it then
+               starts at the beginning of a clean window rather than halfway
+               through one. No new dependency, no reject risk, and the GUI
+               says "waiting for the first window of BTCD15M".
+           (b) DERIVE. The ticker is deterministic: series minus the D15M
+               suffix gives the asset, the clock gives YYMMMDD and the next
+               15-minute boundary gives HHMM, so BTCD15M at 06:07 UTC today
+               is BTCD15M-BTC26OCT260615-0. Cheap and instant - but a wrong
+               guess is an unknown-symbol reject, and that halts. It would
+               need a narrow "this one subscription's reject is not a halt"
+               exemption to be safe, which is the same kind of hole as
+               R-Q1(b).
+           (c) REST. Ask the venue for status=OPEN, which is how the O2
+               example instrument was obtained. It is the correct answer and
+               the expensive one: an HTTP client and REST authentication in a
+               project whose dependency rule is QuickFIX and GoogleTest only.
+Proposal : (a) WAIT, with (b) available later behind a flag if the wait turns
+           out to annoy you in practice. A 15-minute series is not worth a new
+           dependency or a hole in fail-stop to join half a window early.
+Answer   : (c) REST, decided 2026-10-28 by the operator: typing BTCD15M must
+           start quoting the current window, not the next one.
+           What it takes, from the API spec:
+             GET /api/v1/instruments?series_ticker=BTCD15M&status=OPEN
+             headers CB-ACCESS-KEY / -SIGN / -PASSPHRASE / -TIMESTAMP
+             sign = base64(HMAC-SHA256(ts + method + path)), query params
+             excluded, empty body on a GET (spec 2.2) - which is exactly
+             cpm::hmac_sha256_b64, already written for the FIX logon.
+           Costs: an HTTPS GET client on the OpenSSL already linked (~250
+           lines), and the JSON reader moved out of gui/ into shared/ so both
+           can use it. No third-party dependency is added.
+           Credentials live in creds-rest.env (CPM_REST_*), created
+           2026-10-28; the key needs the MARKET_DATA permission.
+           Called once per series at startup and on reconnect, never polled:
+           REST says what is open now, the FIX lifecycle feed says what just
+           changed. This reverses [MD] Q13 ("no REST"), which was decided for
+           lifecycle state before anything needed to resolve a series.
+           Bonus, and not a small one: the instrument object carries
+           price_level_structure, so the tick grid stops being the
+           --tick-structure guess that GUI-Q23 flagged and becomes something
+           the venue states per instrument.
+Proven   : 2026-10-28, against the sandbox, first attempt - HTTP 200 with the
+           signature exactly as planned. Capture:
+           docs/spec/capture-rest-20261028T1205-instruments.txt.
+             BTCD15M -> BTCD15M-BTC26OCT281215-0  OPEN
+             ETHD15M -> ETHD15M-ETH26OCT281215-0  OPEN
+           Three things R1b must build to, learned from it:
+             - ONE SERIES PER CALL. series_ticker=A&series_ticker=B is HTTP
+               400; A,B is HTTP 200 with zero rows, read as one literal
+               ticker. Two series, two calls.
+             - THE WINDOW END COMES FOR FREE. expected_close_time and
+               metadata.market.window_end_time both carry it, so
+               withdraw-before does not need the ticker parsed when REST has
+               answered. close_time is null while the instrument is open - it
+               is the most recent transition to CLOSED, not the schedule.
+               parse_ticker stays as the fallback and the cross-check.
+             - THE OBJECT CARRIES MORE THAN THE TICKER. price_level_structure
+               (GUI-Q23), min_order_size, contract_size,
+               position_limit_per_instrument, speedbump_ms, open_interest,
+               total_volume, and metadata.market.price_strike with the
+               window's start and end. Several of those are risk inputs
+               nothing else in this system can see.
+Status   : ANSWERED and PROVEN. Nothing blocks R1b.
+
+R-Q9  Should a bad symbol halt the daemon?
+-----------------------------------------------------------------------------
+Question : Until rolling is built, typing BTCD15M into the symbol field used
+           to return {"ok":true} and then halt the daemon four seconds later:
+           "MarketDataRequestReject 281=0: unknown symbol=BTCD15M". A typo in
+           a form field ended the trading session.
+Built    : 2026-10-28. A name that could never be an instrument - no dash, so
+           a bare series - is refused at create time with a message naming the
+           shape a ticker has. Nothing is sent, nothing is half-built, and the
+           daemon stays live. Verified against md_sim before and after.
+Remaining: That catches the series name. It does NOT catch a typo in a real
+           ticker (BTCD15M-BTC26OCT260631-0), because nothing on either FIX
+           session can be asked whether a symbol exists - there is no
+           SecurityList (R-Q2) - so the gateway's reject is still the first
+           news, and it still halts.
+Question : Should the FIRST subscription of a newly created strategy be a
+ for you    probe: its reject refuses the create instead of halting the
+           daemon?
+           The case for: a reject for a subscription we just sent, for a
+           symbol we hold no book and no orders on, says "that name does not
+           exist" - it says nothing about the feed we are already trading, so
+           halting everything is a strange response to a typo.
+           The case against: amendment 4 says any reject halts, full stop, and
+           every exception is a place where a real fault can hide. This one is
+           narrow - one MDReqID, sent moments ago, still unanswered - but it
+           is an exception.
+           Not built either way. Say which you want.
+Status   : PARTLY BUILT; the probe question is open.
+
+=============================================================================
+B. DECIDED, UNLESS YOU SAY OTHERWISE
+=============================================================================
+
+R-Q3  A position row per window
+-----------------------------------------------------------------------------
+Question : OrderState keeps a position per symbol. A D15M series is 96 windows
+           a day, so after a day of rolling the positions table has 96 rows
+           per series, nearly all of them settled and closed.
+Proposal : Keep every row in the daemon - they are the audit trail, and the
+           settled ones carry the payout - but have the GUI show the current
+           window's position by default, with the settled ones behind a
+           "closed windows" toggle and a per-series total. Nothing is thrown
+           away; the screen simply stops being a list of everything that ever
+           happened.
+Status   : DEFAULTED 2026-10-28.
+
+R-Q4  What is a "target", and can it still be an instrument?
+-----------------------------------------------------------------------------
+Question : If `symbol` becomes a series, does the explicit ticker still work?
+Proposal : Yes. The parameter keeps its name and takes either: a series
+           (`BTCD15M`, no dashes) rolls; an explicit ticker
+           (`BTCD15M-BTC26OCT260630-0`) pins to that one window and behaves
+           exactly as today, which is what a one-off test or a replay wants.
+           The two are told apart by shape, and the schema's help says so.
+Status   : DEFAULTED 2026-10-28.
+
+R-Q5  Does arming survive a roll?
+-----------------------------------------------------------------------------
+Question : GUI-Q13 made stopping disarm, so that a restart cannot resume
+           trading on an old confirmation. Is a roll a restart?
+Proposal : No - arming survives. A roll is the strategy doing what it was
+           armed to do, not the operator restarting it, and an operator
+           re-confirming every 15 minutes would stop watching the
+           confirmation. The counters, the id and the claim survive with it.
+           Stop, halt and the kill switch all still disarm.
+Status   : DEFAULTED 2026-10-28.
+
+R-Q6  Two strategies, one series
+-----------------------------------------------------------------------------
+Question : GUI-Q6 refuses two strategies on one symbol because the position is
+           per symbol and could not be attributed between them. With rolling,
+           the symbol changes - what is claimed?
+Proposal : The target. Two strategies on BTCD15M are refused; BTCD15M and
+           ETHD15M together are fine. An explicit ticker claims that ticker,
+           and a series claims every window it will ever roll onto, so a
+           series and an explicit ticker of the same series collide and the
+           second is refused.
+Status   : DEFAULTED 2026-10-28.
+
+R-Q7  What if a window never opens?
+-----------------------------------------------------------------------------
+Question : A series that stops rolling - an outage, a trading halt, the venue
+           retiring it.
+Proposal : Not an error, and not a halt. The strategy stays running with
+           nothing to quote and the GUI says how long it has been waiting.
+           A halt is for a feed that is lying to us, not for a market that is
+           not there. If the daemon has heard nothing from a series for longer
+           than --series-quiet (default 2 windows), the GUI says so loudly.
+Status   : DEFAULTED 2026-10-28.
+
+R-Q8  Per-symbol lifecycle subscriptions
+-----------------------------------------------------------------------------
+Question : The daemon currently opens a lifecycle subscription per symbol
+           alongside the book. With one all-instrument lifecycle subscription,
+           are they still needed?
+Proposal : No - drop them. The all-instrument feed carries every status for
+           every instrument, and overlapping subscriptions only duplicate
+           messages ([MD] O7), which MarketState then has to de-duplicate.
+           One subscription, opened at startup, closed at shutdown.
+Status   : DEFAULTED 2026-10-28.
+
+=============================================================================
+C. THINGS R1-R2 MUST NOT FORGET
+=============================================================================
+
+R-N1  The withdrawal is scheduled, not reactive
+-----------------------------------------------------------------------------
+The window end is in the ticker, so the daemon must act on the clock rather
+than wait to be told the market closed. Waiting for Closed is already too
+late: at that point a cancel is a cancel into a closed market, which is the
+whole of R-Q1.
+
+R-N2  Unsubscribe on Closed, not on Settled
+-----------------------------------------------------------------------------
+An instrument that closed ~2 minutes ago is "unknown symbol" ([MD] O6), and an
+unsubscribe for it is a reject, and a reject halts. The old window's book
+subscription has to go at Closed. Its status after that still arrives on the
+all-instrument feed, which is one more reason R-Q8 drops the per-symbol one.
+
+R-N3  Clocks
+-----------------------------------------------------------------------------
+The window end is UTC and comes from the venue's own naming; the daemon's
+clock is its own. A few seconds of skew is the difference between withdrawing
+before the close and cancelling into it, so --withdraw-before must be large
+enough to cover the skew, and the daemon should log the gap it observes
+between the ticker's end time and the Closed it actually sees. Two or three
+rolls of that log is better evidence for the default than any guess made now.
+
+R-N4  md_sim already rolls, which is most of R2's test rig
+-----------------------------------------------------------------------------
+md_sim has --roll-secs and emits the sandbox's exact sequence: Closed,
+Determined, then Listed and Open for the next window, and Settled after
+settle_delay (sim/src/market.cpp). So R1 and R2 can be tested end to end in
+seconds rather than at the venue's 15-minute cadence, and R4 at the sandbox
+becomes a confirmation rather than the first time any of it runs.
+Two gaps to close in R2's tests rather than assume:
+  - the simulator rolls ONE instrument; the daemon must be watched rolling
+    two series independently, as BTCD15M and ETHD15M do within 50 ms of each
+    other in the roll capture;
+  - the simulator's next-window naming must match the venue's ticker shape, or
+    SeriesWatcher's parser is being tested against itself. R1 tests the parser
+    against the tickers in the captures, not against md_sim.

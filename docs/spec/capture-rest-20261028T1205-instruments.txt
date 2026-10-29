@@ -1,0 +1,76 @@
+CPM REST instrument catalog, 2026-10-28T12:05Z, sandbox.
+
+  GET /api/v1/instruments?series_ticker=<SERIES>&status=OPEN
+  host api.cpm-sandbox.fairx.net, headers CB-ACCESS-KEY / -SIGN / -PASSPHRASE
+  / -TIMESTAMP, signature base64(HMAC-SHA256(ts + "GET" + path)) with the
+  query string excluded and an empty body (API spec 2.2). HTTP 200 first try.
+
+No credentials appear below; this is the response only.
+
+What it settles
+---------------
+1. A series resolves to its open window in one call, which is the thing FIX
+   cannot do (docs/open-questions-roll.txt R-Q2):
+     BTCD15M -> BTCD15M-BTC26OCT281215-0   status OPEN
+     ETHD15M -> ETHD15M-ETH26OCT281215-0   status OPEN
+
+2. One series per call. Repeating the parameter
+   (series_ticker=A&series_ticker=B) is HTTP 400; comma-separating them is
+   HTTP 200 with zero rows, i.e. it is read as one literal ticker. Two series
+   means two calls.
+
+3. price_level_structure is TAPERED_DECI_CENT for both of these series - the
+   spec's structure (0.001 below 0.100 and above 0.900, 0.01 between), not
+   the tapered-cent grid built on 2026-10-28. See docs/open-questions-gui.txt
+   GUI-Q23.
+
+4. The scheduled end does not need the ticker parsed: expected_close_time and
+   metadata.market.window_end_time both carry it. close_time is null while the
+   instrument is open - it is "most recent transition to CLOSED", not the
+   schedule.
+
+5. Fields worth having that nothing else exposes: min_order_size,
+   contract_size, position_limit_per_instrument, speedbump_ms, open_interest,
+   total_volume, and metadata.market.price_strike with the window's start and
+   end times.
+
+One instrument, every field
+---------------------------
+{
+  "close_time": null,
+  "contract_size": "1",
+  "disclaimers": null,
+  "event_ticker": "ETH26OCT281215",
+  "expected_close_time": 1793189700000,
+  "expected_open_time": 1793188800000,
+  "fractional_enabled": true,
+  "group_ticker": "ETHD15M-ETH26OCT281215",
+  "id": "241169127383760897",
+  "latest_expiration_time": null,
+  "list_time": 1793188800867,
+  "metadata": {
+    "market": {
+      "price_strike": "2358.9132463734377",
+      "type": "UPDOWN",
+      "underlying": "ETH",
+      "window_end_time": "2026-10-28T12:15:00Z",
+      "window_start_time": "2026-10-28T12:00:00Z"
+    }
+  },
+  "min_order_size": "1",
+  "open_interest": "24.00",
+  "open_time": 1793188801102,
+  "position_limit_per_instrument": "1000000",
+  "price_level_structure": "TAPERED_DECI_CENT",
+  "proposition": "The reference price of ETH at the 15-minute window close is strictly above its reference price at the window open.",
+  "series_ticker": "ETHD15M",
+  "settlement_outcome": null,
+  "settlement_time": null,
+  "settlement_value": null,
+  "speedbump_ms": "0",
+  "status": "OPEN",
+  "ticker": "ETHD15M-ETH26OCT281215-0",
+  "title": "ETH is higher at the 08:15:00 EDT window close than at the 08:00:00 EDT window open on Oct 28, 2026",
+  "total_volume": "185.00",
+  "updated_time": 1793188801132
+}

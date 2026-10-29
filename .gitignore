@@ -5,7 +5,7 @@
 !config/*.env
 
 # Build output
-build/
+build*/
 *.o
 *.a
 *.so
@@ -29,3 +29,25 @@ store/
 .DS_Store
 core
 core.*
+
+# Scratch / working area: the vendor API spec PDF, the project brief and the
+# throwaway logon probe. Local reference only, not part of the repo.
+Temp/
+
+# clangd's index, which comes along with compile_commands.json above.
+.cache/
+.ccls-cache/
+
+# Test leftovers. Each live test writes its own bookmark next to itself,
+# named with its pid, and unlinks it only if it reaches tear-down.
+*-bookmark-*.txt
+
+# Coverage and profiler output.
+*.gcda
+*.gcno
+*.gcov
+perf.data
+perf.data.old
+callgrind.out.*
+massif.out.*
+vgcore.*

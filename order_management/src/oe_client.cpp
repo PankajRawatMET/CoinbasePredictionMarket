@@ -148,11 +148,15 @@ std::string OeClient::send(const NewOrder& order) {
     }
     impl_->check_limits(order);
     if (!logged_on()) throw std::runtime_error("send: not logged on");
+    // Traffic, not news: a market maker re-quoting both sides writes two of
+    // these a second, so they stay in the log file and off the operator's
+    // panel (GUI-Q28). A mass cancel below is a Warn and does reach it.
     impl_->logger.info(std::string("sending order ") + order.cl_ord_id + " " + to_string(order.side) + " " +
                        format_qty(order.quantity) + " " + order.symbol + " @" +
                        (order.type == OrderType::Limit ? format_price(order.price) : std::string("market")) +
                        " " + to_string(order.time_in_force) +
-                       (order.post_only == PostOnly::None ? "" : std::string(" ") + to_string(order.post_only)));
+                       (order.post_only == PostOnly::None ? "" : std::string(" ") + to_string(order.post_only)),
+                       cpm::LogSource::Wire);
     if (!impl_->send_message(fix::new_order_single(order, impl_->options.config))) {
         throw std::runtime_error("send: order could not be sent");
     }
@@ -163,7 +167,8 @@ bool OeClient::cancel(const CancelOrder& request) {
     if (auto bad = check_cancel(request)) throw std::invalid_argument(*bad);
     if (!logged_on()) return false;
     impl_->logger.info("sending cancel " + request.cl_ord_id + " for " +
-                       (request.order_id.empty() ? request.orig_cl_ord_id : request.order_id));
+                           (request.order_id.empty() ? request.orig_cl_ord_id : request.order_id),
+                       cpm::LogSource::Wire);
     return impl_->send_message(fix::order_cancel_request(request, impl_->options.config));
 }
 

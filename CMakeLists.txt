@@ -32,5 +32,14 @@ add_subdirectory(shared/common)
 add_subdirectory(shared/fix_common)
 add_subdirectory(market_data)
 add_subdirectory(order_management)
-# strategies/ sits on top of both services.
+# binance/ is a reference price and nothing else: no orders, no credentials.
+# market_data/ does not depend on it and neither does order_management/.
+add_subdirectory(binance)
+# strategies/ sits on top of both services: the host first, then each kind.
+add_subdirectory(strategies/host)
 add_subdirectory(strategies/CryptoMM)
+# trader/ is the daemon: it composes both services, the host and every kind.
+add_subdirectory(trader)
+# gui/ is the operator's surface over the daemon, and the only sockets here
+# that are not FIX. Nothing below it depends on it.
+add_subdirectory(gui)

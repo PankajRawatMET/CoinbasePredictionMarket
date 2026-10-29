@@ -110,7 +110,12 @@ TEST(Config, TargetCompIdDefaultsToTheServiceAndCanBeOverridden) {
 }
 
 TEST(Config, ACompIdThatCouldNotSurviveTheWireIsRefused) {
-    for (const char* bad : {"CPM MD", "CPM=MD", "CPM\tMD", std::string(65, 'x').c_str()}) {
+    // std::string rather than const char*: the last of these is built here,
+    // and a .c_str() off a temporary in a braced list dangles before the loop
+    // reads it - which is exactly how this test failed one run in a hundred.
+    for (const std::string& bad :
+         {std::string("CPM MD"), std::string("CPM=MD"), std::string("CPM\tMD"),
+          std::string(65, 'x')}) {
         Env env = sandbox_env();
         env["CPM_FIX_TARGET_COMP_ID"] = bad;
         const auto message = error_of(env);

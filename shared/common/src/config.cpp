@@ -79,6 +79,20 @@ Credentials load_credentials(const EnvLookup& env, const std::string& prefix) {
     return creds;
 }
 
+RestCredentials load_rest_config(const EnvLookup& env) {
+    const auto read = [&env](const char* name) {
+        const auto value = env(name);
+        return value ? *value : std::string();
+    };
+    RestCredentials out;
+    out.api_key = read("CPM_REST_API_KEY");
+    out.passphrase = read("CPM_REST_PASSPHRASE");
+    out.secret_b64 = read("CPM_REST_SECRET");
+    out.url = read("CPM_REST_URL");
+    out.ca_file = read("CPM_REST_CA_FILE");
+    return out;
+}
+
 MdConfig load_md_config(const EnvLookup& env) {
     MdConfig cfg;
     cfg.credentials = load_credentials(env);

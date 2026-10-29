@@ -1,0 +1,118 @@
+#pragma once
+
+#include "cpm/binance/reference.hpp"
+#include "cpm/md/market_state.hpp"
+#include "cpm/oms/order_state.hpp"
+#include "cpm/oms/orders.hpp"
+
+#include <functional>
+#include <optional>
+#include <string>
+#include <vector>
+
+// What the host needs from a strategy, and what a strategy reports back. Plain
+// structs with no QuickFIX and no FIX session in them, the same division the
+// rest of the project keeps: a strategy sees decoded books and reports, and
+// reaches the venue only through hooks.
+namespace cpm::strategy {
+
+using cpm::md::InstrumentView;
+using cpm::oms::CancelOrder;
+using cpm::oms::ExecutionReport;
+using cpm::oms::NewOrder;
+using cpm::oms::Position;
+using Clock = cpm::oms::Clock;
+
+// Everything a strategy may do to the outside world. The host composes these
+// so that arming, the submission gate and the halt are all enforced below the
+// strategy rather than by it: a strategy that ignored can_submit() still could
+// not send, because the client refuses too.
+struct StrategyHooks {
+    // May an order go out *right now*? False while reconciling, while
+    // disarmed, or after a halt, so it changes from moment to moment.
+    std::function<bool()> can_submit;
+    // May this daemon ever trade? The --allow-orders key, fixed for the life
+    // of the run. Arming consults this rather than can_submit: arming is the
+    // operator's intent, and reconciliation is not a reason to refuse an
+    // intent - it is a reason not to act on it yet, which can_submit covers.
+    // Unset means permitted, as for can_submit.
+    std::function<bool()> orders_permitted;
+    std::function<std::string(const NewOrder&)> send;  // returns the ClOrdID
+    std::function<bool(const CancelOrder&)> cancel;
+    std::function<std::string()> next_cl_ord_id;
+    std::function<void(const std::string&)> log;
+};
+
+// One order a strategy currently has in the market, flattened for display.
+// Prices and quantities stay scaled integers all the way to the browser.
+struct LiveLeg {
+    cpm::oms::Side side = cpm::oms::Side::Buy;
+    std::string cl_ord_id;
+    Price price = 0;
+    Qty quantity = 0;
+    bool cancel_pending = false;
+};
+
+// What a strategy says about itself. Deliberately flat and kind-agnostic: the
+// host copies it out and the GUI renders it without knowing what produced it,
+// which is what lets a second strategy kind be added without touching either.
+struct StrategyStatus {
+    std::vector<LiveLeg> legs;
+    // Why it is not acting, for the operator. Empty while it is.
+    std::string reason;
+    std::size_t passes = 0;
+    std::size_t passes_without_target = 0;
+    std::size_t placed = 0;
+    std::size_t cancelled = 0;
+    std::size_t fills = 0;
+};
+
+// A strategy is whatever satisfies this. The host owns the clock, the books,
+// the positions and the fan-out of reports; the strategy owns the decision.
+class IStrategy {
+public:
+    virtual ~IStrategy() = default;
+
+    // One pass over one of the strategy's symbols. Called from the host loop,
+    // never from a QuickFIX thread.
+    virtual void on_market(const InstrumentView& book, const Position& position,
+                           Clock::time_point now) = 0;
+    // The reference venue moved. Called on every update from it, before
+    // the pass above and WHETHER OR NOT this strategy has a book - a
+    // strategy with orders resting on a market that has gone quiet is
+    // exactly the one that needs to hear this (B-Q5).
+    //
+    // Virtual with a default rather than pure: a strategy that does not
+    // care about a reference price should not have to say so.
+    virtual void on_reference(const cpm::binance::ReferenceView&, Clock::time_point) {}
+
+    // Every report the session decodes, including unsolicited ones. A
+    // strategy ignores the ones whose ClOrdID is not its own: the host does
+    // not filter, because a report for a deleted instrument carries
+    // "deleted_instrument" as its symbol rather than the order's.
+    virtual void on_report(const ExecutionReport& report) = 0;
+    // Cancel everything and stop acting until the next on_market().
+    virtual void withdraw(const std::string& why) = 0;
+    // Forget everything and stop acting, WITHOUT sending a cancel: the
+    // instrument has closed, and the venue has already cancelled whatever was
+    // resting on it - an unsolicited Canceled carrying
+    // ExecRestatementReason=2, "instrument lifecycle" (OE spec).
+    //
+    // The distinction is not tidiness. A cancel that reaches the gateway after
+    // the lifecycle cancel has terminated the order comes back as
+    // OrderCancelReject / UNKNOWN_ORDER, and any cancel reject halts the
+    // daemon (OE-Q6). So a closing window is the one case where the right
+    // move is to send nothing at all.
+    virtual void abandon(const std::string& why) = 0;
+
+    // True once nothing of this strategy's is left at the venue, which is what
+    // the host waits for before reporting a strategy stopped.
+    virtual bool quiescent() const = 0;
+    // The symbols it wants books and positions for. Fixed for its lifetime:
+    // the host refuses an overlap between strategies at create time (GUI-Q6),
+    // which it could not do if this changed underneath.
+    virtual std::vector<std::string> symbols() const = 0;
+    virtual StrategyStatus status() const = 0;
+};
+
+}  // namespace cpm::strategy

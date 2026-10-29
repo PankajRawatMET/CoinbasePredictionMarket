@@ -47,6 +47,13 @@ inline std::optional<Amount> parse_amount(std::string_view text) {
 }
 inline std::string format_amount(Amount amount) { return format_signed(amount, kAmtScale); }
 
+// The same price as a percentage chance, which is how a prediction market is
+// read and quoted: 0.599 is a 59.9% chance. No arithmetic is involved - a
+// price is already thousandths of one, so it is the same integer with one
+// implied decimal instead of three, and 1.000 prints as "100".
+inline std::string format_percent(Price price) { return format_scaled(price, 1); }
+inline std::optional<Price> parse_percent(std::string_view text) { return parse_scaled(text, 1); }
+
 inline std::optional<Price> parse_price(std::string_view text) { return parse_scaled(text, kPriceScale); }
 inline std::optional<Qty> parse_qty(std::string_view text) { return parse_scaled(text, kQtyScale); }
 inline std::string format_price(Price price) { return format_scaled(price, kPriceScale); }

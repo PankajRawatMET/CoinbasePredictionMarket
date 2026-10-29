@@ -3,7 +3,7 @@
 
 add_library(cpm_crypto_mm src/crypto_mm.cpp)
 target_include_directories(cpm_crypto_mm PUBLIC include)
-target_link_libraries(cpm_crypto_mm PUBLIC cpm_marketdata cpm_oms)
+target_link_libraries(cpm_crypto_mm PUBLIC cpm_strategy_host)
 cpm_set_warnings(cpm_crypto_mm)
 
 add_executable(crypto_mm apps/crypto_mm/main.cpp)

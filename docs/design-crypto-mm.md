@@ -94,3 +94,45 @@ No skew, no inventory-weighted mid, no spread widening with volatility, no
 hedging between the YES and NO legs of an event, no sizing by queue position,
 and no cross-instrument logic. It quotes x ticks wide with y on each side, which
 is what it was asked to do.
+
+## Resting to the bell, and why that is the safe default
+
+`withdraw-before` is the number of seconds before the window ends at which the
+quotes are pulled. **It defaults to 0: quote to the bell, and let the venue
+cancel at the close.**
+
+That is not laziness, and it is the safer of the two mechanically. An
+instrument that closes takes its resting orders with it: the venue sends an
+unsolicited `ExecType=CANCELED(4)` carrying `ExecRestatementReason(378)=2`,
+"instrument lifecycle". Every layer here already handles that report - the
+decoder maps it to `CancelReason::InstrumentLifecycle`, the reconciler halts
+only on `REJECTED`, and `QuoteManager::on_report` drops the quote whether or
+not it asked.
+
+What is *not* safe is cancelling into the close. A cancel that reaches the
+gateway after the lifecycle cancel has terminated the order is answered with
+`OrderCancelReject` / `CxlRejReason=1 UNKNOWN_ORDER` ("an order that was
+already canceled ... reports UNKNOWN_ORDER(1)"), and any cancel reject halts
+the daemon (OE-Q6). So the rule is **cancel early or not at all, never late**,
+and `IStrategy` has two verbs for it:
+
+| | |
+|---|---|
+| `withdraw(why)` | cancel what is resting. The operator stopped it, the daemon halted, or `withdraw-before` fired while the market is still open |
+| `abandon(why)` | drop the quotes and send nothing. The instrument closed and the venue has already cancelled them |
+
+The host calls `abandon` on a lifecycle stop and `withdraw` on every other,
+which is the difference between a roll that costs nothing and one that halts
+the daemon four times an hour.
+
+What setting `withdraw-before` above 0 buys is not safety but **expiry risk**:
+the last seconds of a 15-minute binary are where the informed flow is, a
+resting quote then is an option about to expire written for a tick of spread,
+and a fill there cannot be managed - windows do not overlap, so the position
+goes to settlement at 0 or 100. Leaving it at 0 accepts that deliberately.
+
+The window end comes from the instrument's own name (`BTCD15M-BTC26OCT260630-0`
+ends at 06:30 UTC, [MD] O2), parsed by `cpm::md::parse_ticker`. A name that
+carries no end - a sports market, a simulator symbol - has nothing to count
+back from, so the parameter is inert there rather than acting on a time it
+invented.

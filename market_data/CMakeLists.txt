@@ -4,6 +4,10 @@ add_library(cpm_marketdata
   src/feed_monitor.cpp
   src/market_state.cpp
   src/md_client.cpp
+  src/instruments.cpp
+  src/series_watcher.cpp
+  src/ticker.cpp
+  src/ticks.cpp
   src/fix/md_application.cpp
   src/fix/md_decoder.cpp
 )
@@ -31,6 +35,10 @@ if(CPM_BUILD_TESTS)
     tests/feed_monitor_test.cpp
     tests/market_state_test.cpp
     tests/session_loopback_test.cpp
+    tests/instruments_test.cpp
+    tests/series_watcher_test.cpp
+    tests/ticker_test.cpp
+    tests/ticks_test.cpp
   )
   target_link_libraries(cpm_marketdata_tests PRIVATE cpm_marketdata cpm_fix_common GTest::gtest_main)
   # decoder_test drives src/fix/md_decoder.hpp and reuses the fix_common wire builder.

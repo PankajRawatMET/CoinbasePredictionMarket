@@ -16,8 +16,16 @@ public:
 
     void clear() override {}
     void backup() override {}
-    void onIncoming(const std::string& msg) override { logger_.info("<< " + format_raw(msg, api_key_)); }
-    void onOutgoing(const std::string& msg) override { logger_.info(">> " + format_raw(msg, api_key_)); }
+    // The messages themselves are the wire: every one of them goes to the
+    // log file and none of them to the operator's panel, which is for the
+    // handful of lines a person reads (GUI-Q28). The session events below
+    // are not wire - "Initiated logout request" is the daemon's own news.
+    void onIncoming(const std::string& msg) override {
+        logger_.info("<< " + format_raw(msg, api_key_), cpm::LogSource::Wire);
+    }
+    void onOutgoing(const std::string& msg) override {
+        logger_.info(">> " + format_raw(msg, api_key_), cpm::LogSource::Wire);
+    }
     void onEvent(const std::string& text) override { logger_.info("-- " + redact_text(text, api_key_)); }
 
 private:

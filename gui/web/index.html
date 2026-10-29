@@ -1,0 +1,1764 @@
+<!doctype html>
+<!--
+  The operator's page: one self-contained document, embedded in the binary at
+  build time (GUI-Q8). No framework, no build step, no network beyond this
+  daemon - which is also what the Content-Security-Policy the server sends
+  allows, so anything added here must stay inline.
+
+  It renders a snapshot and posts commands. It computes nothing: every price
+  and every quantity arrives already formatted from scaled integers (design
+  §8), and every refusal is the daemon's own words. If a number here looks
+  wrong, the daemon said it.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cpm_trader</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0f1116;
+    --panel: #161923;
+    --line: #262b38;
+    --ink: #e6e8ee;
+    --dim: #8b93a7;
+    --accent: #6aa9ff;
+    --good: #3fb950;
+    --warn: #d29922;
+    --bad: #f85149;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  header {
+    display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+    padding: 10px 16px; background: var(--panel);
+    border-bottom: 1px solid var(--line);
+    position: sticky; top: 0; z-index: 2;
+  }
+  .brand { font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: var(--dim); }
+  nav { display: flex; gap: 2px; }
+  nav button {
+    border-radius: 0; border-color: transparent; border-bottom: 2px solid transparent;
+    background: transparent; color: var(--dim); padding: 4px 12px;
+  }
+  nav button:hover:not(.on) { color: var(--ink); border-bottom-color: var(--line); }
+  nav button.on { color: var(--ink); border-bottom-color: var(--accent); background: #1b2030; }
+  nav button .count { color: var(--dim); }
+  .pills { display: flex; flex-wrap: wrap; gap: 6px; flex: 1 1 auto; }
+  .pill {
+    padding: 2px 8px; border: 1px solid var(--line); border-radius: 999px;
+    color: var(--dim); white-space: nowrap;
+  }
+  .pill b { color: var(--ink); font-weight: 600; }
+  .pill.good { border-color: #1f6f32; color: var(--good); }
+  .pill.bad { border-color: #6e2320; color: var(--bad); }
+  .pill.warn { border-color: #6b5010; color: var(--warn); }
+  button {
+    font: inherit; color: var(--ink); background: #222736;
+    border: 1px solid var(--line); border-radius: 4px;
+    padding: 4px 10px; cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .35; cursor: not-allowed; }
+  button.danger { background: #4a1d1d; border-color: #7d2c2c; color: #ffd9d9; }
+  button.arm { background: #1d3a22; border-color: #2f6b3a; }
+  main { padding: 16px; display: grid; gap: 16px; max-width: 1400px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
+  h2 {
+    margin: 0; padding: 8px 12px; font-size: 11px; letter-spacing: .12em;
+    text-transform: uppercase; color: var(--dim); border-bottom: 1px solid var(--line);
+  }
+  .body { padding: 10px 12px; overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th {
+    text-align: left; font-weight: 600; color: var(--dim); font-size: 11px;
+    text-transform: uppercase; letter-spacing: .06em;
+    padding: 4px 10px 4px 0; border-bottom: 1px solid var(--line); white-space: nowrap;
+  }
+  td { padding: 6px 10px 6px 0; border-bottom: 1px solid #1d2230; vertical-align: top; }
+  tr:last-child td { border-bottom: 0; }
+  td.num, th.num { text-align: right; padding-right: 16px; }
+  .muted { color: var(--dim); }
+  .empty { color: var(--dim); padding: 4px 0; }
+  .banner { margin: 0; padding: 10px 16px; font-weight: 600; }
+  .halt { background: #4a1414; color: #ffd9d9; border-bottom: 1px solid #7d2c2c; }
+  .halt small { display: block; font-weight: 400; color: #ffb4b4; }
+  .flash { background: #3a2a10; color: #ffe6b8; border-bottom: 1px solid #6b5010; }
+  .leg.buy { color: var(--good); }
+  .leg.sell { color: var(--accent); }
+  .leg.cancelling { color: var(--warn); }
+  .actions { display: flex; gap: 6px; flex-wrap: wrap; }
+  .tag { padding: 1px 6px; border-radius: 3px; border: 1px solid var(--line); color: var(--dim); }
+  .tag.running { border-color: #1f6f32; color: var(--good); }
+  .tag.stopping { border-color: #6b5010; color: var(--warn); }
+  .tag.halted { border-color: #6e2320; color: var(--bad); }
+  .tag.armed { border-color: #2f6b3a; color: var(--good); }
+  /* One row: Start Feed, Start, Stop, then the parameters in the order they
+     are worked through (GUI-Q25). The per-field help that used to sit under
+     each input is the input's tooltip now - it is what cost the row its
+     second and third lines. It wraps on a narrow window; it never scrolls
+     sideways. */
+  /* One grid for the header and every row, live or blank (GUI-Q29). The
+     wrappers are display:contents so that each row's cells are items of
+     this one grid and not of a grid of their own - which is what makes a
+     column a column: the browser cannot drift it from one row to the next.
+     The template itself is set from the schema, in renderRowsHead. */
+  .rows { display: grid; align-items: center; row-gap: 4px; column-gap: 10px; }
+  #rows-head, #strategy-rows, #draft-rows, .rowhead, .runbar, .form { display: contents; }
+  .rowhead .col {
+    color: var(--dim); font-size: 11px; white-space: nowrap;
+    padding-bottom: 6px; border-bottom: 1px solid var(--line); align-self: end;
+  }
+  /* The line under a row, across all of it. */
+  .rows .status { grid-column: 1 / -1; margin: 0 0 10px; }
+  .runbar.new .controls-slot { padding-top: 10px; }
+  /* Wide enough for the five a live row has, so the three on the blank row
+     pad out to the same place and every row's fields start on one column. */
+  .controls { display: flex; gap: 8px; align-items: center; }
+  /* Arm is narrower than Disarm, so without this Remove moves between a
+     row that is armed and one that is not. */
+  .controls button { min-width: 62px; }
+  .status .tag { margin-right: 6px; }
+  .field { min-width: 0; }
+  /* One height for every control in the row, selects included: a select
+     that is two pixels taller lifts its label out of line with the rest. */
+  .field input, .field select {
+    font: inherit; color: var(--ink); background: #0f1319; width: 100%;
+    border: 1px solid var(--line); border-radius: 4px; padding: 4px 6px;
+    height: 29px; box-sizing: border-box;
+  }
+  /* A box that cannot be typed in says so rather than waiting to be clicked:
+     the kind and the symbol on every live row, and every parameter of a
+     strategy that is armed (GUI-Q30). */
+  .field input:disabled {
+    color: var(--dim); background: #0b0e12; border-color: #1a1f27; cursor: not-allowed;
+  }
+  /* A ticker is long and everything else is two or three characters, so the
+     symbol takes the slack and the numbers stay the size of their contents. */
+  /* A text field takes the column it is given; everything else is two or
+     three characters and says so, which is what the column is sized from. */
+  .field.wide input, .field.wide select { width: 100%; }
+  .field.narrow input { width: 5.5em; }
+  /* A select has a value and an arrow to fit, and "tapered" is wider than a
+     number: let it size itself, and the column takes the wider of the two
+     rows that share it. */
+  .field.narrow select { width: auto; }
+  .field.kind input, .field.kind select { width: 9.5em; }
+  .status { color: var(--dim); font-size: 12px; margin: 12px 0 0; }
+  /* The controls live in a slot of their own so a snapshot can redraw them
+     without touching the inputs beside them. It is the Buttons column. */
+  .controls-slot { display: flex; }
+  button.drop { min-width: 0; padding: 4px 8px; color: var(--dim); }
+  #add-row { margin-top: 14px; }
+
+  /* The log. pre, not wrap: a line that wrapped would hide the shape of the
+     thing being read, so it scrolls sideways instead. */
+  /* Pinned to the window, not to the end of the page. Only the Strategies
+     view has one, and that view's main gets the room for it below. */
+  .logs {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 5;
+    margin: 0; border: 0; border-top: 1px solid var(--line); border-radius: 0;
+    background: var(--panel);
+  }
+  /* Which page is open, set on the body by the nav. It is deliberately not
+     the attribute a section carries: nothing above the header belongs to
+     one page, and a test holds the page to that. */
+  body[data-page="strategies"] main { padding-bottom: 250px; }
+  .logs h2 {
+    margin: 0; padding: 10px 14px; font-size: 11px; letter-spacing: .12em;
+    text-transform: uppercase; color: var(--dim); border-bottom: 1px solid var(--line);
+  }
+  .logbody {
+    height: 190px; overflow: auto; padding: 8px 14px; font-size: 12px;
+    white-space: pre; line-height: 1.45;
+  }
+  .logbody .line { color: var(--ink); }
+  .logbody .at { color: var(--dim); }
+  .logbody .lvl { color: var(--dim); }
+  .logbody .WARN .lvl, .logbody .WARN { color: var(--warn); }
+  .logbody .ERROR .lvl, .logbody .ERROR { color: var(--bad); }
+  .logbody .empty { color: var(--dim); }
+  footer { color: var(--dim); padding: 0 16px 24px; max-width: 1400px; }
+  .ladders { display: flex; flex-wrap: wrap; gap: 20px; align-items: flex-start; }
+  .ladder { min-width: 330px; }
+  .ladder .name { color: var(--ink); padding-bottom: 6px; }
+  .ladder .name small { color: var(--dim); }
+  .ladder table { width: auto; min-width: 330px; }
+  .ladder th { padding: 4px 8px; }
+  .ladder td { padding: 2px 8px; border-bottom: 0; text-align: right; }
+  .ladder td.price { text-align: center; color: var(--ink); border-left: 1px solid var(--line);
+                     border-right: 1px solid var(--line); min-width: 64px; }
+  .ladder td.bid { color: var(--good); }
+  .ladder td.ask { color: var(--accent); }
+  .ladder td.mine { font-weight: 700; }
+  /* Our own resting orders, so the one question a ladder is opened to answer
+     - where am I in this book - is answered by looking, not by reading. */
+  .ladder tr.mine-bid td.price { background: #14301c; border-color: #2f6b3a; }
+  .ladder tr.mine-bid td.ours-bid { background: #14301c; color: var(--good); }
+  .ladder tr.mine-ask td.price { background: #122537; border-color: #2d5a85; }
+  .ladder tr.mine-ask td.ours-ask { background: #122537; color: var(--accent); }
+  .ladder tr.cancelling td.ours-bid, .ladder tr.cancelling td.ours-ask { color: var(--warn); }
+  /* The whole grid is here, so most rungs are empty most of the time: the
+     eye needs the busy part to stand out rather than the quiet part to be
+     hidden. */
+  .ladder-scroll { max-height: 62vh; overflow-y: auto; border: 1px solid var(--line); border-radius: 4px; }
+  .ladder-scroll thead th { position: sticky; top: 0; background: var(--panel); z-index: 1; }
+  .ladder tr.quiet td.price { color: #5c6478; }
+  .ladder tr.between td.price { background: #1b1f2b; }
+  .ladder td.off-grid { color: var(--warn); }
+  .ladder td.unquotable { color: #5c6478; font-style: italic; }
+  .ladder .name button { padding: 1px 8px; font-size: 11px; }
+  .ladder .foot { color: var(--dim); padding-top: 6px; }
+  .modal {
+    position: fixed; inset: 0; z-index: 10; padding: 16px;
+    background: rgba(5, 7, 12, .72);
+    display: flex; align-items: center; justify-content: center;
+  }
+  .modal .panel {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+    width: 100%; max-width: 560px;
+  }
+  .modal h3 {
+    margin: 0; padding: 10px 14px; border-bottom: 1px solid var(--line);
+    font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: var(--dim);
+  }
+  .modal .content { padding: 14px; display: grid; gap: 6px; }
+  .modal .row { display: flex; gap: 12px; }
+  .modal .row span:first-child { color: var(--dim); min-width: 104px; }
+  .modal .says { color: var(--warn); padding-top: 4px; }
+  .modal .buttons { display: flex; gap: 10px; justify-content: flex-end; padding: 0 14px 14px; }
+  #reconnect { display: none; }
+  #reconnect.needed { display: inline-block; }
+  /* Nothing on the page is current any more. Saying so in a banner is not
+     enough while the numbers beside it still look alive. */
+  body.stale main,
+  body.stale footer,
+  body.stale .pill:not(#pill-stream) { opacity: .45; }
+</style>
+</head>
+<body>
+<header>
+  <span class="brand">cpm_trader</span>
+  <nav id="nav"></nav>
+  <span class="pills">
+    <span class="pill" id="pill-state">state <b>-</b></span>
+    <span class="pill" id="pill-md">md <b>-</b></span>
+    <span class="pill" id="pill-oe">oe <b>-</b></span>
+    <span class="pill" id="pill-recovery">recovery <b>-</b></span>
+    <span class="pill" id="pill-reference">reference <b>-</b></span>
+    <span class="pill" id="pill-orders">orders <b>-</b></span>
+    <span class="pill" id="pill-stream">stream <b>connecting</b></span>
+  </span>
+  <button id="reconnect" type="button">Reconnect</button>
+  <button id="stop-all" class="danger" type="button">Stop all</button>
+</header>
+
+<div class="banner halt" id="halt" hidden></div>
+<div class="banner flash" id="flash" hidden></div>
+
+<main>
+  <!-- One section, one row per strategy, and a blank row at the bottom to
+       make another (GUI-Q25). There is no table above it: a row carries its
+       own controls, its own parameters and its own line of state, so nothing
+       is running that this page does not show. -->
+  <section data-view="strategies">
+    <h2>Run a strategy</h2>
+    <div class="body">
+      <div class="rows" id="rows">
+        <div class="rowhead" id="rows-head"></div>
+        <div id="strategy-rows"></div>
+        <div id="draft-rows"></div>
+      </div>
+      <button id="add-row" type="button">Add row</button>
+      <p class="empty" id="create-note" hidden></p>
+    </div>
+  </section>
+
+  <section data-view="books">
+    <h2>Books</h2>
+    <div class="body">
+      <table id="books">
+        <thead>
+          <tr>
+            <th>symbol</th>
+            <th class="num">yes bid %</th><th class="num">qty</th>
+            <th class="num">yes ask %</th><th class="num">qty</th>
+            <th class="num">mid %</th><th class="num">last %</th>
+            <th class="num">volume</th><th class="num">open int.</th>
+            <th>status</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <p class="empty" id="books-empty">No symbol is subscribed.</p>
+    </div>
+  </section>
+
+  <section data-view="ladders">
+    <h2>Ladders</h2>
+    <div class="body">
+      <div id="ladders" class="ladders"></div>
+      <p class="empty" id="ladders-empty">No symbol is subscribed.</p>
+    </div>
+  </section>
+
+  <section data-view="positions">
+    <h2>Positions</h2>
+    <div class="body">
+      <table id="positions">
+        <thead>
+          <tr>
+            <th>symbol</th>
+            <th class="num">net</th><th class="num">bought</th><th class="num">sold</th>
+            <th class="num">cash</th><th class="num">fees</th><th class="num">fills</th>
+            <th class="num">settlement</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <p class="empty" id="positions-empty">Nothing filled.</p>
+    </div>
+  </section>
+  <!-- The tail of the daemon's log: the Strategies page only, and pinned to
+       the bottom of the window rather than the end of the document, so it
+       stays put while the rows scroll above it (GUI-Q28). Both scrollbars,
+       because a wrapped log line is unreadable and a truncated one is
+       worse. -->
+  <section class="logs" data-view="strategies">
+    <h2>Log</h2>
+    <div class="logbody" id="log-lines"></div>
+  </section>
+</main>
+
+<footer id="limits"></footer>
+
+<script>
+(function () {
+  'use strict';
+
+  // ---- the token ---------------------------------------------------------
+  // It arrives in the query on the first load. Keep it for this tab, then
+  // strip it from the address bar so it is not left in history or carried off
+  // in a copied URL (GUI-Q3).
+  var token = (function () {
+    var fromUrl = new URLSearchParams(window.location.search).get('t');
+    if (fromUrl) {
+      try { window.sessionStorage.setItem('cpm-token', fromUrl); } catch (e) { /* private mode */ }
+      window.history.replaceState(null, '', window.location.pathname + window.location.hash);
+      return fromUrl;
+    }
+    try { return window.sessionStorage.getItem('cpm-token') || ''; } catch (e) { return ''; }
+  })();
+
+  var snapshot = null;
+  var kinds = [];
+  var busy = false;
+  var stream = null;
+  var lastEventAt = 0;       // when the daemon last said anything
+  var failedConnects = 0;    // errors since the last event that arrived
+  var gaveUp = false;
+
+  // A request that never answers must not leave the page unable to act, and
+  // the one request that matters most is the kill switch.
+  var REQUEST_TIMEOUT_MS = 10000;
+  // Past this many failures with nothing received in between, the stream is
+  // not coming back by itself and saying "reconnecting" forever would be a
+  // lie about what this page is showing.
+  var GIVE_UP_AFTER = 5;
+
+  // ---- small helpers -----------------------------------------------------
+  // Everything the daemon says is put on the page with textContent: a symbol,
+  // a halt reason or a refusal is data from a FIX session, never markup.
+  function el(tag, className, text) {
+    var node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined && text !== null) node.textContent = String(text);
+    return node;
+  }
+
+  function show(value) {
+    return (value === null || value === undefined || value === '') ? '—' : String(value);
+  }
+
+  function cell(row, text, className) {
+    var td = el('td', className, show(text));
+    row.appendChild(td);
+    return td;
+  }
+
+  function flash(message) {
+    var banner = document.getElementById('flash');
+    banner.textContent = message;
+    banner.hidden = !message;
+  }
+
+  function clear(node) {
+    while (node.firstChild) node.removeChild(node.firstChild);
+  }
+
+  // ---- the views ----------------------------------------------------------
+  // One page per thing an operator is doing, chosen from the nav. What is
+  // above the nav - the daemon's state, the halt banner and Stop All - is on
+  // every one of them, because none of it waits for the right page to be open.
+  var VIEWS = [
+    { name: 'strategies', label: 'Strategies' },
+    { name: 'ladders', label: 'Ladders' },
+    { name: 'books', label: 'Books' },
+    { name: 'positions', label: 'Positions' }
+  ];
+  var view = 'strategies';
+
+  function viewFromHash() {
+    var wanted = (window.location.hash || '').replace('#', '');
+    for (var i = 0; i < VIEWS.length; ++i) {
+      if (VIEWS[i].name === wanted) return wanted;
+    }
+    return 'strategies';
+  }
+
+  function showView(name) {
+    view = name;
+    // Ladders built while this page was hidden could not be centred then.
+    if (name === 'ladders') {
+      window.setTimeout(function () {
+        Object.keys(ladders).forEach(function (symbol) {
+          var entry = ladders[symbol];
+          if (entry.centred || !entry.scroll.clientHeight) return;
+          entry.centred = true;
+          centreOn(entry, symbol);
+        });
+      }, 0);
+    }
+    var sections = document.querySelectorAll('section[data-view]');
+    for (var i = 0; i < sections.length; ++i) {
+      sections[i].hidden = sections[i].getAttribute('data-view') !== name;
+    }
+    // The log panel is fixed to the window on this view, so this view's
+    // content needs room under it; the others must not leave a gap.
+    document.body.setAttribute('data-page', name);
+    var buttons = document.querySelectorAll('#nav button');
+    for (var j = 0; j < buttons.length; ++j) {
+      buttons[j].className = buttons[j].getAttribute('data-view') === name ? 'on' : '';
+    }
+  }
+
+  function buildNav() {
+    var nav = document.getElementById('nav');
+    clear(nav);
+    VIEWS.forEach(function (entry) {
+      var button = el('button', '', entry.label);
+      button.type = 'button';
+      button.setAttribute('data-view', entry.name);
+      button.addEventListener('click', function () {
+        // The hash, so the view survives a reload and can be sent to someone.
+        window.location.hash = entry.name;
+        showView(entry.name);
+      });
+      nav.appendChild(button);
+    });
+    showView(viewFromHash());
+  }
+
+  window.addEventListener('hashchange', function () { showView(viewFromHash()); });
+
+  // ---- the confirm step ---------------------------------------------------
+  // Arming and stopping everything are the two controls with consequences at
+  // the venue, so both say what they are about to do and to which strategy.
+  // The browser's own confirm dialog cannot: it shows one bare sentence, no
+  // detail, and nothing the operator could check before pressing.
+  function ask(options) {
+    return new Promise(function (resolve) {
+      var overlay = el('div', 'modal');
+      var panel = el('div', 'panel');
+      panel.appendChild(el('h3', null, options.title));
+
+      var content = el('div', 'content');
+      (options.rows || []).forEach(function (row) {
+        var line = el('div', 'row');
+        line.appendChild(el('span', null, row[0]));
+        line.appendChild(el('span', null, show(row[1])));
+        content.appendChild(line);
+      });
+      if (options.says) content.appendChild(el('div', 'says', options.says));
+      panel.appendChild(content);
+
+      var buttons = el('div', 'buttons');
+      var cancel = el('button', '', 'Cancel');
+      cancel.type = 'button';
+      var go = el('button', options.danger ? 'danger' : 'arm', options.confirm);
+      go.type = 'button';
+      buttons.appendChild(cancel);
+      buttons.appendChild(go);
+      panel.appendChild(buttons);
+      overlay.appendChild(panel);
+      document.body.appendChild(overlay);
+
+      function finish(answer) {
+        document.removeEventListener('keydown', onKey);
+        if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
+        resolve(answer);
+      }
+      function onKey(event) {
+        if (event.key === 'Escape') finish(false);
+      }
+      cancel.addEventListener('click', function () { finish(false); });
+      go.addEventListener('click', function () { finish(true); });
+      overlay.addEventListener('click', function (event) {
+        if (event.target === overlay) finish(false);
+      });
+      document.addEventListener('keydown', onKey);
+      // Cancel takes the focus, so a stray Return cancels rather than arms.
+      cancel.focus();
+    });
+  }
+
+  // ---- talking to the daemon ---------------------------------------------
+  function api(method, path, body) {
+    var options = { method: method, headers: { 'Authorization': 'Bearer ' + token } };
+    if (body !== undefined) {
+      options.headers['Content-Type'] = 'application/json';
+      options.body = JSON.stringify(body);
+    }
+    // Every request carries its own deadline. Without one, a daemon that
+    // accepts a connection and then stops answering would leave this page
+    // with its buttons disabled and no way back.
+    var controller = typeof AbortController === 'function' ? new AbortController() : null;
+    if (controller) options.signal = controller.signal;
+    var timer = window.setTimeout(function () {
+      if (controller) controller.abort();
+    }, REQUEST_TIMEOUT_MS);
+
+    return fetch(path, options).then(function (response) {
+      window.clearTimeout(timer);
+      return response;
+    }, function (error) {
+      window.clearTimeout(timer);
+      throw error;
+    }).then(function (response) {
+      return response.text().then(function (text) {
+        var parsed = {};
+        try { parsed = JSON.parse(text); } catch (e) { parsed = { error: text }; }
+        parsed.status = response.status;
+        return parsed;
+      });
+    });
+  }
+
+  // Every action goes through here so that a refusal is shown rather than
+  // swallowed: the daemon's reason is the whole point of a refusal.
+  function act(method, path, body, always) {
+    // `always` is for the kill switch: it is never queued behind anything.
+    if (busy && !always) return Promise.resolve();
+    busy = true;
+    render();
+    return api(method, path, body).then(function (result) {
+      if (result.status === 401) {
+        flash('This page is not authorised. Reopen the link the daemon printed at startup.');
+      } else if (!result.ok) {
+        flash('Refused: ' + show(result.error));
+      } else {
+        flash('');
+      }
+      return result;
+    }).catch(function (error) {
+      var aborted = error && error.name === 'AbortError';
+      flash(aborted
+        ? 'The daemon did not answer within ' + (REQUEST_TIMEOUT_MS / 1000) + 's. It may be ' +
+          'stopping, or the tunnel may be down. Nothing was sent twice: try again.'
+        : 'The daemon did not answer: ' + error);
+    }).then(function (result) {
+      busy = false;
+      render();
+      return result;
+    });
+  }
+
+  // ---- the strategy rows --------------------------------------------------
+  function actionButton(label, className, enabled, onClick) {
+    var button = el('button', className, label);
+    button.type = 'button';
+    button.disabled = !enabled || busy;
+    button.addEventListener('click', onClick);
+    return button;
+  }
+
+  // What the operator has retyped on a live strategy's row but not applied
+  // yet, per strategy and per parameter. It lives out here because the rows
+  // are redrawn from a snapshot whenever anything in them changes, and a
+  // redraw must not throw away half-typed text - the same reason a blank
+  // row's values are kept in `drafts`.
+  var edits = {};
+
+  // May this strategy's parameters be changed right now? Armed is the line
+  // (GUI-Q30): a strategy that is quoting does it on the strength of the
+  // confirmation that armed it, and the daemon refuses an edit then whatever
+  // this page thinks. Everything short of that - a feed that was started and
+  // quotes nothing, or one running and disarmed - is where tuning belongs.
+  function editable(strategy) {
+    return !strategy.armed && strategy.state !== 'stopping' &&
+           strategy.state !== 'halted' && snapshot.state !== 'halted';
+  }
+
+  // The value an input should show: what was typed if anything was, and
+  // what the daemon holds otherwise.
+  function editedValue(strategy, name) {
+    var mine = edits[strategy.id];
+    if (mine && mine[name] !== undefined) return mine[name];
+    return strategy.params[name] || '';
+  }
+
+  function changedParams(strategy) {
+    var mine = edits[strategy.id] || {};
+    var out = {};
+    Object.keys(mine).forEach(function (name) {
+      // The symbol is not editable and is never sent: moving a strategy is
+      // not a parameter change (GUI-Q30).
+      if (name === 'symbol') return;
+      if (mine[name] !== (strategy.params[name] || '')) out[name] = mine[name];
+    });
+    return out;
+  }
+
+  function dirty(strategy) { return Object.keys(changedParams(strategy)).length > 0; }
+
+  // Five buttons: the three a blank row has (GUI-Q26), then Apply and Revert
+  // for the parameters typed into this row. Arm and Remove are still not
+  // here: Start arms, and nothing on this page destroys a strategy.
+  function strategyActions(strategy) {
+    var box = el('div', 'controls');
+    var halted = snapshot.state === 'halted';
+    var base = '/api/strategies/' + encodeURIComponent(strategy.id) + '/';
+    var stopped = strategy.state === 'stopped';
+
+    var feed = actionButton('Start Feed', '', false, function () {});
+    feed.title = strategy.id + ' already has its feed.';
+    box.appendChild(feed);
+
+    var start = actionButton('Start', '', stopped && !halted, function () {
+      startQuoting(strategy.kind, strategy.series || strategy.symbols.join(', '),
+                   strategy.params, strategy, null);
+    });
+    if (!stopped) start.title = strategy.id + ' is already running.';
+    box.appendChild(start);
+
+    box.appendChild(actionButton('Stop', '', !stopped, function () {
+      act('POST', base + 'stop');
+    }));
+
+    // Both are always here, enabled or not, so the column does not change
+    // width when a row becomes dirty and shift every row's fields sideways.
+    var apply = actionButton('Apply', '', editable(strategy) && dirty(strategy), function () {
+      act('POST', base + 'params', { params: changedParams(strategy) })
+        .then(function (result) {
+          // Only on success: a refused edit stays in the boxes, where the
+          // operator can see what they typed next to the reason it was
+          // refused.
+          if (result && result.ok) {
+            delete edits[strategy.id];
+            render();
+          }
+        });
+    });
+    apply.id = 'apply-' + strategy.id;
+    apply.title = !editable(strategy)
+      ? strategy.id + ' is armed: disarm it to change its parameters.'
+      : (dirty(strategy) ? 'Rebuilds ' + strategy.id + ' with these parameters.'
+                         : 'Nothing has been changed on this row.');
+    box.appendChild(apply);
+
+    var revert = actionButton('Revert', '', dirty(strategy), function () {
+      delete edits[strategy.id];
+      render();
+    });
+    revert.id = 'revert-' + strategy.id;
+    revert.title = 'Puts back what the daemon is running with.';
+    box.appendChild(revert);
+    return box;
+  }
+
+
+  // A live strategy's parameters, in the same places the blank row shows the
+  // ones being typed. They are editable while it is not armed and locked
+  // once it is (GUI-Q30): applying one rebuilds the instance, which is how
+  // a parameter read at construction can change at all. The kind and the
+  // symbol are never editable - the kind is what it is, and moving a
+  // strategy to another instrument is not a parameter change.
+  function paramFields(strategy) {
+    var box = el('div', 'form');
+    var kind = kindByName(strategy.kind);
+    var specs = kind && kind.name === strategy.kind ? kind.params : [];
+    var byName = {};
+    specs.forEach(function (spec) { byName[spec.name] = spec; });
+    var open = editable(strategy);
+
+    // Enabling or disabling the two buttons as the boxes are typed into,
+    // without redrawing the row under the caret.
+    function refreshButtons() {
+      var apply = document.getElementById('apply-' + strategy.id);
+      var revert = document.getElementById('revert-' + strategy.id);
+      if (apply) apply.disabled = busy || !editable(strategy) || !dirty(strategy);
+      if (revert) revert.disabled = busy || !dirty(strategy);
+    }
+
+    function cell(value, classes, help, spec) {
+      var holder = el('div', 'field ' + classes);
+      var input = el('input');
+      input.type = 'text';
+      input.value = value;
+      input.disabled = !spec || !open;
+      if (spec && open) {
+        input.id = 'edit-' + strategy.id + '-' + spec.name;
+        input.addEventListener('input', function () {
+          if (!edits[strategy.id]) edits[strategy.id] = {};
+          edits[strategy.id][spec.name] = input.value.trim();
+          refreshButtons();
+        });
+      }
+      if (help) input.title = help;
+      holder.appendChild(input);
+      box.appendChild(holder);
+    }
+
+    cell(strategy.kind, 'narrow kind', kind ? kind.help : '');
+    // One cell per column of the header, in the header's order, whether or
+    // not this kind has that parameter: a row that skipped a column would
+    // put every cell after it under the wrong heading.
+    columns().forEach(function (spec) {
+      if (!byName[spec.name]) {
+        box.appendChild(el('div', 'field'));
+        return;
+      }
+      // The series, not the window: BTCD15M is what the operator typed and
+      // what they think of it as, and the quarter-hour window it is on now
+      // is on the line underneath (GUI-Q26).
+      if (spec.name === 'symbol') {
+        cell(strategy.series || strategy.symbols.join(', '),
+             spec.type === 'text' ? 'wide' : 'narrow', spec.help, null);
+        return;
+      }
+      cell(editedValue(strategy, spec.name), spec.type === 'text' ? 'wide' : 'narrow',
+           spec.help, spec);
+    });
+    return box;
+  }
+
+  // What the row says about a strategy. Nothing here moves by itself
+  // (GUI-Q28): the live orders and the placed/cancelled/fills counters used
+  // to tick twice a second in a section whose job is to hold controls, and
+  // they are on the Ladders, Books and Positions pages where they belong.
+  // What is left changes when the operator acts on it, when it rolls, or
+  // when it stops - and then it must change, because a strategy that halted
+  // and did not say so would be the worst thing on this page.
+  function strategyStatus(strategy) {
+    var line = el('p', 'status');
+    line.appendChild(el('span', 'tag ' + strategy.state, strategy.state));
+    line.appendChild(el('span', 'tag ' + (strategy.armed ? 'armed' : ''),
+                        strategy.armed ? 'armed' : 'disarmed'));
+    var where = strategy.series ? strategy.series + ' · ' + strategy.symbols.join(', ')
+                                : strategy.symbols.join(', ');
+    line.appendChild(document.createTextNode(' ' + strategy.id + ' · ' + where));
+    // Why it is not acting, and why it last stopped: the two questions an
+    // operator asks of a strategy that is quoting nothing.
+    var why = [strategy.reason, strategy.note].filter(Boolean).join(' · ');
+    if (why) line.appendChild(el('span', 'muted', ' · ' + why));
+    return line;
+  }
+
+  // What the rows are made of, as one string. A snapshot arrives twice a
+  // second and almost all of them say the same thing about this section, so
+  // it is rebuilt only when that string changes - which is also what stops
+  // the buttons flickering under the pointer.
+  function rowsSignature() {
+    return snapshot.strategies.map(function (strategy) {
+      return [strategy.id, strategy.kind, strategy.state, strategy.armed, strategy.series,
+              strategy.symbols.join(','), strategy.reason, strategy.note,
+              JSON.stringify(strategy.params)].join('|');
+    }).join('||') + '#' + snapshot.state + '#' + snapshot.allow_orders + '#' + busy;
+  }
+
+  var rowsDrawn = null;
+  // Whether each row was drawn open or locked, so a row that locks while it
+  // is being typed into is still redrawn.
+  var drawnEditable = {};
+
+  function renderStrategyRows() {
+    var host = document.getElementById('strategy-rows');
+    // A row whose lock changed is redrawn whatever is in it: a strategy that
+    // has been armed must never look editable, and text that can no longer
+    // be applied must not sit in a box as though it could.
+    var force = false;
+    snapshot.strategies.forEach(function (strategy) {
+      var was = drawnEditable[strategy.id];
+      if (was !== undefined && was !== editable(strategy)) {
+        delete edits[strategy.id];
+        force = true;
+      }
+    });
+    var signature = rowsSignature();
+    if (signature === rowsDrawn && !force) return;
+    // Not while a parameter is being typed into one of these rows: a
+    // snapshot arrives twice a second, and a redraw would take the caret and
+    // the half-typed value with it. Only while something is uncommitted -
+    // once Apply or Revert has emptied the buffer there is nothing to
+    // protect, which is what gets the row's buttons back in step.
+    var focused = document.activeElement;
+    if (!force && Object.keys(edits).length > 0 && focused && focused.tagName === 'INPUT' &&
+        host.contains(focused)) {
+      return;
+    }
+    rowsDrawn = signature;
+    clear(host);
+    drawnEditable = {};
+    snapshot.strategies.forEach(function (strategy) {
+      drawnEditable[strategy.id] = editable(strategy);
+      var row = el('div', 'runbar');
+      row.appendChild(strategyActions(strategy));
+      row.appendChild(paramFields(strategy));
+      host.appendChild(row);
+      host.appendChild(strategyStatus(strategy));
+    });
+  }
+
+  // ---- books and positions ------------------------------------------------
+  function renderBooks() {
+    var body = document.querySelector('#books tbody');
+    clear(body);
+    document.getElementById('books-empty').hidden = snapshot.books.length > 0;
+    document.getElementById('books').hidden = snapshot.books.length === 0;
+
+    snapshot.books.forEach(function (book) {
+      var row = el('tr');
+      cell(row, book.symbol);
+      cell(row, book.best_yes_bid, 'num');
+      cell(row, book.best_yes_bid_qty, 'num');
+      cell(row, book.implied_yes_ask, 'num');
+      cell(row, book.best_no_bid_qty, 'num');
+      cell(row, book.mid, 'num');
+      cell(row, book.last_trade, 'num');
+      cell(row, book.volume, 'num');
+      cell(row, book.open_interest, 'num');
+
+      var status = el('td');
+      status.appendChild(el('span', 'tag', book.status));
+      // A book nobody should quote against says so here, because a strategy
+      // withdrawing for this reason is otherwise a silent screen.
+      if (!book.valid) {
+        status.appendChild(document.createTextNode(' '));
+        status.appendChild(el('span', 'tag halted', 'no valid book'));
+      }
+      if (book.crossed_or_locked) {
+        status.appendChild(document.createTextNode(' '));
+        status.appendChild(el('span', 'tag stopping', 'crossed'));
+      }
+      // With the session down these numbers are the last ones that arrived,
+      // not the market. A halted page showing a live-looking book is the
+      // quiet kind of wrong this project spends its words avoiding.
+      if (!snapshot.market_data.logged_on) {
+        status.appendChild(document.createTextNode(' '));
+        status.appendChild(el('span', 'tag stopping', 'feed down: last known'));
+      }
+      row.appendChild(status);
+      body.appendChild(row);
+    });
+  }
+
+  // ---- the ladders --------------------------------------------------------
+  // The instrument's whole price axis, every rung from 0 to 1, with whatever
+  // rests on each and our own orders coloured in. The axis comes from the
+  // daemon once per symbol: it is the instrument's tick grid (tapered, cent
+  // or deci-cent - O5), and the page could not generate it without doing
+  // decimal arithmetic on prices, which is the one thing it does not do.
+  var axes = {};        // symbol -> the rungs the daemon sent
+  var axisAsked = {};   // symbol -> a request is already out
+  var ladders = {};     // symbol -> the built table, kept so scroll survives
+  // Prices seen off the instrument's grid, remembered for as long as the
+  // ladder lives. They are kept rather than dropped when they empty, because
+  // a rung that comes and goes rebuilds the table underneath whoever is
+  // reading it - and a rung that was real a second ago is worth a line.
+  var extraRungs = {};  // symbol -> ticks -> rung
+
+  function wantAxis(symbol) {
+    if (axes[symbol] || axisAsked[symbol]) return;
+    axisAsked[symbol] = true;
+    api('GET', '/api/ladder?symbol=' + encodeURIComponent(symbol)).then(function (result) {
+      if (result && result.rungs) {
+        axes[symbol] = result;
+        render();
+      } else {
+        // A symbol nobody is watching has no ladder; ask again next time it
+        // appears rather than remembering a failure for the whole run.
+        delete axisAsked[symbol];
+      }
+    }).catch(function () { delete axisAsked[symbol]; });
+  }
+
+  function ourLegs(symbol) {
+    var legs = [];
+    snapshot.strategies.forEach(function (strategy) {
+      if (strategy.symbols.indexOf(symbol) === -1) return;
+      strategy.legs.forEach(function (leg) {
+        legs.push({ leg: leg, strategy: strategy });
+      });
+    });
+    return legs;
+  }
+
+  // What is on each rung right now, keyed by tick count.
+  function rungState(book, legs) {
+    var state = {};
+    function at(ticks) {
+      if (!state[ticks]) state[ticks] = {};
+      return state[ticks];
+    }
+    book.bids.forEach(function (level) { at(level.price_ticks).bid = level; });
+    book.asks.forEach(function (level) { at(level.price_ticks).ask = level; });
+    legs.forEach(function (entry) {
+      var side = entry.leg.side === 'buy' ? 'mineBid' : 'mineAsk';
+      var rung = at(entry.leg.price_ticks);
+      rung[side] = rung[side] || { sizes: [], cancelling: false, who: [] };
+      // Listed, not added: a quantity is a scaled integer the daemon has
+      // already formatted, and adding two of them here would be arithmetic
+      // this page does not do (design §8).
+      rung[side].sizes.push(entry.leg.quantity);
+      rung[side].cancelling = rung[side].cancelling || entry.leg.cancel_pending;
+      if (rung[side].who.indexOf(entry.strategy.id) === -1) {
+        rung[side].who.push(entry.strategy.id);
+      }
+    });
+    return state;
+  }
+
+  // Every rung the ladder needs: the grid, plus anything ever seen off it.
+  function allRungs(symbol, book, axis, legs) {
+    var seen = {};
+    var rungs = [];
+    axis.rungs.forEach(function (rung) {
+      seen[rung.price_ticks] = true;
+      rungs.push(rung);
+    });
+    var extras = extraRungs[symbol] || (extraRungs[symbol] = {});
+    function extra(level) {
+      if (seen[level.price_ticks] || extras[level.price_ticks]) return;
+      extras[level.price_ticks] =
+        { price: level.price, price_ticks: level.price_ticks, off_grid: true };
+    }
+    book.bids.forEach(extra);
+    book.asks.forEach(extra);
+    legs.forEach(function (entry) { extra(entry.leg); });
+    Object.keys(extras).forEach(function (ticks) {
+      if (!seen[ticks]) rungs.push(extras[ticks]);
+    });
+    return rungs.sort(function (a, b) { return b.price_ticks - a.price_ticks; });
+  }
+
+  function buildLadder(symbol, rungs) {
+    var panel = el('div', 'ladder');
+    var name = el('div', 'name', symbol);
+    var note = el('small', null, '');
+    name.appendChild(note);
+    var centre = el('button', '', 'centre');
+    centre.type = 'button';
+    name.appendChild(document.createTextNode(' '));
+    name.appendChild(centre);
+    panel.appendChild(name);
+
+    var scroll = el('div', 'ladder-scroll');
+    var table = document.createElement('table');
+    var head = document.createElement('thead');
+    var headRow = el('tr');
+    // A prediction market is read as a chance, so the axis is 0 to 100 and
+    // says so once at the top rather than on every rung.
+    ['ours', 'bid', 'chance %', 'ask', 'ours'].forEach(function (label) {
+      headRow.appendChild(el('th', 'num', label));
+    });
+    head.appendChild(headRow);
+    table.appendChild(head);
+
+    var body = document.createElement('tbody');
+    var rows = {};
+    rungs.forEach(function (rung) {
+      var line = el('tr');
+      var ourBid = el('td', 'ours-bid mine');
+      var bid = el('td', 'bid');
+      var price = el('td', 'price' + (rung.off_grid ? ' off-grid' : '') +
+                           (rung.quotable === false ? ' unquotable' : ''), rung.price);
+      if (rung.off_grid) price.title = 'not on the instrument\'s tick grid';
+      if (rung.quotable === false) {
+        price.title = 'a settlement value, not a price an order can be placed at';
+      }
+      var ask = el('td', 'ask');
+      var ourAsk = el('td', 'ours-ask mine');
+      [ourBid, bid, price, ask, ourAsk].forEach(function (cell) { line.appendChild(cell); });
+      body.appendChild(line);
+      rows[rung.price_ticks] = { line: line, ourBid: ourBid, bid: bid, ask: ask, ourAsk: ourAsk };
+    });
+    table.appendChild(body);
+    scroll.appendChild(table);
+    panel.appendChild(scroll);
+
+    var entry = { panel: panel, scroll: scroll, note: note, rows: rows, centred: false,
+                  signature: rungs.length + ':' + (rungs.length ? rungs[0].price_ticks : 0) };
+    centre.addEventListener('click', function () { centreOn(entry, symbol); });
+    return entry;
+  }
+
+  // Put the market in the middle of the visible part. Done once per symbol,
+  // and then only when asked: an operator who has scrolled somewhere is
+  // looking at it, and a ladder that scrolls itself twice a second is useless.
+  function centreOn(entry, symbol) {
+    var book = null;
+    snapshot.books.forEach(function (b) { if (b.symbol === symbol) book = b; });
+    if (!book) return;
+    var target = null;
+    if (book.bids.length) target = book.bids[0].price_ticks;
+    if (book.asks.length) target = book.asks[0].price_ticks;
+    if (target === null) return;
+    var row = entry.rows[target];
+    if (!row) return;
+    entry.scroll.scrollTop = row.line.offsetTop - (entry.scroll.clientHeight / 2);
+  }
+
+  function renderLadders() {
+    var host = document.getElementById('ladders');
+    document.getElementById('ladders-empty').hidden = snapshot.books.length > 0;
+
+    var live = {};
+    snapshot.books.forEach(function (book) {
+      live[book.symbol] = true;
+      wantAxis(book.symbol);
+      var axis = axes[book.symbol];
+      if (!axis) return;  // the grid has not arrived yet
+
+      var legs = ourLegs(book.symbol);
+      var rungs = allRungs(book.symbol, book, axis, legs);
+      var entry = ladders[book.symbol];
+      var signature = rungs.length + ':' + (rungs.length ? rungs[0].price_ticks : 0);
+      if (!entry || entry.signature !== signature) {
+        // Built once and then updated in place: rebuilding hundreds of rows
+        // twice a second would throw away wherever the operator had scrolled
+        // to. It is rebuilt only when the set of rungs itself changes - an
+        // order appearing at a price off the instrument's grid, say - and
+        // then it *replaces* the old panel. Appending beside it was the first
+        // version of this, and it grew a new ladder every few seconds.
+        var rebuilt = buildLadder(book.symbol, rungs);
+        rebuilt.centred = entry ? entry.centred : false;
+        var where = entry && entry.panel.parentNode ? entry.panel : null;
+        if (where) {
+          var keep = entry.scroll.scrollTop;
+          host.replaceChild(rebuilt.panel, where);
+          // After it is in the document, never before: scrollTop on a node
+          // with no layout yet is silently discarded.
+          rebuilt.scroll.scrollTop = keep;
+        } else {
+          host.appendChild(rebuilt.panel);
+        }
+        entry = rebuilt;
+        ladders[book.symbol] = entry;
+      }
+
+      var state = rungState(book, legs);
+      var bestBid = book.bids.length ? book.bids[0].price_ticks : null;
+      var bestAsk = book.asks.length ? book.asks[0].price_ticks : null;
+
+      Object.keys(entry.rows).forEach(function (ticks) {
+        var row = entry.rows[ticks];
+        var here = state[ticks] || {};
+        var classes = [];
+        if (here.mineBid) classes.push('mine-bid');
+        if (here.mineAsk) classes.push('mine-ask');
+        if ((here.mineBid && here.mineBid.cancelling) ||
+            (here.mineAsk && here.mineAsk.cancelling)) {
+          classes.push('cancelling');
+        }
+        // The spread, as the band of empty rungs it actually is.
+        if (bestBid !== null && bestAsk !== null &&
+            Number(ticks) > bestBid && Number(ticks) < bestAsk) {
+          classes.push('between');
+        }
+        if (!here.bid && !here.ask && !here.mineBid && !here.mineAsk) classes.push('quiet');
+        row.line.className = classes.join(' ');
+
+        row.ourBid.textContent = here.mineBid
+          ? here.mineBid.sizes.join('+') + (here.mineBid.cancelling ? '*' : '') : '';
+        row.ourBid.title = here.mineBid ? 'our bid: ' + here.mineBid.who.join(', ') : '';
+        row.bid.textContent = here.bid ? here.bid.qty : '';
+        row.ask.textContent = here.ask ? here.ask.qty : '';
+        row.ourAsk.textContent = here.mineAsk
+          ? here.mineAsk.sizes.join('+') + (here.mineAsk.cancelling ? '*' : '') : '';
+        row.ourAsk.title = here.mineAsk ? 'our ask: ' + here.mineAsk.who.join(', ') : '';
+      });
+
+      clear(entry.note);
+      entry.note.appendChild(document.createTextNode(
+        '  ' + axis.structure + ' grid, ' + axis.rungs.length + ' rungs, 0-100%' +
+        (book.valid ? '' : '   no valid book') +
+        (book.crossed_or_locked ? '   CROSSED' : '') +
+        (snapshot.market_data.logged_on ? '' : '   feed down: last known') +
+        (book.spread ? '   spread ' + book.spread + '%' : '') +
+        (book.mid ? '   mid ' + book.mid + '%' : '')));
+
+      // A hidden section has no height, so centring in it would scroll to
+      // nowhere and never be tried again. The nav asks for it instead when
+      // the page is actually opened.
+      if (!entry.centred && entry.scroll.clientHeight > 0) {
+        entry.centred = true;
+        centreOn(entry, book.symbol);
+      }
+    });
+
+    // A symbol whose strategy was removed takes its ladder with it.
+    Object.keys(ladders).forEach(function (symbol) {
+      if (live[symbol]) return;
+      if (ladders[symbol].panel.parentNode) {
+        ladders[symbol].panel.parentNode.removeChild(ladders[symbol].panel);
+      }
+      delete ladders[symbol];
+      delete axes[symbol];
+      delete axisAsked[symbol];
+      delete extraRungs[symbol];
+    });
+  }
+
+  function renderPositions() {
+    var body = document.querySelector('#positions tbody');
+    clear(body);
+    document.getElementById('positions-empty').hidden = snapshot.positions.length > 0;
+    document.getElementById('positions').hidden = snapshot.positions.length === 0;
+
+    snapshot.positions.forEach(function (position) {
+      var row = el('tr');
+      cell(row, position.symbol);
+      cell(row, position.net, 'num');
+      cell(row, position.bought, 'num');
+      cell(row, position.sold, 'num');
+      cell(row, position.cash, 'num');
+      cell(row, position.fees, 'num');
+      cell(row, position.fills, 'num');
+      cell(row, position.settlement_payout, 'num');
+      body.appendChild(row);
+    });
+  }
+
+  // ---- the blank rows the operator adds -----------------------------------
+  // Nothing here knows what a CryptoMM parameter is. A kind registered in C++
+  // after this file was written renders its own row (design §4).
+  //
+  // A blank row is never conjured up: the operator presses Add row for one
+  // (GUI-Q26), fills it in, and presses Start Feed or Start. On Start it
+  // becomes a live strategy and the blank row goes, because the strategy's
+  // own row is now there in its place.
+  //
+  // Each row's three buttons are the daemon's verbs: Start Feed is create,
+  // which subscribes the book and quotes nothing; Start is create (if
+  // needed) then start then arm - it puts live orders in the market, which
+  // is why it asks first; Stop is stop, and leaves the feed up.
+  var drafts = [];
+  var nextDraft = 1;
+
+  // What was typed, per blank row and per kind, so switching kind and coming
+  // back does not lose a half-typed ticker.
+  function remember(draft, name, value) { draft.values[draft.kind + '.' + name] = value; }
+  function remembered(draft, spec) {
+    var value = draft.values[draft.kind + '.' + spec.name];
+    return value !== undefined ? value : (spec.default || '');
+  }
+
+  function draftInput(draft, name) { return document.getElementById('param-' + draft.n + '-' + name); }
+
+  function draftSymbol(draft) {
+    var input = draftInput(draft, 'symbol');
+    return input ? input.value.trim() : '';
+  }
+
+  function draftParams(draft) {
+    var params = {};
+    kindByName(draft.kind).params.forEach(function (spec) {
+      var input = draftInput(draft, spec.name);
+      var value = input ? input.value.trim() : '';
+      // An omitted value means "use the schema's default", which the daemon
+      // fills in; sending an empty string would be a different question.
+      if (value !== '') params[spec.name] = value;
+    });
+    return params;
+  }
+
+  // The strategy a name belongs to, whether that name is the series it
+  // follows or the window it is on. A symbol belongs to one strategy
+  // (GUI-Q6), so this is a key and the page keeps no state of its own.
+  function strategyOn(kind, name) {
+    if (!snapshot || !name) return null;
+    var found = null;
+    snapshot.strategies.forEach(function (strategy) {
+      if (found || strategy.kind !== kind) return;
+      if (strategy.target === name || strategy.series === name ||
+          strategy.symbols.indexOf(name) !== -1) {
+        found = strategy;
+      }
+    });
+    return found;
+  }
+
+  function dropDraft(draft) {
+    drafts = drafts.filter(function (other) { return other !== draft; });
+    render();
+  }
+
+  function createFromDraft(draft) {
+    return act('POST', '/api/strategies', { kind: draft.kind, params: draftParams(draft) })
+      .then(function (result) {
+        // The strategy has its own row from here; this one has done its job.
+        if (result && result.ok) dropDraft(draft);
+        return result;
+      });
+  }
+
+  // Start means quote. It creates what is missing, starts it and arms it, in
+  // that order, and asks first because the last of those three is the one
+  // that puts an order in the market (GUI-Q8, GUI-Q26).
+  function startQuoting(kind, symbol, params, existing, draft) {
+    var base = function (id) { return '/api/strategies/' + encodeURIComponent(id) + '/'; };
+    var run = function (id) {
+      act('POST', base(id) + 'start').then(function (result) {
+        if (result && result.ok && snapshot.allow_orders) act('POST', base(id) + 'arm');
+      });
+    };
+    var go = function () {
+      if (existing) {
+        run(existing.id);
+        return;
+      }
+      createFromDraft(draft).then(function (result) {
+        if (result && result.ok && result.id) run(result.id);
+      });
+    };
+    if (!snapshot.allow_orders) {
+      // Nothing can reach the venue in this daemon, so there is nothing to
+      // confirm: it is a dry run whatever the button says.
+      go();
+      return;
+    }
+    var shown = Object.keys(params).map(function (name) {
+      return name + '=' + params[name];
+    }).join('  ');
+    ask({
+      title: 'Start quoting ' + (symbol || kind) + '?',
+      rows: [
+        ['strategy', existing ? existing.id + '  (' + kind + ')' : 'new  (' + kind + ')'],
+        ['symbol', symbol],
+        ['parameters', shown],
+        ['per order', snapshot.limits.max_quantity + ' contracts, ' +
+                      snapshot.limits.max_notional + ' notional'],
+        ['recovery', snapshot.recovery]
+      ],
+      says: snapshot.recovery === 'live'
+        ? 'It will send live orders to the venue from its next pass.'
+        : 'It will send live orders to the venue as soon as recovery finishes.',
+      confirm: 'Start quoting'
+    }).then(function (yes) {
+      if (yes) go();
+    });
+  }
+
+  function draftControls(draft) {
+    var box = el('div', 'controls');
+    var halted = snapshot && snapshot.state === 'halted';
+    var symbol = draftSymbol(draft);
+    var mine = strategyOn(draft.kind, symbol);
+    // A strategy is controlled from its own row, never from two places.
+    var taken = mine ? mine.id + ' is already on ' + symbol + ' - use its row above.' : '';
+
+    var feed = actionButton('Start Feed', '', !mine && !halted, function () {
+      createFromDraft(draft);
+    });
+    if (taken) feed.title = taken;
+    box.appendChild(feed);
+
+    var start = actionButton('Start', '', !mine && !halted, function () {
+      startQuoting(draft.kind, symbol, draftParams(draft), null, draft);
+    });
+    start.title = taken || (snapshot && snapshot.allow_orders
+      ? 'Creates it, starts it and arms it: live orders.'
+      : 'This daemon was started without --allow-orders, so this is a dry run.');
+    box.appendChild(start);
+
+    var stop = actionButton('Stop', '', false, function () {});
+    stop.title = taken || 'Nothing to stop yet: this row has not made a strategy.';
+    box.appendChild(stop);
+
+    // Not the Remove button, which is gone: this throws away a blank row,
+    // and a blank row is the only thing it can throw away.
+    var drop = actionButton('×', 'drop', true, function () { dropDraft(draft); });
+    drop.title = 'Discard this blank row.';
+    box.appendChild(drop);
+    return box;
+  }
+
+  function buildDraftRow(draft) {
+    var row = el('div', 'runbar new');
+    row.id = 'draft-' + draft.n;
+    var controls = el('div', 'controls-slot');
+    controls.id = 'draft-controls-' + draft.n;
+    row.appendChild(controls);
+
+    var form = el('div', 'form');
+    var chooser = el('div', 'field narrow kind');
+    var select = el('select');
+    kinds.forEach(function (kind) {
+      var option = el('option', null, kind.name);
+      option.value = kind.name;
+      select.appendChild(option);
+    });
+    select.value = draft.kind;
+    select.title = kindByName(draft.kind).help;
+    select.addEventListener('change', function () {
+      draft.kind = select.value;
+      draft.built = false;  // a different kind is a different set of fields
+      render();
+    });
+    chooser.appendChild(select);
+    form.appendChild(chooser);
+
+    var mine = {};
+    kindByName(draft.kind).params.forEach(function (spec) { mine[spec.name] = spec; });
+
+    // One cell per column of the header, in its order, empty where this
+    // kind has no such parameter.
+    columns().forEach(function (column) {
+      var spec = mine[column.name];
+      if (!spec) {
+        form.appendChild(el('div', 'field'));
+        return;
+      }
+      var field = el('div', 'field ' + (spec.type === 'text' ? 'wide' : 'narrow'));
+
+      var input;
+      if (spec.type === 'enum') {
+        input = el('select');
+        spec.choices.forEach(function (choice) {
+          var option = el('option', null, choice);
+          option.value = choice;
+          input.appendChild(option);
+        });
+      } else {
+        input = el('input');
+        if (spec.type === 'int' || spec.type === 'decimal') {
+          input.type = 'number';
+          input.step = spec.type === 'decimal' ? String(Math.pow(10, -spec.scale)) : '1';
+          if (spec.min !== '') input.min = spec.min;
+          if (spec.max !== '') input.max = spec.max;
+        } else {
+          input.type = 'text';
+        }
+        input.placeholder = spec.required ? 'required' : spec.default;
+      }
+      input.id = 'param-' + draft.n + '-' + spec.name;
+      input.value = remembered(draft, spec);
+      // The daemon validates against the same schema whatever this sends, so
+      // the row is a convenience and never the rule (design §4).
+      input.title = spec.help;
+      input.addEventListener('input', function () {
+        remember(draft, spec.name, input.value);
+        // The symbol is what the buttons are about, so they follow it as it
+        // is typed. Only the controls are redrawn, so the caret stays put.
+        if (spec.name === 'symbol') {
+          var slot = document.getElementById('draft-controls-' + draft.n);
+          clear(slot);
+          slot.appendChild(draftControls(draft));
+        }
+      });
+      field.appendChild(input);
+      form.appendChild(field);
+    });
+
+    row.appendChild(form);
+    var status = el('p', 'status');
+    status.id = 'draft-status-' + draft.n;
+    draft.row = row;
+    draft.status = status;
+    draft.built = true;
+    return row;
+  }
+
+  function renderDrafts() {
+    var host = document.getElementById('draft-rows');
+    var note = document.getElementById('create-note');
+    if (!kinds.length) {
+      clear(host);
+      note.hidden = false;
+      note.textContent = 'This build has no strategy kinds registered.';
+      return;
+    }
+    note.hidden = true;
+
+    // The fields belong to whoever is typing in them: they are built once
+    // per row and never rebuilt by a snapshot, which arrives twice a second.
+    // Only the controls and the line under them are redrawn.
+    var fresh = drafts.some(function (draft) { return !draft.built; });
+    if (fresh || host.children.length !== drafts.length * 2) {
+      clear(host);
+      drafts.forEach(function (draft) {
+        host.appendChild(buildDraftRow(draft));
+        host.appendChild(draft.status);
+      });
+    }
+    drafts.forEach(function (draft) {
+      var slot = document.getElementById('draft-controls-' + draft.n);
+      if (!slot) return;
+      var mine = strategyOn(draft.kind, draftSymbol(draft));
+      // Same rule as a live row: redrawn when it has something new to say,
+      // not because another snapshot arrived (GUI-Q28).
+      var signature = [mine ? mine.id : '', mine ? mine.state : '', draftSymbol(draft),
+                       snapshot && snapshot.state, snapshot && snapshot.allow_orders,
+                       busy].join('|');
+      if (signature === draft.drawn) return;
+      draft.drawn = signature;
+      clear(slot);
+      slot.appendChild(draftControls(draft));
+      draft.status.textContent = snapshot && snapshot.state === 'halted'
+        ? 'The daemon has halted. Nothing starts again in this process.'
+        : mine ? mine.id + ' is already on that symbol - use its row above.'
+               : 'Start Feed subscribes the book and quotes nothing. Start quotes.';
+    });
+  }
+
+  // The columns after Buttons and Kind: every parameter any registered kind
+  // has, in the order the schema gives them, each name once. One kind is
+  // the usual case and this is then just its schema; two kinds share the
+  // columns they have in common and leave each other's cells empty, which
+  // is what keeps a column a column when a second kind is registered.
+  function columns() {
+    var out = [];
+    var seen = {};
+    kinds.forEach(function (kind) {
+      kind.params.forEach(function (spec) {
+        if (seen[spec.name]) return;
+        seen[spec.name] = true;
+        out.push(spec);
+      });
+    });
+    return out;
+  }
+
+  function renderRowsHead() {
+    var head = document.getElementById('rows-head');
+    var grid = document.getElementById('rows');
+    var specs = columns();
+    var wanted = 'Buttons|Kind|' + specs.map(function (spec) {
+      return spec.label || titleCase(spec.name);
+    }).join('|');
+    if (head.dataset.head === wanted) return;
+    head.dataset.head = wanted;
+    clear(head);
+
+    wanted.split('|').forEach(function (title) {
+      head.appendChild(el('div', 'col', title));
+    });
+    // A text column takes the slack; the rest are as wide as their heading
+    // or their box, whichever is wider, and never move again.
+    grid.style.gridTemplateColumns = 'auto auto ' + specs.map(function (spec) {
+      return spec.type === 'text' ? 'minmax(140px, 1fr)' : 'auto';
+    }).join(' ');
+  }
+
+  function renderRows() {
+    renderRowsHead();
+    renderStrategyRows();
+    renderDrafts();
+    // A heading with nothing under it says nothing: it arrives with the
+    // first row.
+    var any = (snapshot && snapshot.strategies.length > 0) || drafts.length > 0;
+    document.getElementById('rows-head').hidden = !any;
+    var add = document.getElementById('add-row');
+    add.disabled = busy || !kinds.length;
+  }
+
+  function titleCase(name) {
+    return name.split(/[-_ ]+/).map(function (word) {
+      return word ? word.charAt(0).toUpperCase() + word.slice(1) : word;
+    }).join(' ');
+  }
+
+  function kindByName(name) {
+    for (var i = 0; i < kinds.length; ++i) {
+      if (kinds[i].name === name) return kinds[i];
+    }
+    return kinds[0];
+  }
+
+  // ---- the log panel ------------------------------------------------------
+  // A reconnect starts the daemon's side at zero again and re-sends the
+  // tail, so the sequence number is what stops a dropped tunnel from
+  // printing everything twice.
+  var lastLogSeq = 0;
+  var LOG_LINES_KEPT = 1000;
+
+  function appendLogs(lines) {
+    var box = document.getElementById('log-lines');
+    // Stick to the bottom only if that is where the operator already is:
+    // scrolling up to read something must not be undone by the next line.
+    var atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 24;
+    var added = 0;
+    lines.forEach(function (line) {
+      if (line.seq <= lastLogSeq) return;
+      lastLogSeq = line.seq;
+      var row = el('div', 'line ' + line.level);
+      row.appendChild(el('span', 'at', line.at));
+      row.appendChild(document.createTextNode(' '));
+      row.appendChild(el('span', 'lvl', (line.level + '    ').slice(0, 5)));
+      row.appendChild(document.createTextNode(' ' + line.text));
+      box.appendChild(row);
+      added += 1;
+    });
+    if (!added) return;
+    while (box.children.length > LOG_LINES_KEPT) box.removeChild(box.firstChild);
+    if (atBottom) box.scrollTop = box.scrollHeight;
+  }
+
+  // ---- the header, the halt and the limits --------------------------------
+  function pill(id, label, value, className) {
+    var node = document.getElementById(id);
+    clear(node);
+    node.className = 'pill' + (className ? ' ' + className : '');
+    node.appendChild(document.createTextNode(label + ' '));
+    node.appendChild(el('b', null, value));
+  }
+
+  function renderHeader() {
+    pill('pill-state', 'state', snapshot.state,
+         snapshot.state === 'halted' ? 'bad' : (snapshot.state === 'live' ? 'good' : 'warn'));
+    pill('pill-md', 'md', snapshot.market_data.logged_on ? 'up' : 'down',
+         snapshot.market_data.logged_on ? 'good' : 'bad');
+    pill('pill-oe', 'oe', snapshot.order_entry.logged_on ? 'up' : 'down',
+         snapshot.order_entry.logged_on ? 'good' : 'bad');
+    document.getElementById('pill-md').title = snapshot.market_data.last_reason || '';
+    document.getElementById('pill-oe').title = snapshot.order_entry.last_reason || '';
+    // Reconciling is not a fault: it is the gate that holds orders back until
+    // the session's state is known again (GUI-Q11).
+    pill('pill-recovery', 'recovery', snapshot.recovery,
+         snapshot.recovery === 'live' ? '' : 'warn');
+    // The speed bump's own feed. "off" is not a problem - it is a daemon
+    // with no reference venue configured - but stale or down is, because a
+    // strategy with the guard on will not quote without one (B-Q4).
+    var reference = snapshot.reference || 'off';
+    pill('pill-reference', 'reference', reference,
+         reference === 'up' ? 'good' : (reference === 'off' ? '' : 'warn'));
+    pill('pill-orders', 'orders', snapshot.allow_orders ? 'permitted' : 'observer',
+         snapshot.allow_orders ? '' : 'warn');
+
+    var halt = document.getElementById('halt');
+    clear(halt);
+    halt.hidden = !snapshot.halt_reason;
+    if (snapshot.halt_reason) {
+      halt.appendChild(document.createTextNode('HALTED: ' + snapshot.halt_reason));
+      // There is no clear-halt control, and the page should not imply one
+      // exists (GUI-Q4, instructions amendment 4).
+      halt.appendChild(el('small', null,
+        'Every strategy was withdrawn and both sessions were stopped. Nothing resumes in ' +
+        'this process: stop the daemon, fix what caused this, and start a new one.'));
+    }
+
+    var limits = snapshot.limits;
+    // Per order, not exposure: max_inventory is the only position cap and it
+    // is per strategy (GUI-Q10).
+    document.getElementById('limits').textContent =
+      'Session limits, shared by every strategy: at most ' + limits.max_quantity +
+      ' contracts and ' + limits.max_notional + ' notional per order, ' +
+      limits.max_orders_per_sec + ' orders/sec across the session' +
+      '  ·  revision ' + snapshot.revision;
+  }
+
+  // A page nobody is looking at still has news: the counts sit in the nav so
+  // an operator on the ladder can see a fill arrive on another page.
+  function renderNav() {
+    var counts = {
+      strategies: snapshot.strategies.length,
+      ladders: snapshot.books.length,
+      books: snapshot.books.length,
+      positions: snapshot.positions.length
+    };
+    var buttons = document.querySelectorAll('#nav button');
+    for (var i = 0; i < buttons.length; ++i) {
+      var name = buttons[i].getAttribute('data-view');
+      var count = counts[name];
+      clear(buttons[i]);
+      buttons[i].appendChild(document.createTextNode(
+        VIEWS.filter(function (v) { return v.name === name; })[0].label + ' '));
+      buttons[i].appendChild(el('span', 'count', count ? '(' + count + ')' : ''));
+    }
+  }
+
+  function render() {
+    if (!snapshot) return;
+    renderNav();
+    renderHeader();
+    renderRows();
+    renderBooks();
+    renderLadders();
+    renderPositions();
+  }
+
+  // ---- the stream ---------------------------------------------------------
+  // Every connect begins with a whole snapshot, and so does every reconnect,
+  // so a closed laptop needs no recovery logic here and nothing is merged
+  // (GUI-Q14). EventSource reconnects on its own.
+  function connect() {
+    gaveUp = false;
+    document.getElementById('reconnect').className = '';
+    if (stream) stream.close();
+    stream = new EventSource('/api/events?t=' + encodeURIComponent(token));
+
+    stream.addEventListener('open', function () {
+      failedConnects = 0;
+      pill('pill-stream', 'stream', 'live', 'good');
+    });
+
+    stream.addEventListener('snapshot', function (event) {
+      snapshot = JSON.parse(event.data);
+      lastEventAt = Date.now();
+      failedConnects = 0;
+      document.body.className = '';
+      pill('pill-stream', 'stream', 'live', 'good');
+      render();
+    });
+
+    // The heartbeat is how this page knows the difference between a market
+    // with nothing happening in it and a connection that has quietly died.
+    stream.addEventListener('heartbeat', function (event) {
+      lastEventAt = Date.now();
+      failedConnects = 0;
+      pill('pill-stream', 'stream', 'live', 'good');
+      var beat = JSON.parse(event.data);
+      // The daemon has moved on and this page did not hear it: reconnecting
+      // takes a whole snapshot, which is the only way back into step
+      // (GUI-Q14 - nothing here is ever merged).
+      if (snapshot && beat.revision !== snapshot.revision) connect();
+    });
+
+    // The log arrives on its own event, so the page is not re-rendered for a
+    // line of text and the snapshot does not carry the same tail every pass.
+    stream.addEventListener('log', function (event) {
+      lastEventAt = Date.now();
+      appendLogs(JSON.parse(event.data).lines);
+    });
+
+    stream.addEventListener('error', function () {
+      // EventSource raises the same event for "retrying" and "given up", and
+      // those are different news. Worse, a token the daemon will never accept
+      // produces a retry loop that looks exactly like a flaky tunnel, so a
+      // run of failures with nothing received between them is taken as the
+      // answer it is.
+      failedConnects += 1;
+      var closed = stream.readyState === EventSource.CLOSED;
+      if (closed || failedConnects >= GIVE_UP_AFTER) {
+        giveUp(closed
+          ? 'The event stream closed and will not reopen by itself.'
+          : 'The event stream has failed ' + failedConnects + ' times without connecting.');
+        return;
+      }
+      pill('pill-stream', 'stream', 'reconnecting', 'warn');
+    });
+  }
+
+  // A page that has stopped hearing from the daemon must say so rather than
+  // keep showing the last thing it heard as though it were now.
+  function giveUp(why) {
+    gaveUp = true;
+    if (stream) stream.close();
+    document.body.className = 'stale';
+    pill('pill-stream', 'stream', 'not connected', 'bad');
+    if (snapshot) pill('pill-state', 'last known', snapshot.state, 'warn');
+    document.getElementById('reconnect').className = 'needed';
+    flash(why + ' Nothing on this page is current. The daemon is unaffected either way - ' +
+          'press Reconnect, or reopen the link it printed at startup.');
+  }
+
+  // Once a second, whatever the stream is doing: an age beside the state is
+  // the difference between a quiet market and a frozen page.
+  function watchFreshness() {
+    window.setInterval(function () {
+      if (gaveUp || !lastEventAt) return;
+      var age = Math.round((Date.now() - lastEventAt) / 1000);
+      // The daemon sends a keepalive every 15 s, so twice that with nothing
+      // at all means the connection is not carrying anything.
+      if (age >= 40) {
+        pill('pill-stream', 'stream', 'silent ' + age + 's', 'bad');
+      } else if (age >= 20) {
+        pill('pill-stream', 'stream', 'quiet ' + age + 's', 'warn');
+      }
+    }, 1000);
+  }
+
+  document.getElementById('add-row').addEventListener('click', function () {
+    if (!kinds.length) return;
+    drafts.push({ n: nextDraft++, kind: kinds[0].name, values: {}, built: false });
+    render();
+  });
+
+  // The kill switch: never disabled, never queued behind another request, and
+  // it does not need a snapshot, a schema or a working stream to be pressed.
+  // If this page can reach the daemon at all, this button works.
+  document.getElementById('stop-all').addEventListener('click', function () {
+    var live = snapshot ? snapshot.strategies.filter(function (s) {
+      return s.state !== 'stopped';
+    }) : [];
+    ask({
+      title: 'Stop every strategy?',
+      rows: live.length
+        ? live.map(function (s) {
+            return [s.id, s.symbols.join(', ') + ' - ' + s.state +
+                          (s.armed ? ', armed' : ', disarmed') +
+                          ', ' + s.legs.length + ' live order(s)'];
+          })
+        : [['running', snapshot ? 'nothing is running' : 'unknown - this page has no snapshot']],
+      says: 'Each one withdraws its orders and is disarmed. Nothing restarts by itself.',
+      confirm: 'Stop all',
+      danger: true
+    }).then(function (yes) {
+      if (yes) act('POST', '/api/stop-all', undefined, true);
+    });
+  });
+
+  document.getElementById('reconnect').addEventListener('click', function () {
+    flash('');
+    failedConnects = 0;
+    pill('pill-stream', 'stream', 'connecting', 'warn');
+    connect();
+  });
+
+  if (!token) {
+    flash('No run token. Open the link the daemon printed at startup, which carries ?t=...');
+    return;
+  }
+
+  // The schema once, the snapshot forever after: the kinds cannot change in a
+  // running daemon, because they are registered in main().
+  //
+  // The stream is opened whatever the schema does. Failing to read the schema
+  // costs the create form; it must not also cost the operator the table, the
+  // halt banner and the kill switch.
+  buildNav();
+  watchFreshness();
+  api('GET', '/api/schema').then(function (result) {
+    if (result && result.status === 401) {
+      flash('This page is not authorised. Reopen the link the daemon printed at startup.');
+      kinds = [];
+    } else {
+      kinds = (result && result.kinds) || [];
+    }
+  }).catch(function () {
+    kinds = [];
+    flash('The parameter schema could not be read, so no new strategy can be started from ' +
+          'this page. Everything already running is still shown and can still be stopped.');
+  }).then(function () {
+    connect();
+  });
+})();
+</script>
+</body>
+</html>

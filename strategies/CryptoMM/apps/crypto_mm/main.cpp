@@ -5,11 +5,16 @@
 // market data session and the orders go out on the order entry session, each
 // with its own credentials and its own endpoint guard.
 //
-//   source creds.env && source creds-oe.env && \
-//     ./crypto_mm --symbol BTCD15M-... --width-ticks 2 --qty 1 --allow-orders
+//   source creds.env && source creds-oe.env
+//   ./crypto_mm --symbol BTCD15M-... --width-ticks 2 --qty 1 --allow-orders
 //
 // Without --allow-orders it runs as a dry run: it computes and logs the quotes
 // it would place and sends nothing.
+//
+// Since G1 the strategy runs under StrategyHost, the same host cpm_trader will
+// use, with exactly one strategy in it. The flags are unchanged: they are
+// validated against the CryptoMM parameter schema, so this binary and the GUI
+// cannot disagree about what a parameter means.
 #include "cpm/common/config.hpp"
 #include "cpm/common/logging.hpp"
 #include "cpm/md/market_state.hpp"
@@ -19,6 +24,7 @@
 #include "cpm/oms/order_state.hpp"
 #include "cpm/oms/reconciler.hpp"
 #include "cpm/strategy/crypto_mm.hpp"
+#include "cpm/strategy/host.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -34,12 +40,9 @@ namespace {
 using namespace std::chrono_literals;
 
 struct Args {
-    std::string symbol;
-    int width_ticks = 2;
-    cpm::Qty quantity = 100;      // 1.00 contract
-    cpm::Qty max_inventory = 500; // 5.00 contracts
-    int requote_threshold = 1;
-    cpm::strategy::TickStructure ticks = cpm::strategy::TickStructure::TaperedDeciCent;
+    // Everything the schema describes arrives here as typed text and is
+    // validated by cpm::strategy::validate(), not by this file.
+    cpm::strategy::ParamValues params;
     int duration_secs = 60;
     bool allow_orders = false;
     bool verbose = false;
@@ -50,10 +53,21 @@ struct Args {
 void usage() {
     std::cerr << "usage: crypto_mm --symbol SYMBOL [--width-ticks N] [--qty Q]\n"
                  "                 [--max-inventory Q] [--requote-threshold N]\n"
-                 "                 [--ticks tapered|cent|deci] [--duration SECS]\n"
+                 "                 [--withdraw-before SECS] [--ticks GRID]\n"
+                 "                 [--duration SECS]\n"
                  "                 [--allow-orders] [--bookmark PATH] [--verbose]\n"
                  "env: the market data set (CPM_*) and the order entry set (CPM_OE_*)\n"
                  "Without --allow-orders nothing is sent: it logs the quotes it would place.\n";
+    std::cerr << "\nstrategy parameters:\n";
+    for (const auto& spec : cpm::strategy::crypto_mm_schema()) {
+        std::cerr << "  --" << spec.name << "  " << spec.help;
+        if (spec.required()) {
+            std::cerr << " (required)";
+        } else {
+            std::cerr << " (default " << spec.default_value << ")";
+        }
+        std::cerr << '\n';
+    }
 }
 
 int to_int(std::string_view flag, const char* value) {
@@ -65,46 +79,39 @@ int to_int(std::string_view flag, const char* value) {
     return static_cast<int>(parsed);
 }
 
-std::int64_t to_decimal(std::string_view flag, const char* value, int scale) {
-    const auto parsed = cpm::parse_scaled(value, scale);
-    if (!parsed) {
-        throw std::invalid_argument(std::string(flag) + " needs a decimal with at most " +
-                                    std::to_string(scale) + " places");
-    }
-    return *parsed;
-}
-
 Args parse_args(int argc, char** argv) {
     Args a;
+    const auto schema = cpm::strategy::crypto_mm_schema();
     for (int i = 1; i < argc; ++i) {
         const std::string_view flag = argv[i];
         auto value = [&]() -> const char* {
             if (i + 1 >= argc) throw std::invalid_argument(std::string(flag) + " needs a value");
             return argv[++i];
         };
-        if (flag == "--symbol") a.symbol = value();
-        else if (flag == "--width-ticks") a.width_ticks = to_int(flag, value());
-        else if (flag == "--qty") a.quantity = to_decimal(flag, value(), cpm::kQtyScale);
-        else if (flag == "--max-inventory") a.max_inventory = to_decimal(flag, value(), cpm::kQtyScale);
-        else if (flag == "--requote-threshold") a.requote_threshold = to_int(flag, value());
-        else if (flag == "--duration") a.duration_secs = to_int(flag, value());
+        if (flag == "--duration") a.duration_secs = to_int(flag, value());
         else if (flag == "--allow-orders") a.allow_orders = true;
         else if (flag == "--bookmark") a.bookmark = value();
         else if (flag == "--dict-dir") a.dict_dir = value();
         else if (flag == "--verbose") a.verbose = true;
-        else if (flag == "--ticks") {
-            const std::string_view which = value();
-            if (which == "tapered") a.ticks = cpm::strategy::TickStructure::TaperedDeciCent;
-            else if (which == "cent") a.ticks = cpm::strategy::TickStructure::LinearCent;
-            else if (which == "deci") a.ticks = cpm::strategy::TickStructure::DeciCent;
-            else throw std::invalid_argument("--ticks must be tapered, cent or deci");
-        }
         else if (flag == "--help" || flag == "-h") { usage(); std::exit(0); }
+        else if (flag.size() > 2 && flag.substr(0, 2) == "--") {
+            // Any remaining --name is a strategy parameter if the schema has
+            // one by that name, so the flags and the GUI form stay the same
+            // set by construction.
+            const std::string name(flag.substr(2));
+            const bool known = std::any_of(schema.begin(), schema.end(),
+                                           [&](const cpm::strategy::ParamSpec& spec) {
+                                               return spec.name == name;
+                                           });
+            if (!known) throw std::invalid_argument("unknown option " + std::string(flag));
+            a.params[name] = value();
+        }
         else throw std::invalid_argument("unknown option " + std::string(flag));
     }
-    if (a.symbol.empty()) throw std::invalid_argument("--symbol is required");
-    if (a.width_ticks < 1) throw std::invalid_argument("--width-ticks must be at least 1");
-    if (a.quantity <= 0) throw std::invalid_argument("--qty must be positive");
+    // Validated here so a bad flag is refused before any session is opened.
+    const auto checked = cpm::strategy::validate(schema, a.params);
+    if (!checked.ok()) throw std::invalid_argument(checked.error);
+    a.params = checked.values;
     return a;
 }
 
@@ -119,11 +126,16 @@ int main(int argc, char** argv) {
         usage();
         return 64;
     }
+    const std::string symbol = cpm::strategy::param_text(args.params, "symbol");
+    const auto quantity = cpm::strategy::param_decimal(args.params, "qty", cpm::kQtyScale);
 
     sigset_t signals;
     sigemptyset(&signals);
     sigaddset(&signals, SIGINT);
     sigaddset(&signals, SIGTERM);
+    // An SSH drop sends SIGHUP, which is default-terminate: without this the
+    // run would die without withdrawing its quotes (GUI-N2).
+    sigaddset(&signals, SIGHUP);
     pthread_sigmask(SIG_BLOCK, &signals, nullptr);
 
     cpm::Logger logger(std::cout, args.verbose ? cpm::LogLevel::Debug : cpm::LogLevel::Info);
@@ -163,46 +175,54 @@ int main(int argc, char** argv) {
         orders.on_anomaly(reconciler.anomaly_handler());
         oe.on_session_event(reconciler.session_callback());
 
-        // --- the strategy -------------------------------------------------
-        cpm::strategy::Params params;
-        params.symbol = args.symbol;
-        params.half_width_ticks = args.width_ticks;
-        params.quantity = args.quantity;
-        params.max_inventory = args.max_inventory;
-        params.requote_threshold_ticks = args.requote_threshold;
-        params.ticks = args.ticks;
+        // --- the strategy, under the host ---------------------------------
+        cpm::strategy::StrategyRegistry registry;
+        cpm::strategy::register_crypto_mm(registry);
 
         std::atomic<std::uint64_t> counter{reconciler.cl_ord_counter()};
-        cpm::strategy::QuoteManager::Hooks hooks;
-        hooks.can_submit = [&] { return args.allow_orders && reconciler.submission_allowed(); };
-        hooks.send = [&](const cpm::oms::NewOrder& order) {
+        cpm::strategy::StrategyHooks venue;
+        venue.can_submit = [&] { return args.allow_orders && reconciler.submission_allowed(); };
+        venue.orders_permitted = [&] { return args.allow_orders; };
+        venue.send = [&](const cpm::oms::NewOrder& order) {
             orders.record_sent(order);
             return oe.send(order);
         };
-        hooks.cancel = [&](const cpm::oms::CancelOrder& request) {
+        venue.cancel = [&](const cpm::oms::CancelOrder& request) {
             orders.record_cancel_sent(request);
             return oe.cancel(request);
         };
-        hooks.next_cl_ord_id = [&] {
+        venue.next_cl_ord_id = [&] {
             const auto next = ++counter;
             reconciler.note_cl_ord_counter(next);
             return cpm::oms::make_cl_ord_id("mm-", next);
         };
-        hooks.log = [&logger](const std::string& line) { logger.info(line); };
-        cpm::strategy::QuoteManager manager(params, std::move(hooks));
+        venue.log = [&logger](const std::string& line) { logger.info(line); };
+
+        cpm::strategy::StrategyHost::Feeds feeds;
+        feeds.book = [&book](const std::string& name) { return book.instrument(name); };
+        feeds.position = [&orders](const std::string& name) {
+            return orders.position(name).value_or(cpm::oms::Position{});
+        };
+        cpm::strategy::StrategyHost host({}, registry, std::move(venue), std::move(feeds), logger);
+
+        std::string id;
+        if (const auto error = host.create({"CryptoMM", args.params}, id); !error.empty()) {
+            logger.error(error);
+            return 64;
+        }
 
         cpm::oms::OeCallbacks strategy_callbacks;
         strategy_callbacks.report = [&](const cpm::oms::ExecutionReport& report) {
-            manager.on_report(report);
+            host.on_report(report);
         };
         oe.on_events(cpm::oms::combine_oe(
             cpm::oms::combine_oe(orders.callbacks(), reconciler.callbacks()), strategy_callbacks));
         cpm::oms::OrderLimits limits;
         limits.allow_orders = args.allow_orders;
-        limits.max_quantity = args.quantity * 2;
+        limits.max_quantity = quantity * 2;
         // Two sides, a few re-quotes: a few orders a second is plenty.
         limits.max_orders_per_sec = 4;
-        limits.max_notional = args.quantity * cpm::kPriceOne * 10;
+        limits.max_notional = quantity * cpm::kPriceOne * 10;
         oe.set_limits(limits);
 
         if (!args.allow_orders) {
@@ -230,70 +250,55 @@ int main(int argc, char** argv) {
                         "), continuing as a dry run on market data alone");
         }
         // The book, and the lifecycle so the strategy knows when to stop.
-        md.subscribe({cpm::md::Channel::Book, {args.symbol}, 10});
-        md.subscribe({cpm::md::Channel::Lifecycle, {args.symbol}, 0});
+        md.subscribe({cpm::md::Channel::Book, {symbol}, 10});
+        md.subscribe({cpm::md::Channel::Lifecycle, {symbol}, 0});
+
+        host.start(id);
+        // Armed from the command line: --allow-orders is the other key, and
+        // the host's can_submit folds both together.
+        if (args.allow_orders) {
+            if (const auto error = host.arm(id); !error.empty()) logger.warn(error);
+        }
 
         int elapsed_ms = 0;
-        bool withdrawn = false;
         while ((args.duration_secs == 0 || elapsed_ms < args.duration_secs * 1000) && !halted.load()) {
             const timespec quarter_second{0, 250'000'000};
             const int sig = sigtimedwait(&signals, nullptr, &quarter_second);
-            if (sig == SIGINT || sig == SIGTERM) {
+            if (sig == SIGINT || sig == SIGTERM || sig == SIGHUP) {
                 logger.info("interrupted; withdrawing quotes");
                 break;
             }
             elapsed_ms += 250;
-
-            const auto view = book.instrument(args.symbol);
-            if (!view) {
-                // A symbol with no book at all is almost always the wrong
-                // symbol, or a window that has already closed (O2/O6).
-                if (elapsed_ms % 5000 == 0) {
-                    logger.warn("no book for " + args.symbol + " yet after " +
-                                std::to_string(elapsed_ms / 1000) + "s: is the symbol live? " +
-                                "md_client --list-instruments names the live ones");
-                }
-                continue;
-            }
-            // An instrument that has stopped trading is not quotable, and its
-            // 15-minute window closes without warning (O2/O6).
-            const bool tradable = view->status == cpm::md::LifecycleStatus::Open ||
-                                  view->status == cpm::md::LifecycleStatus::Unknown;
-            if (!tradable) {
-                if (!withdrawn) {
-                    manager.withdraw(std::string("instrument is ") + to_string(view->status));
-                    withdrawn = true;
-                }
-                continue;
-            }
-            withdrawn = false;
-            const auto position = orders.position(args.symbol).value_or(cpm::oms::Position{});
-            manager.on_market(*view, position, cpm::oms::Clock::now());
+            host.tick(cpm::oms::Clock::now());
         }
+        if (halted.load()) host.halt("order entry halted");
 
-        // Nothing is left resting on the way out.
-        manager.withdraw("shutting down");
-        cpm::oms::wait_for([&] { return manager.live_bid() == std::nullopt &&
-                                        manager.live_ask() == std::nullopt; }, 3s);
+        // Nothing is left resting on the way out. The host keeps ticking so
+        // the cancels' reports are delivered, but a stopped strategy is never
+        // driven again, so nothing re-quotes.
+        host.stop_all("shutting down");
+        cpm::oms::wait_for([&] { host.tick(cpm::oms::Clock::now()); return host.quiescent(); }, 3s);
         reconciler.stop();
         reconciler.save_bookmark();
         md.unsubscribe_all();
         md.stop();
         oe.stop();
 
-        std::cout << "\nquotes placed " << manager.quotes_placed() << ", cancelled "
-                  << manager.quotes_cancelled() << ", fills " << manager.fills() << '\n';
-        if (manager.quotes_placed() == 0) {
+        const auto info = host.info(id);
+        const auto status = info ? info->status : cpm::strategy::StrategyStatus{};
+        std::cout << "\nquotes placed " << status.placed << ", cancelled " << status.cancelled
+                  << ", fills " << status.fills << '\n';
+        if (status.placed == 0) {
             // A run that quoted nothing should say why on its way out.
-            std::cout << manager.passes() << " pass(es) over the book, "
-                      << manager.passes_without_quotes() << " with no quotable target\n";
+            std::cout << status.passes << " pass(es) over the book, "
+                      << status.passes_without_target << " with no quotable target\n";
             // Most specific first: the reason it could not quote matters more
             // than the reason it would not have sent.
-            if (manager.passes() == 0) {
-                std::cout << "no book ever arrived for " << args.symbol
+            if (status.passes == 0) {
+                std::cout << "no book ever arrived for " << symbol
                           << ": check the symbol is live (md_client --list-instruments)\n";
-            } else if (!manager.last_reason().empty()) {
-                std::cout << "could not quote: " << manager.last_reason() << '\n';
+            } else if (!status.reason.empty()) {
+                std::cout << "could not quote: " << status.reason << '\n';
             }
             if (!args.allow_orders) {
                 std::cout << "and nothing would have been sent anyway: --allow-orders was not given\n";

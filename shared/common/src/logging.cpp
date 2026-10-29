@@ -36,12 +36,18 @@ std::string utc_now() {
 
 Logger::Logger(std::ostream& out, LogLevel min_level) : out_(out), min_level_(min_level) {}
 
-void Logger::log(LogLevel level, std::string_view message) {
+void Logger::also_to(Sink sink) {
+    std::lock_guard lock(mutex_);
+    sink_ = std::move(sink);
+}
+
+void Logger::log(LogLevel level, std::string_view message, LogSource source) {
     if (level < min_level_) return;
     const std::string stamp = utc_now();
     std::lock_guard lock(mutex_);
     out_ << stamp << ' ' << level_name(level) << ' ' << message << '\n';
     out_.flush();
+    if (sink_) sink_(level, source, stamp, message);
 }
 
 }  // namespace cpm
