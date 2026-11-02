@@ -4,6 +4,8 @@
 
 #include <gtest/gtest.h>
 
+#include <map>
+
 #include <sstream>
 #include <thread>
 
@@ -38,6 +40,9 @@ public:
     void on_market(const InstrumentView&, const Position&, Clock::time_point) override {
         ++passes;
         could_submit = hooks_.can_submit && hooks_.can_submit();
+        // What CryptoMM does at its inventory limit: ask, and carry on with
+        // the pass. The host acts on it the moment the pass returns.
+        if (!stop_me_with.empty() && hooks_.stop_me) hooks_.stop_me(stop_me_with);
     }
     void on_report(const ExecutionReport& report) override { reports.push_back(report.cl_ord_id); }
     void withdraw(const std::string& why) override { withdrawals.push_back(why); }
@@ -52,7 +57,22 @@ public:
         return status;
     }
 
+    // Sends through the hooks the host handed it, which is the only way an
+    // order ever leaves a strategy.
+    std::string place(const std::string& cl_ord_id) {
+        cpm::oms::NewOrder order;
+        order.cl_ord_id = cl_ord_id;
+        return hooks_.send ? hooks_.send(order) : std::string();
+    }
+    bool pull(const std::string& cl_ord_id) {
+        cpm::oms::CancelOrder request;
+        request.cl_ord_id = cl_ord_id;
+        return hooks_.cancel && hooks_.cancel(request);
+    }
+
     std::string width;
+    // Non-empty: ask the host to stop this strategy on the next pass.
+    std::string stop_me_with;
     std::size_t passes = 0;
     bool could_submit = false;
     bool resting = false;
@@ -93,6 +113,9 @@ struct Fixture {
         venue.send = [](const cpm::oms::NewOrder&) { return std::string("x"); };
         venue.cancel = [](const cpm::oms::CancelOrder&) { return true; };
         venue.next_cl_ord_id = [this] { return "c" + std::to_string(++counter); };
+        venue.attribute = [this](const std::string& cl_ord_id, const std::string& strategy_id) {
+            attributed[cl_ord_id] = strategy_id;
+        };
         venue.log = [](const std::string&) {};
 
         StrategyHost::Feeds feeds;
@@ -153,7 +176,133 @@ struct Fixture {
     bool have_book = true;
     LifecycleStatus status = LifecycleStatus::Open;
     std::uint64_t counter = 0;
+    // ClOrdID -> the strategy the host said it came from.
+    std::map<std::string, std::string> attributed;
 };
+
+// --- attribution ----------------------------------------------------------
+
+TEST(Attribution, SaysWhichStrategyAnOrderAndItsCancelCameFrom) {
+    Fixture f;
+    const auto first = f.live();
+    const auto second = f.live(kOther);
+    ASSERT_EQ(f.fakes.size(), 2u);
+
+    // The ClOrdID cannot say by itself: the counter behind it is the
+    // daemon's, so the host is the only thing that knows (docs/design-logs.md).
+    EXPECT_EQ(f.fakes[0]->place("mm-1"), "x");
+    EXPECT_EQ(f.fakes[1]->place("mm-2"), "x");
+    EXPECT_TRUE(f.fakes[0]->pull("c-3"));
+
+    EXPECT_EQ(f.attributed["mm-1"], first);
+    EXPECT_EQ(f.attributed["mm-2"], second);
+    EXPECT_EQ(f.attributed["c-3"], first);
+    EXPECT_NE(first, second);
+}
+
+TEST(Attribution, StillSendsWhenNobodyIsAttributing) {
+    Fixture f;
+    // Every test and every run that writes no record files: the hook is
+    // unset and the send goes out exactly as before.
+    f.host.reset();
+    cpm::strategy::StrategyHooks venue;
+    venue.send = [](const cpm::oms::NewOrder&) { return std::string("sent"); };
+    venue.cancel = [](const cpm::oms::CancelOrder&) { return true; };
+    StrategyHost::Feeds feeds;
+    feeds.book = [](const std::string&) -> std::optional<InstrumentView> { return book(); };
+    feeds.position = [](const std::string&) { return Position{}; };
+    f.fakes.clear();
+    f.host = std::make_unique<StrategyHost>(f.options, f.registry, std::move(venue),
+                                            std::move(feeds), f.logger);
+    f.live();
+    ASSERT_EQ(f.fakes.size(), 1u);
+    EXPECT_EQ(f.fakes[0]->place("mm-1"), "sent");
+    EXPECT_TRUE(f.attributed.empty());
+}
+
+// --- a strategy that stops itself -----------------------------------------
+
+TEST(StopsItself, IsStoppedAsSoonAsThePassReturns) {
+    Fixture f;
+    const auto id = f.live();
+    ASSERT_EQ(f.fakes.size(), 1u);
+    f.host->tick(Clock::now());
+    ASSERT_EQ(f.host->info(id)->state, cpm::strategy::RunState::Running);
+
+    f.fakes[0]->stop_me_with = "long inventory limit reached: net 3 of 3";
+    f.host->tick(Clock::now());
+
+    // Stopped on the same pass it asked, with the reason on the row and its
+    // quotes withdrawn - a strategy at its limit must not get another pass.
+    EXPECT_EQ(f.host->info(id)->state, cpm::strategy::RunState::Stopped);
+    EXPECT_EQ(f.host->info(id)->note, "long inventory limit reached: net 3 of 3");
+    ASSERT_EQ(f.fakes[0]->withdrawals.size(), 1u);
+    EXPECT_EQ(f.fakes[0]->withdrawals.front(), "long inventory limit reached: net 3 of 3");
+    // Stopping disarms, so a Start afterwards asks the operator again.
+    EXPECT_FALSE(f.host->info(id)->armed);
+
+    const auto passes = f.fakes[0]->passes;
+    f.host->tick(Clock::now());
+    EXPECT_EQ(f.fakes[0]->passes, passes) << "a stopped strategy is never driven again";
+}
+
+TEST(StopsItself, WaitsForItsCancelsLikeAnyOtherStop) {
+    Fixture f;
+    const auto id = f.live();
+    ASSERT_EQ(f.fakes.size(), 1u);
+    f.fakes[0]->resting = true;  // something of its own is still at the venue
+    f.fakes[0]->stop_me_with = "short inventory limit reached: net -4 of 3";
+    f.host->tick(Clock::now());
+
+    EXPECT_EQ(f.host->info(id)->state, cpm::strategy::RunState::Stopping);
+    f.fakes[0]->resting = false;
+    f.host->tick(Clock::now());
+    EXPECT_EQ(f.host->info(id)->state, cpm::strategy::RunState::Stopped);
+}
+
+TEST(StopsItself, KeepsItsRowAndItsFeed) {
+    Fixture f;
+    const auto id = f.live();
+    f.fakes[0]->stop_me_with = "long inventory limit reached: net 3 of 3";
+    f.host->tick(Clock::now());
+
+    // Not the Stop button: the operator did not ask for this, so the book
+    // stays up for them to look at and the row offers Start and Stop.
+    const auto info = f.host->info(id);
+    ASSERT_TRUE(info.has_value());
+    EXPECT_TRUE(info->feed);
+    EXPECT_EQ(f.host->list().size(), 1u);
+}
+
+// --- the feed a row reads -------------------------------------------------
+
+TEST(Feed, AStrategyWithNoFeedIsNotStarted) {
+    Fixture f;
+    const auto id = f.create();
+    ASSERT_EQ(f.host->set_feed(id, false), "");
+    // A strategy with no book to read would quote nothing and not say why.
+    EXPECT_EQ(f.host->start(id), id + " has no feed: start its feed first");
+    EXPECT_EQ(f.host->info(id)->state, cpm::strategy::RunState::Stopped);
+    EXPECT_FALSE(f.host->info(id)->feed);
+
+    // And it starts once it has one again.
+    ASSERT_EQ(f.host->set_feed(id, true), "");
+    EXPECT_EQ(f.host->start(id), "");
+    EXPECT_EQ(f.host->info(id)->state, cpm::strategy::RunState::Running);
+}
+
+TEST(Feed, ARowKeepsItsParametersWhileItsFeedIsStopped) {
+    Fixture f;
+    const auto id = f.create();
+    ASSERT_EQ(f.host->set_feed(id, false), "");
+    const auto info = f.host->info(id);
+    ASSERT_TRUE(info.has_value());
+    // Everything the row shows survives: this is what makes Start Feed a
+    // button rather than typing it all again.
+    EXPECT_EQ(info->symbols, std::vector<std::string>{kSym});
+    EXPECT_EQ(info->params.at("width-ticks"), "2");
+    EXPECT_EQ(info->kind, "Fake");
+}
 
 // --- the registry ---------------------------------------------------------
 

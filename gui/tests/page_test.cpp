@@ -48,8 +48,18 @@ cpm::trader::Snapshot populated() {
     position.cash = -1'500'000;
     position.fees = 49'500;
     position.fills = 3;
+    position.bought_value = 1'560'000;
+    position.sold_value = 1'100'000;
     position.settlement_payout = 2'000'000;
     daemon.positions.push_back(position);
+
+    cpm::trader::PnlView pnl;
+    pnl.symbol = kSym;
+    pnl.mark = 550;
+    pnl.realized = 30'000;
+    pnl.unrealized = 20'000;
+    pnl.total = 50'000;
+    daemon.pnl.push_back(pnl);
     return daemon.api->snapshot();
 }
 
@@ -67,8 +77,11 @@ TEST(Page, EveryFieldThePageReadsIsInTheSnapshot) {
 
     expect_fields(parsed.value,
                   {"state", "allow_orders", "halt_reason", "recovery", "revision", "market_data",
-                   "order_entry", "limits", "strategies", "books", "positions"},
+                   "order_entry", "limits", "strategies", "books", "positions", "pnl",
+                   "pnl_total"},
                   "the snapshot");
+    expect_fields(*parsed.value.find("pnl_total"), {"realized", "unrealized", "total"},
+                  "the P&L total");
     expect_fields(*parsed.value.find("market_data"), {"logged_on", "last_reason"}, "a session");
     expect_fields(*parsed.value.find("limits"),
                   {"max_quantity", "max_notional", "max_orders_per_sec"}, "the limits");
@@ -96,9 +109,43 @@ TEST(Page, EveryFieldThePageReadsIsInTheSnapshot) {
     const auto* positions = parsed.value.find("positions");
     ASSERT_FALSE(positions->items.empty());
     expect_fields(positions->items[0],
-                  {"symbol", "net", "bought", "sold", "cash", "fees", "fills",
-                   "settlement_payout"},
+                  {"symbol", "net", "bought", "sold", "cash", "bought_value", "sold_value",
+                   "fees", "fills", "settlement_payout"},
                   "a position");
+
+    const auto* pnl = parsed.value.find("pnl");
+    ASSERT_FALSE(pnl->items.empty());
+    expect_fields(pnl->items[0], {"symbol", "mark", "realized", "unrealized", "total"}, "a P&L");
+}
+
+// The unrealized half of an unmarked position must reach the page as null, so
+// the page can draw a dash: a zero there would read as a flat position when
+// the truth is that there is no mid to mark against (GUI-Q15).
+TEST(Page, AnUnmarkedPnlIsNullAndNotZero) {
+    Daemon daemon;
+    PositionView position;
+    position.symbol = kSym;
+    position.net = 100;
+    daemon.positions.push_back(position);
+    cpm::trader::PnlView pnl;
+    pnl.symbol = kSym;
+    pnl.realized = 30'000;  // mark, unrealized and total all unset
+    daemon.pnl.push_back(pnl);
+
+    const auto parsed = cpm::gui::json_parse(cpm::gui::snapshot_json(daemon.api->snapshot()));
+    ASSERT_TRUE(parsed.ok()) << parsed.error;
+    const auto* rows = parsed.value.find("pnl");
+    ASSERT_FALSE(rows->items.empty());
+    const auto& row = rows->items[0];
+    EXPECT_EQ(row.find("realized")->text, "0.03");
+    for (const auto& field : {"mark", "unrealized", "total"}) {
+        ASSERT_NE(row.find(field), nullptr) << field;
+        EXPECT_EQ(row.find(field)->type, JsonValue::Type::Null) << field;
+    }
+    const auto* totals = parsed.value.find("pnl_total");
+    EXPECT_EQ(totals->find("realized")->text, "0.03");
+    EXPECT_EQ(totals->find("unrealized")->type, JsonValue::Type::Null);
+    EXPECT_EQ(totals->find("total")->type, JsonValue::Type::Null);
 }
 
 TEST(Page, TheLadderArrivesWithBothSidesOnOnePriceAxis) {
@@ -202,9 +249,18 @@ TEST(Page, DrawsTheWholeGridAndAsksTheDaemonWhatItIs) {
     // It centres itself once and then leaves the scroll alone.
     EXPECT_TRUE(contains(page, "entry.centred"));
     EXPECT_TRUE(contains(page, "looking at it"));
-    // The axis is a percentage chance, 0 to 100, and says so.
+    // The axis is a percentage chance, and the column header is where it
+    // says so: the ladder's own heading is the ticker and the centre button
+    // and nothing else, so there is no line beside it to put it on.
     EXPECT_TRUE(contains(page, "chance %"));
-    EXPECT_TRUE(contains(page, "0-100%"));
+    EXPECT_FALSE(contains(page, "rungs, 0-100%"));
+    EXPECT_FALSE(contains(page, "entry.note"));
+    EXPECT_TRUE(contains(page, "and nothing else"));
+    // None of it is lost: a book that should not be quoted against, one that
+    // is crossed, and a feed that is down all say so on Books.
+    EXPECT_TRUE(contains(page, "'no valid book'"));
+    EXPECT_TRUE(contains(page, "'crossed'"));
+    EXPECT_TRUE(contains(page, "feed down: last known"));
     // 0 and 100 are rungs, but not prices an order can be placed at.
     EXPECT_TRUE(contains(page, "unquotable"));
     EXPECT_TRUE(contains(page, "a settlement value, not a price"));
@@ -271,20 +327,28 @@ TEST(Page, PutsEveryRowUnderOneHeaderOfColumns) {
 
 TEST(Page, GivesEveryRowTheSameButtons) {
     const auto page = the_page();
-    // GUI-Q26: Start Feed, Start, Stop on every row, and GUI-Q30's two for
-    // the parameters typed into a live row. Arm and Remove came off the
-    // page, and Start is what arms now.
+    // GUI-Q26: Start Feed, Start, Stop, and those three only. Arm and Remove
+    // are not buttons - Start arms, and the x is how a row goes.
     EXPECT_TRUE(contains(page, "actionButton('Start Feed'"));
     EXPECT_TRUE(contains(page, "actionButton('Start'"));
     EXPECT_TRUE(contains(page, "actionButton('Stop'"));
-    EXPECT_TRUE(contains(page, "actionButton('Apply'"));
-    EXPECT_TRUE(contains(page, "actionButton('Revert'"));
+    EXPECT_FALSE(contains(page, "actionButton('Apply'"));
+    EXPECT_FALSE(contains(page, "actionButton('Revert'"));
     EXPECT_FALSE(contains(page, "actionButton('Arm'"));
     EXPECT_FALSE(contains(page, "actionButton('Disarm'"));
     EXPECT_FALSE(contains(page, "actionButton('Remove'"));
-    // Nothing on the page destroys a strategy, which is the one call that
-    // would also drop its feed.
-    EXPECT_FALSE(contains(page, "'destroy'"));
+    // Stop takes the feed with it but leaves the row: the quotes come off,
+    // then the feed goes once the strategy has actually stopped, which is
+    // what closeStopped() waits for. The row is then one Start Feed from
+    // being watched again, and the x is the only thing that removes it.
+    EXPECT_TRUE(contains(page, "base + 'stop-feed'"));
+    EXPECT_TRUE(contains(page, "base + 'start-feed'"));
+    EXPECT_TRUE(contains(page, "'destroy'"));
+    EXPECT_TRUE(contains(page, "function closeStopped()"));
+    EXPECT_TRUE(contains(page, "strategy.state !== 'stopped'"));
+    // The buttons follow the feed, so a row has to be redrawn when it
+    // changes - the whole point of the signature (GUI-Q28).
+    EXPECT_TRUE(contains(page, "strategy.feed"));
     // Start still asks before it sends an order (GUI-Q8), and it is the only
     // thing on the page that arms.
     EXPECT_TRUE(contains(page, "Start quoting"));
@@ -293,15 +357,13 @@ TEST(Page, GivesEveryRowTheSameButtons) {
     EXPECT_TRUE(contains(page, "Add row"));
 }
 
-TEST(Page, OpensTheParametersOfAStrategyThatIsNotArmed) {
+TEST(Page, LocksTheParametersOnALiveRow) {
     const auto page = the_page();
-    // GUI-Q30. Armed is the line, and the page draws it in one place: the
-    // boxes are enabled from editable(), Apply posts only what changed, and
-    // the daemon refuses the rest whatever the page believes.
-    EXPECT_TRUE(contains(page, "function editable(strategy)"));
-    EXPECT_TRUE(contains(page, "!strategy.armed"));
-    EXPECT_TRUE(contains(page, "'params'"));
-    EXPECT_TRUE(contains(page, "changedParams(strategy)"));
+    // GUI-Q30, as it now stands: with Apply gone there is nothing on the page
+    // to send an edit with, so a live row's boxes are read-only rather than
+    // accepting text they can never act on. The daemon still refuses an edit
+    // to an armed strategy whatever any client believes.
+    EXPECT_TRUE(contains(page, "var open = false;"));
     // What is typed outlives a redraw, and a redraw does not take the caret
     // out of a box being typed into.
     EXPECT_TRUE(contains(page, "var edits = {}"));
@@ -426,17 +488,19 @@ TEST_F(PagePaths, EveryButtonOnThePageReachesSomething) {
     const auto id = cpm::gui::json_parse(body_of(created)).value.find("id")->text;
 
     // What the page calls, built as '/api/strategies/' + id + '/' + action.
-    // Start arms, so arm is among them; disarm and destroy are not on the
-    // page at all any more (GUI-Q26).
-    for (const std::string action : {"start", "arm", "stop"}) {
+    // Start arms, so arm is among them; Stop stops and then drops the feed;
+    // Start Feed brings it back; and the x on a row with no feed destroys.
+    // Disarm is not on the page at all.
+    for (const std::string action : {"start", "arm", "stop", "stop-feed", "start-feed",
+                                     "destroy"}) {
         EXPECT_TRUE(contains(page, "'" + action + "'")) << action << " is not on the page";
     }
     EXPECT_FALSE(contains(page, "'disarm'")) << "nothing on the page disarms";
-    EXPECT_FALSE(contains(page, "'destroy'")) << "nothing on the page destroys";
 
-    // Every one of the five still answers: the page is not the only
-    // operator, and the stdin console still has all of them.
-    for (const std::string action : {"start", "arm", "disarm", "stop", "destroy"}) {
+    // Every one of them still answers: the page is not the only operator,
+    // and the stdin console still has all of them.
+    for (const std::string action : {"start", "arm", "disarm", "stop", "stop-feed",
+                                     "start-feed", "destroy"}) {
         const auto response = send("POST", "/api/strategies/" + id + "/" + action);
         EXPECT_NE(status_of(response), 404) << action << " reached nothing";
         EXPECT_NE(status_of(response), 405) << action << " is the wrong method";

@@ -9,6 +9,8 @@
 #include "cpm/md/md_client.hpp"
 #include "cpm/oms/oe_client.hpp"
 #include "cpm/oms/order_state.hpp"
+#include "cpm/oms/pnl.hpp"
+#include "cpm/oms/record_log.hpp"
 #include "cpm/oms/reconciler.hpp"
 #include "cpm/trader/control_api.hpp"
 
@@ -42,6 +44,17 @@ struct TraderOptions {
     // resolved, and everything that names a full ticker still works.
     cpm::md::RestConfig rest;
     std::chrono::milliseconds stale_after{std::chrono::seconds(30)};
+    // Where the record files go: fills-*.csv and orders-*.csv, beside the
+    // daemon's .log files (docs/design-logs.md). Empty writes none, which is
+    // every test that does not ask for them.
+    std::string log_dir;
+    // The quotes record file, which is off unless it is asked for: a market
+    // maker changes what it is showing about once a second per strategy.
+    bool quote_records = false;
+    // How often a P&L row is written per position. Not the snapshot's
+    // cadence: the page is rebuilt twice a second, and a P&L series at that
+    // rate would be 170,000 rows a day per instrument to say the same thing.
+    std::chrono::seconds pnl_every{5};
     // A daemon meant to stay up for days must drop the instruments it will
     // never see again (GUI-N3): the sandbox lists ~100 rolling windows a day.
     std::chrono::seconds evict_finished_after{std::chrono::minutes(15)};
@@ -120,6 +133,15 @@ private:
     void roll_series(Clock::time_point now);
     void unsubscribe(const std::string& symbol);
     BookView view_of(const std::string& symbol) const;
+    // A position, the mark the page would show for it, and the P&L that
+    // follows from that mark. One function, so the page and the record file
+    // can never disagree about either.
+    struct MarkedPosition {
+        cpm::oms::Position position;
+        std::optional<Price> mark;
+        cpm::oms::Pnl pnl;
+    };
+    std::vector<MarkedPosition> marked_positions() const;
     // The reference venue's view of a CPM symbol: its asset, mapped. An
     // asset with no mapping has no reference, which a guard that is on
     // reads as "do not quote" and one that is off ignores.
@@ -129,6 +151,15 @@ private:
     // Tells the reference feed which streams the running strategies need.
     // Called every pass, from tick(), on the tick thread.
     void follow_reference_demand();
+    // Writes one row per report, and forgets the attribution of anything
+    // that has finished. Runs on the order session's callback thread.
+    void record(const cpm::oms::AppliedReport& applied);
+    std::string strategy_of(const std::string& cl_ord_id) const;
+    // A P&L row per position, on options_.pnl_every.
+    void record_pnl(Clock::time_point now);
+    // A row per strategy whose quoting has changed since the last one.
+    // Called every pass, and writes nothing on most of them.
+    void record_quotes();
 
     std::unique_ptr<cpm::binance::ReferenceFeed> reference_;
     // A self-pipe, so the feed's thread can wake the loop without sharing
@@ -149,6 +180,17 @@ private:
 
     cpm::oms::OrderState orders_;
     cpm::oms::OeClient oe_;
+    // The record files, and who to credit each row to. The ClOrdID does not
+    // carry the strategy, so the host tells us on the way past and we keep
+    // it until the order is finished with. Bounded by the orders that are
+    // still live plus the cancels still unanswered.
+    std::unique_ptr<cpm::oms::RecordLog> records_;
+    mutable std::mutex attribution_mutex_;
+    std::map<std::string, std::string> attribution_;
+    Clock::time_point last_pnl_{};
+    // strategy id -> the decision last written for it, so a row is written
+    // when the quoting changes rather than four times a second.
+    std::map<std::string, std::string> last_quote_;
     std::unique_ptr<cpm::oms::Reconciler> reconciler_;
 
     cpm::strategy::StrategyHost host_;

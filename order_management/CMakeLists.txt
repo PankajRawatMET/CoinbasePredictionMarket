@@ -6,6 +6,8 @@ add_library(cpm_oms
   src/order_rules.cpp
   src/reconciler.cpp
   src/order_state.cpp
+  src/pnl.cpp
+  src/record_log.cpp
   src/orders.cpp
   src/fix/oe_application.cpp
   src/fix/oe_decoder.cpp
@@ -54,6 +56,8 @@ if(CPM_BUILD_TESTS)
     tests/dictionary_test.cpp
     tests/messages_test.cpp
     tests/order_state_test.cpp
+    tests/pnl_test.cpp
+    tests/record_log_test.cpp
     tests/recovery_test.cpp
     tests/orders_test.cpp
     tests/sim_engine_test.cpp

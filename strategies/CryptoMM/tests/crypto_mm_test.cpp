@@ -58,12 +58,24 @@ Position flat() {
     return position;
 }
 
-Params params(int half_width = 2, cpm::Qty quantity = 100) {
+// The default is 4 ticks across, which is the two ticks either side of the mid
+// these tests were written against.
+Params params(int spread = 4, cpm::Qty quantity = 100) {
     Params p;
     p.symbol = kSym;
-    p.half_width_ticks = half_width;
+    p.spread_ticks = spread;
     p.quantity = quantity;
     return p;
+}
+
+// The same book with the two resting sizes set apart, which is what the
+// rounding leans on when the position is small.
+InstrumentView book_with(cpm::Price yes_bid, cpm::Price no_bid, cpm::Qty bid_qty,
+                         cpm::Qty ask_qty) {
+    InstrumentView view = book(yes_bid, no_bid);
+    view.yes.front().qty = bid_qty;
+    view.no.front().qty = ask_qty;
+    return view;
 }
 
 // --- the tick grid --------------------------------------------------------
@@ -86,7 +98,7 @@ TEST(CryptoMmTicks, TheTaperedGridIsFineAtTheEdgesAndCoarseInTheMiddle) {
 
 TEST(CryptoMmQuotes, QuotesBothSidesAroundTheMid) {
     // YES bid 0.500, NO bid 0.400 -> YES ask 0.600, mid 0.550.
-    const auto quotes = desired_quotes(book(500, 400), flat(), params(2, 250));
+    const auto quotes = desired_quotes(book(500, 400), flat(), params(4, 250));
     ASSERT_TRUE(quotes.bid.has_value());
     ASSERT_TRUE(quotes.ask.has_value());
     // Two 0.01 ticks either side of 0.550.
@@ -98,12 +110,195 @@ TEST(CryptoMmQuotes, QuotesBothSidesAroundTheMid) {
 }
 
 TEST(CryptoMmQuotes, TheWidthIsInTicksNotInPrice) {
-    for (const int width : {1, 2, 5}) {
+    // An even width sits symmetrically either side of the mid.
+    for (const int width : {2, 4, 10}) {
         const auto quotes = desired_quotes(book(500, 400), flat(), params(width));
         ASSERT_TRUE(quotes.bid.has_value()) << width;
-        EXPECT_EQ(quotes.bid->price, 550 - 10 * width) << width;
-        EXPECT_EQ(quotes.ask->price, 550 + 10 * width) << width;
+        EXPECT_EQ(quotes.bid->price, 550 - 5 * width) << width;
+        EXPECT_EQ(quotes.ask->price, 550 + 5 * width) << width;
     }
+}
+
+// Our own resting orders come out of the book before it is read. The touch we
+// lean on is the one other people are making: our own size on a level is this
+// strategy reading itself back, and a level that is only ours is not a market.
+TEST(CryptoMmQuotes, TakesOurOwnOrdersOutOfTheTouch) {
+    using cpm::strategy::LiveLeg;
+    // YES bid 0.500 showing 2 contracts, YES ask 0.600 showing 2.
+    const auto market = book_with(500, 400, 200, 200);
+
+    // One of the two on the bid is ours: 0.500 is still the best bid, and the
+    // size that counts is the other contract, not both.
+    const std::vector<LiveLeg> one_of_two{{Side::Buy, "mm-1", 500, 100, false}};
+    const auto trimmed = desired_quotes(market, flat(), params(4), one_of_two);
+    ASSERT_TRUE(trimmed.bid.has_value());
+    EXPECT_EQ(trimmed.bid->price, 530) << "mid 0.550 still, so the quotes do not move";
+    EXPECT_EQ(trimmed.ask->price, 570);
+
+    // Both of them are ours: 0.500 stops being a bid at all, and the mid is
+    // measured from whatever is behind it.
+    const std::vector<LiveLeg> both{{Side::Buy, "mm-1", 500, 200, false}};
+    auto deeper = market;
+    deeper.yes.push_back(cpm::md::BookLevel{480, 300});
+    const auto moved = desired_quotes(deeper, flat(), params(4), both);
+    ASSERT_TRUE(moved.bid.has_value());
+    // Bid 0.480, ask 0.600, mid 0.540.
+    EXPECT_EQ(moved.bid->price, 520);
+    EXPECT_EQ(moved.ask->price, 560);
+}
+
+// A sell of ours does not rest on the YES book: it is a NO bid at 1.000 minus
+// its price, which is how this venue carries the other side. Subtracting it
+// from the wrong side would leave it in the market we lean on and take
+// somebody else's order out instead.
+TEST(CryptoMmQuotes, TakesOurOwnSellOffTheNoBook) {
+    using cpm::strategy::LiveLeg;
+    // YES bid 0.500 (2), NO bid 0.400 (2) - so a YES ask of 0.600 for 2.
+    auto market = book_with(500, 400, 200, 200);
+    market.no.push_back(cpm::md::BookLevel{380, 300});  // a YES ask of 0.620 behind it
+
+    // Our sell at 0.600 is the whole of the 0.400 NO level, so the ask we
+    // lean on becomes 0.620 and the mid moves up with it.
+    const std::vector<LiveLeg> mine{{Side::Sell, "mm-2", 600, 200, false}};
+    const auto quotes = desired_quotes(market, flat(), params(4), mine);
+    ASSERT_TRUE(quotes.ask.has_value());
+    // Bid 0.500, ask 0.620, mid 0.560.
+    EXPECT_EQ(quotes.bid->price, 540);
+    EXPECT_EQ(quotes.ask->price, 580);
+}
+
+// The sizes that pick the lean are the sizes other people are showing.
+TEST(CryptoMmQuotes, TheLeanReadsTheBookWithoutOurOwnSize) {
+    using cpm::strategy::LiveLeg;
+    // Mid 0.545, so the rounding has to pick a side. 6 on the bid, 4 on the
+    // ask: left alone it leans up, towards the heavier bid.
+    const auto market = book_with(500, 410, 600, 400);
+    EXPECT_TRUE(desired_quotes(market, flat(), params(2)).rounded_up);
+
+    // But 3 of those 6 are ours, so the bid other people are showing is 3
+    // against their 4, and the lean goes the other way.
+    const std::vector<LiveLeg> mine{{Side::Buy, "mm-3", 500, 300, false}};
+    const auto quotes = desired_quotes(market, flat(), params(2), mine);
+    EXPECT_FALSE(quotes.rounded_up) << "it leaned on its own order";
+    EXPECT_EQ(quotes.round_reason, "qty imbalance");
+}
+
+// When we are the only order in the book there is no market to lean on, so
+// nothing is quoted rather than this strategy pricing off itself.
+TEST(CryptoMmQuotes, QuotesNothingWhenTheOnlyOrdersAreOurs) {
+    using cpm::strategy::LiveLeg;
+    const auto market = book_with(500, 400, 200, 200);
+    const std::vector<LiveLeg> both_sides{{Side::Buy, "mm-4", 500, 200, false},
+                                          {Side::Sell, "mm-5", 600, 200, false}};
+    const auto quotes = desired_quotes(market, flat(), params(4), both_sides);
+    EXPECT_FALSE(quotes.bid.has_value());
+    EXPECT_FALSE(quotes.ask.has_value());
+    EXPECT_EQ(quotes.reason, "one-sided book once our own orders are taken out");
+}
+
+// Our record of what is resting and the book's can disagree for an instant -
+// an order acknowledged before its level reaches the feed, say. Taking more
+// off a level than it holds must not turn a level we are not even on into
+// the touch.
+TEST(CryptoMmQuotes, NeverSubtractsALevelBelowZero) {
+    using cpm::strategy::LiveLeg;
+    const auto market = book_with(500, 400, 100, 500);
+    const std::vector<LiveLeg> too_much{{Side::Buy, "mm-6", 500, 900, false}};
+    auto deeper = market;
+    deeper.yes.push_back(cpm::md::BookLevel{480, 300});
+    const auto quotes = desired_quotes(deeper, flat(), params(4), too_much);
+    ASSERT_TRUE(quotes.bid.has_value());
+    // 0.500 is gone, not negative: the bid we lean on is 0.480.
+    EXPECT_EQ(quotes.bid->price, 520) << "mid 0.540";
+}
+
+// The whole point of rounding both sides the same way: the market we make is
+// exactly as wide as it was configured to be, whether the width is odd or
+// even and wherever the mid falls. Rounding each side away from the touch
+// instead added a tick whenever the mid landed between two of them.
+TEST(CryptoMmQuotes, TheWidthIsExactlyWhatWasAskedFor) {
+    for (const int width : {1, 2, 3, 4, 5, 7}) {
+        // Mid 0.550 (on a rung) and mid 0.545 (between two), leaning both ways.
+        for (const auto& market : {book_with(500, 400, 600, 400),
+                                   book_with(500, 400, 400, 600),
+                                   book_with(500, 410, 600, 400),
+                                   book_with(500, 410, 400, 600)}) {
+            const auto quotes = desired_quotes(market, flat(), params(width));
+            ASSERT_TRUE(quotes.bid.has_value()) << width;
+            ASSERT_TRUE(quotes.ask.has_value()) << width;
+            EXPECT_EQ(quotes.ask->price - quotes.bid->price, 10 * width)
+                << "width " << width << ", rounded " << (quotes.rounded_up ? "up" : "down");
+        }
+    }
+}
+
+// Two ticks wide off the back of the market, which is what this is for: a
+// one-tick market, a two-tick quote, and the side we land on decided by the
+// sizes resting on each.
+TEST(CryptoMmQuotes, TwoTicksWideLandsOnTheHeavierSide) {
+    // YES bid 0.500 with 6 contracts, YES ask 0.510 with 4: mid 0.505.
+    const auto heavy_bid = desired_quotes(book_with(500, 490, 600, 400), flat(), params(2));
+    ASSERT_TRUE(heavy_bid.bid.has_value());
+    EXPECT_TRUE(heavy_bid.rounded_up);
+    EXPECT_EQ(heavy_bid.round_reason, "qty imbalance");
+    EXPECT_EQ(heavy_bid.bid->price, 500) << "on the best bid, where the size is";
+    EXPECT_EQ(heavy_bid.ask->price, 520) << "and a tick above the offer";
+
+    // The same market with the sizes the other way round.
+    const auto heavy_ask = desired_quotes(book_with(500, 490, 400, 600), flat(), params(2));
+    ASSERT_TRUE(heavy_ask.ask.has_value());
+    EXPECT_FALSE(heavy_ask.rounded_up);
+    EXPECT_EQ(heavy_ask.bid->price, 490) << "a tick below the bid";
+    EXPECT_EQ(heavy_ask.ask->price, 510) << "and on the best offer";
+
+    // Equal sizes lean nowhere, so the strict comparison rounds down.
+    const auto level = desired_quotes(book_with(500, 490, 500, 500), flat(), params(2));
+    EXPECT_FALSE(level.rounded_up);
+    EXPECT_EQ(level.ask->price, 510);
+}
+
+// Past a third of the maximum position the inventory decides and the sizes
+// stop mattering: long sits on the offer so it sells first, short sits on the
+// bid so it buys first.
+TEST(CryptoMmQuotes, PastAThirdOfTheLimitThePositionDecides) {
+    auto p = params(2);
+    p.max_inventory = 300;  // a third is 100
+
+    // Long, on a book whose sizes say the opposite.
+    Position lengthy = flat();
+    lengthy.net = 101;
+    const auto when_long = desired_quotes(book_with(500, 490, 600, 400), lengthy, p);
+    EXPECT_FALSE(when_long.rounded_up) << "long rounds down";
+    EXPECT_EQ(when_long.round_reason, "position");
+    EXPECT_EQ(when_long.ask->price, 510) << "on the offer, selling first";
+
+    Position shorted = flat();
+    shorted.net = -101;
+    const auto when_short = desired_quotes(book_with(500, 490, 400, 600), shorted, p);
+    EXPECT_TRUE(when_short.rounded_up) << "short rounds up";
+    EXPECT_EQ(when_short.round_reason, "position");
+    EXPECT_EQ(when_short.bid->price, 500) << "on the bid, buying first";
+
+    // Exactly a third is not past it, so the sizes still decide.
+    Position third = flat();
+    third.net = 100;
+    const auto at_third = desired_quotes(book_with(500, 490, 600, 400), third, p);
+    EXPECT_TRUE(at_third.rounded_up);
+    EXPECT_EQ(at_third.round_reason, "qty imbalance");
+
+    // A third of an odd limit needs no rounding: 3 * |net| against the limit.
+    p.max_inventory = 100;
+    Position just_over = flat();
+    just_over.net = 34;  // 102 > 100
+    EXPECT_EQ(desired_quotes(book(500, 490), just_over, p).round_reason, "position");
+    Position just_under = flat();
+    just_under.net = 33;  // 99 < 100
+    EXPECT_EQ(desired_quotes(book(500, 490), just_under, p).round_reason, "qty imbalance");
+
+    // And a disabled limit disables the lean, as it disables the cap.
+    p.max_inventory = 0;
+    EXPECT_EQ(desired_quotes(book_with(500, 490, 600, 400), lengthy, p).round_reason,
+              "qty imbalance");
 }
 
 // The mid is taken from both sides, so a one-sided book is not quotable.
@@ -128,14 +323,22 @@ TEST(CryptoMmQuotes, RefusesToQuoteACrossedBook) {
 }
 
 // Rounding must never move a quote towards the other side.
-TEST(CryptoMmQuotes, RoundsAwayFromTheTouch) {
-    // Mid 0.545 on a 0.01 grid: the bid rounds down, the ask rounds up.
-    const auto quotes = desired_quotes(book(500, 410), flat(), params(1));
-    ASSERT_TRUE(quotes.bid.has_value());
-    EXPECT_EQ(quotes.bid->price, 530) << "0.545 - 0.01 = 0.535, rounded down";
-    EXPECT_EQ(quotes.ask->price, 560) << "0.545 + 0.01 = 0.555, rounded up";
-    EXPECT_EQ(quotes.bid->price % 10, 0);
-    EXPECT_EQ(quotes.ask->price % 10, 0);
+TEST(CryptoMmQuotes, RoundsBothSidesTheSameWay) {
+    // Mid 0.545, between two rungs of the 0.01 grid, two ticks wide: the pair
+    // has to shift one way or the other, and it shifts together.
+    const auto down = desired_quotes(book_with(500, 410, 400, 600), flat(), params(2));
+    ASSERT_TRUE(down.bid.has_value());
+    EXPECT_EQ(down.bid->price, 530) << "0.535 rounded down";
+    EXPECT_EQ(down.ask->price, 550) << "0.555 rounded down too, not up to 0.560";
+
+    const auto up = desired_quotes(book_with(500, 410, 600, 400), flat(), params(2));
+    EXPECT_EQ(up.bid->price, 540) << "0.535 rounded up";
+    EXPECT_EQ(up.ask->price, 560) << "0.555 rounded up";
+
+    for (const auto& quotes : {down, up}) {
+        EXPECT_EQ(quotes.bid->price % 10, 0);
+        EXPECT_EQ(quotes.ask->price % 10, 0);
+    }
 }
 
 // A quote that would cross is stepped back: a post-only reject would halt the
@@ -151,12 +354,12 @@ TEST(CryptoMmQuotes, NeverQuotesThroughTheRestingBook) {
 
 TEST(CryptoMmQuotes, StaysInsideThePriceBounds) {
     // A market near the top of the range, where the grid is also finer.
-    const auto high = desired_quotes(book(980, 15), flat(), params(3));
+    const auto high = desired_quotes(book(980, 15), flat(), params(6));
     if (high.ask) {
         EXPECT_LT(high.ask->price, cpm::kPriceOne);
         EXPECT_GT(high.ask->price, 0);
     }
-    const auto low = desired_quotes(book(15, 980), flat(), params(3));
+    const auto low = desired_quotes(book(15, 980), flat(), params(6));
     if (low.bid) {
         EXPECT_GT(low.bid->price, 0);
     }
@@ -197,37 +400,52 @@ TEST(CryptoMmQuotes, QuotesOnlyAtPricesTheGridHas) {
 }
 
 // Inventory: stop adding to the side that would extend the position.
-TEST(CryptoMmQuotes, StopsQuotingTheSideThatWouldExtendThePosition) {
+TEST(CryptoMmQuotes, StopsAtTheInventoryLimitRatherThanQuotingOneSide) {
     auto p = params();
     p.max_inventory = 300;
 
+    // At the limit it is done: both sides off, and it asks to be stopped.
+    // It does not go on quoting the reducing side - a position at the limit
+    // is the operator's to decide about.
     Position lengthy = flat();
     lengthy.net = 300;
     const auto long_limited = desired_quotes(book(500, 400), lengthy, p);
-    EXPECT_FALSE(long_limited.bid.has_value()) << "no more buying";
-    EXPECT_TRUE(long_limited.ask.has_value()) << "but it will still sell";
-    EXPECT_EQ(long_limited.reason, "long inventory limit reached");
+    EXPECT_TRUE(long_limited.stop);
+    EXPECT_FALSE(long_limited.bid.has_value());
+    EXPECT_FALSE(long_limited.ask.has_value());
+    // The reason says which way and by how much, because it is what the
+    // operator reads on the row afterwards.
+    EXPECT_EQ(long_limited.reason, "long inventory limit reached: net 3 of 3");
 
     Position shorted = flat();
-    shorted.net = -300;
+    shorted.net = -400;
     const auto short_limited = desired_quotes(book(500, 400), shorted, p);
-    EXPECT_TRUE(short_limited.bid.has_value());
+    EXPECT_TRUE(short_limited.stop);
+    EXPECT_FALSE(short_limited.bid.has_value());
     EXPECT_FALSE(short_limited.ask.has_value());
+    EXPECT_EQ(short_limited.reason, "short inventory limit reached: net -4 of 3");
 
-    // Inside the limit, both sides quote.
+    // Inside the limit, both sides quote and nothing stops.
     Position small = flat();
     small.net = 100;
-    EXPECT_TRUE(desired_quotes(book(500, 400), small, p).bid.has_value());
+    const auto inside = desired_quotes(book(500, 400), small, p);
+    EXPECT_FALSE(inside.stop);
+    EXPECT_TRUE(inside.bid.has_value());
+    EXPECT_TRUE(inside.ask.has_value());
 
     // And the check can be switched off.
     p.max_inventory = 0;
-    EXPECT_TRUE(desired_quotes(book(500, 400), lengthy, p).bid.has_value());
+    const auto off = desired_quotes(book(500, 400), lengthy, p);
+    EXPECT_FALSE(off.stop);
+    EXPECT_TRUE(off.bid.has_value());
 }
 
 // --- the driver, with fakes ----------------------------------------------
 
 struct Fake {
-    Fake(Params p = params()) {
+    // `owned` false is the one-shot crypto_mm binary: no host behind it, so
+    // no hook to ask to be stopped.
+    Fake(Params p = params(), bool owned = true) {
         QuoteManager::Hooks hooks;
         hooks.can_submit = [this] { return allowed; };
         hooks.send = [this](const cpm::oms::NewOrder& order) {
@@ -240,7 +458,13 @@ struct Fake {
             return true;
         };
         hooks.next_cl_ord_id = [this] { return "q" + std::to_string(++counter); };
+        hooks.order_finished = [this](const std::string& cl_ord_id) {
+            return finished.count(cl_ord_id) > 0;
+        };
         hooks.log = [this](const std::string& line) { log.push_back(line); };
+        if (owned) {
+            hooks.stop_me = [this](const std::string& why) { stop_asked.push_back(why); };
+        }
         manager = std::make_unique<QuoteManager>(std::move(p), std::move(hooks));
     }
 
@@ -262,12 +486,25 @@ struct Fake {
     bool allowed = true;
     bool refuse_sends = false;
     std::set<std::string> acknowledged;
+    // What the order manager already knows has finished at the venue, which
+    // it learns before the strategy does.
+    std::set<std::string> finished;
     int counter = 0;
     std::vector<cpm::oms::NewOrder> sent;
     std::vector<cpm::oms::CancelOrder> cancels;
+    std::vector<std::string> stop_asked;
     std::vector<std::string> log;
     std::unique_ptr<QuoteManager> manager;
 };
+
+// The ClOrdID of the last order sent on one side, which is what the strategy
+// has resting there.
+std::string id_of(const std::vector<cpm::oms::NewOrder>& sent, Side side) {
+    for (auto it = sent.rbegin(); it != sent.rend(); ++it) {
+        if (it->side == side) return it->cl_ord_id;
+    }
+    return {};
+}
 
 TEST(CryptoMmDriver, AbandoningSendsNothingAtAll) {
     // The window closed, so the venue has already cancelled what was resting
@@ -294,6 +531,54 @@ TEST(CryptoMmDriver, AbandoningSendsNothingAtAll) {
     for (const auto& order : live.sent) live.acknowledge(order);
     live.manager->withdraw("operator");
     EXPECT_EQ(live.cancels.size(), 2u);
+}
+
+// The race that halted a live run on 2026-10-30. A fill updates the position
+// on the session's thread at once, while the report that clears the quote
+// waits for the next tick. In between, the strategy prices against the fill
+// and still believes the filled order is resting - and cancelling it comes
+// back UNKNOWN_ORDER, which halts the daemon (OE-Q6).
+TEST(CryptoMmDriver, DoesNotCancelAnOrderThatHasAlreadyFinished) {
+    Fake fake;
+    fake.manager->on_market(book(500, 400), flat(), cpm::oms::Clock::now());
+    ASSERT_EQ(fake.sent.size(), 2u);
+    for (const auto& order : fake.sent) fake.acknowledge(order);
+    const auto resting_bid = id_of(fake.sent, Side::Buy);
+
+    // The bid fills. The order manager knows; this strategy has not been
+    // handed the report yet, which is exactly the window.
+    fake.finished.insert(resting_bid);
+
+    // A pass that wants to move the bid: without the check this is where the
+    // cancel for a filled order went out.
+    Position bought = flat();
+    bought.net = 100;
+    fake.manager->on_market(book(490, 400), bought, cpm::oms::Clock::now());
+
+    for (const auto& cancel : fake.cancels) {
+        EXPECT_NE(cancel.orig_cl_ord_id, resting_bid) << "cancelled an order that had finished";
+    }
+    // And it does not simply go quiet: the side is quoted again, which is
+    // what the report would have led to a moment later anyway.
+    EXPECT_TRUE(fake.manager->live_bid().has_value());
+    EXPECT_NE(id_of(fake.sent, Side::Buy), resting_bid) << "a fresh order, not the filled one";
+}
+
+// The same guard on the way out: withdrawing must not cancel what the venue
+// has already finished either, which is how the halt path turned one reject
+// into a second one.
+TEST(CryptoMmDriver, WithdrawDoesNotCancelAnOrderThatHasAlreadyFinished) {
+    Fake fake;
+    fake.manager->on_market(book(500, 400), flat(), cpm::oms::Clock::now());
+    for (const auto& order : fake.sent) fake.acknowledge(order);
+    const auto bid = id_of(fake.sent, Side::Buy);
+    const auto ask = id_of(fake.sent, Side::Sell);
+    fake.finished.insert(bid);
+
+    fake.manager->withdraw("operator");
+    ASSERT_EQ(fake.cancels.size(), 1u) << "only the one still live";
+    EXPECT_EQ(fake.cancels.front().orig_cl_ord_id, ask);
+    EXPECT_FALSE(fake.manager->live_bid().has_value());
 }
 
 TEST(CryptoMmStrategy, WithdrawBeforePullsTheQuotesAheadOfTheClose) {
@@ -424,6 +709,51 @@ TEST(CryptoMmDriver, PlacesBothQuotesOnce) {
     EXPECT_TRUE(fake.cancels.empty());
 }
 
+TEST(CryptoMmDriver, AsksToBeStoppedAtTheInventoryLimitAndQuotesNothingMore) {
+    auto p = params();
+    p.max_inventory = 300;
+    Fake fake(p);
+    fake.manager->on_market(book(500, 400), flat(), {});
+    ASSERT_EQ(fake.sent.size(), 2u);
+    for (auto& order : fake.sent) fake.acknowledge(order);
+
+    // A fill takes it to the limit.
+    Position full = flat();
+    full.net = 300;
+    fake.manager->on_market(book(500, 400), full, {});
+
+    ASSERT_EQ(fake.stop_asked.size(), 1u);
+    EXPECT_EQ(fake.stop_asked.front(), "long inventory limit reached: net 3 of 3");
+    EXPECT_EQ(fake.sent.size(), 2u) << "nothing more is placed";
+    // The quotes are not cancelled here: the host withdraws on its way out
+    // of this pass, and cancelling twice would race its own cancel.
+    EXPECT_TRUE(fake.cancels.empty());
+    EXPECT_EQ(fake.manager->last_reason(), "long inventory limit reached: net 3 of 3");
+
+    // It keeps asking for as long as the host has not acted, and never
+    // starts quoting again by itself.
+    fake.manager->on_market(book(500, 400), full, {});
+    EXPECT_EQ(fake.sent.size(), 2u);
+    EXPECT_EQ(fake.stop_asked.size(), 2u);
+}
+
+TEST(CryptoMmDriver, WithTheInventoryLimitAndNoOwnerItJustComesOff) {
+    // The one-shot crypto_mm binary has no host to ask: a strategy with no
+    // owner can only take its own quotes off, and that is what it does.
+    auto p = params();
+    p.max_inventory = 300;
+    Fake fake(p, false);
+    fake.manager->on_market(book(500, 400), flat(), {});
+    ASSERT_EQ(fake.sent.size(), 2u);
+    for (auto& order : fake.sent) fake.acknowledge(order);
+
+    Position full = flat();
+    full.net = 300;
+    fake.manager->on_market(book(500, 400), full, {});
+    EXPECT_TRUE(fake.stop_asked.empty());
+    EXPECT_EQ(fake.cancels.size(), 2u) << "both quotes come off";
+}
+
 TEST(CryptoMmDriver, ReQuotesWhenTheMidMoves) {
     Fake fake;
     fake.manager->on_market(book(500, 400), flat(), {});
@@ -470,18 +800,41 @@ TEST(CryptoMmDriver, LeavesAQuoteAloneWhileItsCancelIsOutstanding) {
     EXPECT_EQ(fake.sent.size(), 2u) << "and nothing new until the cancels are confirmed";
 }
 
-// Only the side whose target actually moved is re-quoted.
-TEST(CryptoMmDriver, ASmallMoveReQuotesOnlyTheSideThatChanged) {
+// Both quotes round the same way, so on an even grid they move together or
+// not at all. A mid that shifts by half a tick shifts neither, which is a
+// cancel and a re-submit that no longer happens.
+TEST(CryptoMmDriver, AHalfTickMoveLeavesBothQuotesAlone) {
     Fake fake;
     fake.manager->on_market(book(500, 400), flat(), {});
     for (auto& order : fake.sent) fake.acknowledge(order);
-    // Mid 0.550 -> 0.555: the bid target stays at 0.530 after rounding down,
-    // while the ask target moves from 0.570 to 0.580.
+    ASSERT_EQ(fake.sent.size(), 2u);
+
+    // Mid 0.550 -> 0.555. Rounded down together, both targets are unmoved.
     fake.manager->on_market(book(510, 400), flat(), {});
-    ASSERT_EQ(fake.cancels.size(), 1u);
-    EXPECT_EQ(fake.cancels.front().side, Side::Sell);
-    EXPECT_TRUE(fake.manager->live_bid().has_value());
-    EXPECT_EQ(fake.manager->live_bid()->price, 530) << "the bid was left where it was";
+    EXPECT_TRUE(fake.cancels.empty()) << "nothing to re-quote";
+    EXPECT_EQ(fake.manager->live_bid()->price, 530);
+    EXPECT_EQ(fake.manager->live_ask()->price, 570);
+
+    // Mid 0.560, a whole tick on: both move, and the width is unchanged.
+    fake.manager->on_market(book(520, 400), flat(), {});
+    EXPECT_EQ(fake.cancels.size(), 2u) << "the pair moves as a pair";
+}
+
+// The lean changing is a move of the whole pair by one tick, so it costs two
+// cancels and two re-submits. There is no hysteresis in it: a book whose two
+// sizes keep trading places keeps paying that.
+TEST(CryptoMmDriver, AnImbalanceFlipReQuotesBothSides) {
+    Fake fake;
+    // Mid 0.545, four ticks wide, the ask heavier: the pair rounds down from
+    // 0.525 / 0.565 to 0.520 / 0.560.
+    fake.manager->on_market(book_with(500, 410, 400, 600), flat(), {});
+    for (auto& order : fake.sent) fake.acknowledge(order);
+    ASSERT_EQ(fake.manager->live_bid()->price, 520);
+    ASSERT_EQ(fake.manager->live_ask()->price, 560);
+
+    // The same market, the bid now heavier: up a tick, both sides.
+    fake.manager->on_market(book_with(500, 410, 600, 400), flat(), {});
+    EXPECT_EQ(fake.cancels.size(), 2u);
 }
 
 TEST(CryptoMmDriver, AFilledQuoteIsReplacedOnTheNextUpdate) {
@@ -511,7 +864,7 @@ TEST(CryptoMmDriver, AFilledQuoteIsReplacedOnTheNextUpdate) {
 }
 
 TEST(CryptoMmDriver, APartialFillLeavesTheRestQuoted) {
-    Fake fake(params(2, 200));
+    Fake fake(params(4, 200));
     fake.manager->on_market(book(500, 400), flat(), {});
     for (auto& order : fake.sent) fake.acknowledge(order);
 
@@ -687,9 +1040,11 @@ TEST(CryptoMmDriver, TheQuotesFollowTheMid) {
         }
     };
 
-    // The mid walks from 0.550 to 0.600 in 0.01 steps. At each step the quotes
-    // straddle the mid, sit at least two ticks from it, and are on the grid -
-    // and both move as the mid does, which is the whole point.
+    // The mid walks from 0.550 to 0.600 in 0.005 steps. At each step the quotes
+    // straddle the mid, are on the grid, and are exactly the configured width
+    // apart - and both move as the mid does, which is the whole point. They
+    // are not symmetric about the mid: on a half tick the pair rounds one way
+    // together, which is what keeps the width exact.
     cpm::Price previous_bid = 0;
     cpm::Price previous_ask = 0;
     for (cpm::Price yes_bid = 500; yes_bid <= 550; yes_bid += 10) {
@@ -703,8 +1058,7 @@ TEST(CryptoMmDriver, TheQuotesFollowTheMid) {
 
         EXPECT_LT(bid->price, mid) << at;
         EXPECT_GT(ask->price, mid) << at;
-        EXPECT_LE(bid->price, mid - 20) << "at least two 0.01 ticks below" << at;
-        EXPECT_GE(ask->price, mid + 20) << "at least two 0.01 ticks above" << at;
+        EXPECT_EQ(ask->price - bid->price, 40) << "four 0.01 ticks apart" << at;
         EXPECT_EQ(bid->price % 10, 0) << "on the 0.01 grid" << at;
         EXPECT_EQ(ask->price % 10, 0) << at;
         // The quotes track the mid upwards, never backwards.
@@ -721,7 +1075,7 @@ TEST(CryptoMmDriver, TheQuotesFollowTheMid) {
 
 // And down again, including the quantity: y is what is shown on each side.
 TEST(CryptoMmDriver, BothSidesAlwaysShowTheConfiguredQuantity) {
-    Fake fake(params(3, 250));
+    Fake fake(params(6, 250));
     fake.manager->on_market(book(500, 400), flat(), {});
     ASSERT_EQ(fake.sent.size(), 2u);
     for (const auto& order : fake.sent) {
@@ -792,7 +1146,7 @@ TEST(CryptoMmLive, QuotesRestOnTheSimulatorAndAreCancelled) {
     hooks.next_cl_ord_id = [&counter] { return cpm::oms::make_cl_ord_id("mm-", ++counter); };
     hooks.log = [&](const std::string& line) { client_logger.info(line); };
 
-    QuoteManager manager(params(2, 100), std::move(hooks));
+    QuoteManager manager(params(4, 100), std::move(hooks));
     client.on_events(cpm::oms::combine_oe(state.callbacks(), [&] {
         cpm::oms::OeCallbacks c;
         c.report = [&](const ExecutionReport& report) { manager.on_report(report); };

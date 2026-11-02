@@ -1,6 +1,7 @@
 #include "cpm/strategy/crypto_mm.hpp"
 
 #include <algorithm>
+#include <map>
 #include <memory>
 #include <utility>
 
@@ -23,10 +24,44 @@ std::optional<Price> market_mid(const InstrumentView& book) {
     return (best_bid + best_ask) / 2;
 }
 
+// floor() and ceil() of v/2, for prices carried at twice their scale. The mid
+// of a one-tick market sits on a half, and so does either side of an odd
+// spread, so the halves are kept until the rounding below consumes them:
+// truncating earlier would quietly turn a one-tick spread into none at all.
+Price floor_half(Price v) { return v >= 0 ? v / 2 : -((-v + 1) / 2); }
+Price ceil_half(Price v) { return v >= 0 ? (v + 1) / 2 : -((-v) / 2); }
+
+// One side of the book with our own orders taken out of it: the best level
+// that still has somebody else's size on it, and how much of it is theirs.
+//
+// `mine` is the price each of our orders on this side rests at, which is not
+// always the price we asked for - a post-only slide moves it. Our sells rest
+// on the NO book at 1.000 minus their YES price, which is how the feed
+// carries them, so the caller converts before it gets here.
+struct TopOfBook {
+    bool present = false;
+    Price price = 0;
+    Qty qty = 0;
+};
+
+TopOfBook top_excluding_ours(const std::vector<cpm::md::BookLevel>& levels,
+                             const std::map<Price, Qty>& mine) {
+    for (const auto& level : levels) {
+        const auto found = mine.find(level.price);
+        const Qty ours = found == mine.end() ? 0 : found->second;
+        // Never below zero: our record of what is resting and the book's can
+        // disagree for an instant either way, and a negative here would turn
+        // a level we are not even on into the touch.
+        const Qty theirs = level.qty > ours ? level.qty - ours : 0;
+        if (theirs > 0) return {true, level.price, theirs};
+    }
+    return {};
+}
+
 }  // namespace
 
 DesiredQuotes desired_quotes(const InstrumentView& book, const Position& position,
-                            const Params& params) {
+                            const Params& params, const std::vector<LiveLeg>& ours) {
     DesiredQuotes out;
 
     // The mid needs both sides: the best YES bid, and the YES ask implied by
@@ -47,15 +82,71 @@ DesiredQuotes desired_quotes(const InstrumentView& book, const Position& positio
         out.reason = "crossed or locked book";
         return out;
     }
-    const Price mid = (best_bid + best_ask) / 2;
+    // What is resting that is not ours. A buy of ours sits on the YES book at
+    // its own price; a sell sits on the NO book at 1.000 minus it, which is
+    // how this venue carries the other side.
+    std::map<Price, Qty> our_bids;
+    std::map<Price, Qty> our_asks;
+    for (const auto& leg : ours) {
+        if (leg.quantity <= 0) continue;
+        if (leg.side == cpm::oms::Side::Buy) {
+            our_bids[leg.price] += leg.quantity;
+        } else {
+            our_asks[kPriceOne - leg.price] += leg.quantity;
+        }
+    }
+    const auto bid_ex_ours = top_excluding_ours(book.yes, our_bids);
+    const auto no_bid_ex_ours = top_excluding_ours(book.no, our_asks);
+    if (!bid_ex_ours.present || !no_bid_ex_ours.present) {
+        // Nobody else is showing on one of the sides. There is no market to
+        // lean on, and leaning on our own quote would only be this strategy
+        // reading itself back.
+        out.reason = "one-sided book once our own orders are taken out";
+        return out;
+    }
+    const Price ask_ex_ours = kPriceOne - no_bid_ex_ours.price;
+    if (ask_ex_ours <= bid_ex_ours.price) {
+        out.reason = "crossed or locked book once our own orders are taken out";
+        return out;
+    }
+
+    // Twice the mid, which is exact. The mid itself is only wanted for the
+    // tick band, where half a unit cannot change the answer.
+    const Price mid2 = bid_ex_ours.price + ask_ex_ours;
+    const Price mid = mid2 / 2;
 
     const Price tick = tick_at(mid, params.ticks);
-    const Price offset = tick * params.half_width_ticks;
+    // The whole width, so each side is half of it away from the mid.
+    const Price span = tick * params.spread_ticks;
 
-    // Onto the grid, away from the other side: rounding must never move a
-    // quote towards the touch.
-    Price bid = cpm::md::snap_down(mid - offset, params.ticks);
-    Price ask = cpm::md::snap_up(mid + offset, params.ticks);
+    // Which way the pair leans. Past a third of the maximum position the
+    // position decides and nothing else does: it is the inventory that has to
+    // come off. Below that, the resting sizes decide.
+    //
+    // 3 * |net| against the limit rather than the limit divided by 3, because
+    // the division would have to round and this way nothing does. A zero
+    // limit disables this as it disables the cap below.
+    const Qty net = position.net;
+    const Qty magnitude = net < 0 ? -net : net;
+    const bool position_decides = params.max_inventory > 0 && 3 * magnitude > params.max_inventory;
+    const Qty bid_qty = bid_ex_ours.qty;
+    // The best NO bid is the best YES offer, one contract for one, so the two
+    // sizes compare directly.
+    const Qty ask_qty = no_bid_ex_ours.qty;
+    // Long rounds down, so the ask lands on the offer and sells before it
+    // buys; short rounds up, so the bid lands on the bid. Flat enough, and we
+    // lean towards whichever side is showing more.
+    const bool round_up = position_decides ? net < 0 : bid_qty > ask_qty;
+    out.rounded_up = round_up;
+    out.round_reason = position_decides ? "position" : "qty imbalance";
+
+    // Onto the grid, both sides the same way. That is what holds the width at
+    // exactly span: rounding each side away from the touch instead would add a
+    // tick whenever the mid fell between two of them.
+    Price bid = round_up ? cpm::md::snap_up(ceil_half(mid2 - span), params.ticks)
+                         : cpm::md::snap_down(floor_half(mid2 - span), params.ticks);
+    Price ask = round_up ? cpm::md::snap_up(ceil_half(mid2 + span), params.ticks)
+                         : cpm::md::snap_down(floor_half(mid2 + span), params.ticks);
     bid = std::clamp(bid, kMinPrice, kMaxPrice);
     ask = std::clamp(ask, kMinPrice, kMaxPrice);
 
@@ -73,20 +164,21 @@ DesiredQuotes desired_quotes(const InstrumentView& book, const Position& positio
         return out;
     }
 
-    // Inventory: stop adding to the side that would make the position longer
-    // or shorter still. The position is signed in YES contracts.
+    // Inventory: at the limit the strategy is done. Both sides come off and
+    // it stops itself - it does not go on quoting the reducing side, because
+    // a position at the limit is the operator's to decide about. The
+    // position is signed in YES contracts.
     const bool too_long = params.max_inventory > 0 && position.net >= params.max_inventory;
     const bool too_short = params.max_inventory > 0 && position.net <= -params.max_inventory;
-    if (!too_long) {
-        out.bid = Quote{bid, params.quantity};
-    } else {
-        out.reason = "long inventory limit reached";
+    if (too_long || too_short) {
+        out.stop = true;
+        out.reason = std::string(too_long ? "long" : "short") + " inventory limit reached: net " +
+                     cpm::format_signed(position.net, cpm::kQtyScale) + " of " +
+                     cpm::format_qty(params.max_inventory);
+        return out;
     }
-    if (!too_short) {
-        out.ask = Quote{ask, params.quantity};
-    } else {
-        out.reason = out.reason.empty() ? "short inventory limit reached" : out.reason;
-    }
+    out.bid = Quote{bid, params.quantity};
+    out.ask = Quote{ask, params.quantity};
     return out;
 }
 
@@ -116,6 +208,20 @@ void QuoteManager::reconcile_side(Side side, const std::optional<Quote>& desired
     const auto log = [&](const std::string& message) {
         if (hooks_.log) hooks_.log(message);
     };
+
+    // A quote that has already finished at the venue is not ours to cancel.
+    // The fill that ended it updates the position on the session's thread,
+    // while this quote is only cleared when the report reaches the next tick
+    // - so for the width of that gap the strategy prices against a fill it
+    // has not yet applied, and would cancel the order that caused it.
+    // UNKNOWN_ORDER comes back, and a cancel reject halts the run.
+    if (live && hooks_.order_finished && hooks_.order_finished(live->cl_ord_id)) {
+        log("the " + std::string(to_string(side)) + " quote " + live->cl_ord_id +
+            " has already finished at the venue; dropping it rather than cancelling it");
+        live.reset();
+        // And on, with no live quote: the desired side is placed afresh below,
+        // which is what the report would have led to a moment later anyway.
+    }
 
     if (!desired) {
         if (live && !live->cancel_pending) {
@@ -190,6 +296,10 @@ void QuoteManager::announce(const InstrumentView& book, const DesiredQuotes& des
                format_price((best_bid + best_ask) / 2) + " -> quoting " +
                (desired.bid ? format_price(desired.bid->price) : std::string("-")) + " / " +
                (desired.ask ? format_price(desired.ask->price) : std::string("-"));
+        if (!desired.round_reason.empty()) {
+            line += ", rounded " + std::string(desired.rounded_up ? "up" : "down") + " on " +
+                    desired.round_reason;
+        }
         if (!desired.reason.empty()) line += " (" + desired.reason + ")";
     } else {
         line = "not quoting: " + (desired.reason.empty() ? std::string("no target") : desired.reason);
@@ -270,12 +380,29 @@ void QuoteManager::on_market(const InstrumentView& book, const Position& positio
 
     // Computed first, and always: a run that sends nothing should still be
     // able to say what it would have done and why.
-    const auto desired = desired_quotes(book, position, params_);
+    const auto desired = desired_quotes(book, position, params_,
+                                        hooks_.resting_orders
+                                            ? hooks_.resting_orders(params_.symbol)
+                                            : std::vector<LiveLeg>{});
     last_reason_ = desired.reason;
     if (!desired.bid && !desired.ask) ++passes_without_quotes_;
 
     const bool may_send = !hooks_.can_submit || hooks_.can_submit();
     announce(book, desired, may_send);
+
+    // The inventory limit ends the run. The host takes the quotes off and
+    // moves the row to Stopping on its way out of this pass, so nothing is
+    // placed here and nothing is cancelled twice. With no hook to ask - the
+    // one-shot crypto_mm binary has none - the quotes still come off, which
+    // is as far as a strategy with no owner can go.
+    if (desired.stop) {
+        if (hooks_.stop_me) {
+            hooks_.stop_me(desired.reason);
+        } else {
+            withdraw(desired.reason);
+        }
+        return;
+    }
     if (!may_send) {
         // Reconciling, halted, or a dry run. Quotes already live are left to
         // the reconciler's mass cancel rather than fought over from here.
@@ -340,6 +467,18 @@ void QuoteManager::withdraw(const std::string& why) {
     if (hooks_.log) hooks_.log("withdrawing both quotes: " + why);
     for (auto* quote : {&bid_, &ask_}) {
         if (!*quote || (*quote)->cancel_pending) continue;
+        // The same guard reconcile_side keeps: an order the venue has already
+        // finished is not ours to cancel. A halt withdraws right after its
+        // own mass cancel, which is exactly when this is true.
+        if (hooks_.order_finished && hooks_.order_finished((*quote)->cl_ord_id)) {
+            if (hooks_.log) {
+                hooks_.log("the quote " + (*quote)->cl_ord_id +
+                           " has already finished at the venue; dropping it rather than "
+                           "cancelling it");
+            }
+            quote->reset();
+            continue;
+        }
         CancelOrder request;
         request.cl_ord_id = hooks_.next_cl_ord_id();
         request.orig_cl_ord_id = (*quote)->cl_ord_id;
@@ -407,10 +546,11 @@ ParamSchema crypto_mm_schema() {
     // The operator's word for it. The flag keeps its name.
     width.label = "Spread";
     width.type = ParamSpec::Type::Int;
-    width.default_value = "2";
+    width.default_value = "4";
     width.min = "1";
     width.max = "500";
-    width.help = "how far either side of the mid to quote, in ticks";
+    width.help = "the whole width of the market to make, in ticks: 2 quotes a two-tick "
+                 "market, one tick either side of the mid";
     schema.push_back(std::move(width));
 
     ParamSpec qty;
@@ -430,7 +570,8 @@ ParamSchema crypto_mm_schema() {
     inventory.default_value = "5";
     inventory.min = "0";
     inventory.max = "1000000";
-    inventory.help = "stop adding to a side at this net position; 0 disables the check";
+    inventory.help =
+        "stop the strategy at this net position, long or short; 0 disables the check";
     schema.push_back(std::move(inventory));
 
     ParamSpec threshold;
@@ -479,7 +620,7 @@ ParamSchema crypto_mm_schema() {
 Params crypto_mm_params(const ParamValues& values) {
     Params params;
     params.symbol = param_text(values, "symbol");
-    params.half_width_ticks = static_cast<int>(param_int(values, "width-ticks"));
+    params.spread_ticks = static_cast<int>(param_int(values, "width-ticks"));
     params.quantity = param_decimal(values, "qty", cpm::kQtyScale);
     params.max_inventory = param_decimal(values, "max-inventory", cpm::kQtyScale);
     params.requote_threshold_ticks = static_cast<int>(param_int(values, "requote-threshold"));
@@ -493,7 +634,7 @@ Params crypto_mm_params(const ParamValues& values) {
 
 void register_crypto_mm(StrategyRegistry& registry) {
     registry.add("CryptoMM",
-                 "quotes a bid and an ask x ticks either side of the mid, y on each side",
+                 "quotes a market x ticks wide around the mid, y on each side",
                  crypto_mm_schema(),
                  [](const ParamValues& values, StrategyHooks hooks) -> std::unique_ptr<IStrategy> {
                      return std::make_unique<CryptoMm>(crypto_mm_params(values), std::move(hooks));

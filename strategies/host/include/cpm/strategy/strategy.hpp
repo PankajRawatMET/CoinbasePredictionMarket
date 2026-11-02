@@ -23,6 +23,16 @@ using cpm::oms::NewOrder;
 using cpm::oms::Position;
 using Clock = cpm::oms::Clock;
 
+// One order a strategy currently has in the market, flattened for display.
+// Prices and quantities stay scaled integers all the way to the browser.
+struct LiveLeg {
+    cpm::oms::Side side = cpm::oms::Side::Buy;
+    std::string cl_ord_id;
+    Price price = 0;
+    Qty quantity = 0;
+    bool cancel_pending = false;
+};
+
 // Everything a strategy may do to the outside world. The host composes these
 // so that arming, the submission gate and the halt are all enforced below the
 // strategy rather than by it: a strategy that ignored can_submit() still could
@@ -39,18 +49,41 @@ struct StrategyHooks {
     std::function<bool()> orders_permitted;
     std::function<std::string(const NewOrder&)> send;  // returns the ClOrdID
     std::function<bool(const CancelOrder&)> cancel;
+    // Has this order already finished at the venue - filled, cancelled,
+    // expired or rejected? The order manager knows this the moment the report
+    // is decoded, while a strategy's own view of its quotes waits for the
+    // next tick, so the two disagree for as long as a report sits in the
+    // queue. Cancelling an order that has finished is answered with
+    // UNKNOWN_ORDER, and a cancel reject halts the run, so a strategy asks
+    // before it cancels. Unset means "not known", which keeps the old
+    // behaviour: send the cancel.
+    std::function<bool(const std::string& cl_ord_id)> order_finished;
+    // Everything of ours resting on one instrument, as the order manager
+    // holds it: the price each order actually rests at, and what is still
+    // open on it. A strategy leans on what OTHER people are showing, so it
+    // takes its own size back out of the book before reading it - our own
+    // order on a level is not information about the market, and a level that
+    // is only ours is not a market at all. Unset means "not known", and the
+    // book is then read as it comes.
+    std::function<std::vector<LiveLeg>(const std::string& symbol)> resting_orders;
     std::function<std::string()> next_cl_ord_id;
+    // Which strategy an order or a cancel came from, for the record files:
+    // the ClOrdID does not say, because the counter behind it is the
+    // daemon's and not a strategy's. The host calls this just before the
+    // send it wraps, so a strategy neither knows nor can lie about its own
+    // id. Unset is "do not attribute", which is every test that does not
+    // care and every run with no record files.
+    std::function<void(const std::string& cl_ord_id, const std::string& strategy_id)> attribute;
+    // A strategy asking to be stopped, with the reason the operator will
+    // read on its row. It is a request, not a call into the host: the host
+    // is driving this pass and holds its lock, so the stop happens as soon
+    // as the pass returns - the quotes come off, the row disarms and goes to
+    // Stopping, and nothing of this strategy is driven again.
+    //
+    // Unset means the strategy has no owner to ask, which is the one-shot
+    // crypto_mm binary; it withdraws instead and keeps running.
+    std::function<void(const std::string& why)> stop_me;
     std::function<void(const std::string&)> log;
-};
-
-// One order a strategy currently has in the market, flattened for display.
-// Prices and quantities stay scaled integers all the way to the browser.
-struct LiveLeg {
-    cpm::oms::Side side = cpm::oms::Side::Buy;
-    std::string cl_ord_id;
-    Price price = 0;
-    Qty quantity = 0;
-    bool cancel_pending = false;
 };
 
 // What a strategy says about itself. Deliberately flat and kind-agnostic: the

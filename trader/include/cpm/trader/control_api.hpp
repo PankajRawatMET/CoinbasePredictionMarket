@@ -78,9 +78,31 @@ struct PositionView {
     Qty bought = 0;
     Qty sold = 0;
     Amount cash = 0;
+    Amount bought_value = 0;
+    Amount sold_value = 0;
     Amount fees = 0;
     std::size_t fills = 0;
     std::optional<Amount> settlement_payout;
+};
+
+// One symbol's P&L (GUI-Q15), from cpm::oms::pnl_of. The mark is carried with
+// it so the operator can see what the unrealized half was measured against,
+// and an absent one is why the unrealized half is absent too.
+struct PnlView {
+    std::string symbol;
+    std::optional<Price> mark;
+    Amount realized = 0;
+    std::optional<Amount> unrealized;
+    std::optional<Amount> total;
+};
+
+// The daemon's own line. Realized always adds up; unrealized is null as soon
+// as one open position has no mark, because a sum that quietly leaves one out
+// reads as a smaller number rather than an incomplete one.
+struct PnlTotals {
+    Amount realized = 0;
+    std::optional<Amount> unrealized;
+    std::optional<Amount> total;
 };
 
 // The client-side limits in force, which are shared by every strategy because
@@ -109,6 +131,9 @@ struct Snapshot {
     std::vector<StrategyInfo> strategies;
     std::vector<BookView> books;
     std::vector<PositionView> positions;
+    // One row per position, in the same order, and the daemon's total.
+    std::vector<PnlView> pnl;
+    PnlTotals pnl_total;
     LimitsView limits;
     Clock::time_point taken{};
     // Bumped by every action that changes anything, so the stream layer can
@@ -154,6 +179,10 @@ public:
         // One word for the header: off, up, stale or down.
         std::function<std::string()> reference;
         std::function<std::vector<PositionView>()> positions;
+        // The P&L of each position, marked where a mid can be had. Computed
+        // by the daemon because the mark comes from the book, which this
+        // class does not read.
+        std::function<std::vector<PnlView>()> pnl;
         std::function<std::optional<BookView>(const std::string& symbol)> book;
         std::function<LimitsView()> limits;
         // The price grid an instrument trades on. Configured rather than
@@ -194,6 +223,18 @@ public:
     Result stop(const std::string& id);
     Result arm(const std::string& id);
     Result disarm(const std::string& id);
+    // Drops the row's subscription and leaves everything else: the row stays
+    // on the page with its kind, its symbol and its parameters, and Start
+    // Feed is the only thing left that can be done to it. Only when it is
+    // already stopped, for the same reason destroy is - the cancels have to
+    // be confirmed before the book they were quoting goes away.
+    Result stop_feed(const std::string& id);
+    // Subscribes a row whose feed was stopped. A row that follows a series
+    // is moved onto the window that is open now, because the one it last
+    // quoted has probably closed and subscribing to a closed instrument is
+    // answered "unknown symbol", which is a reject, and a reject halts
+    // (R-N2, [MD] O6).
+    Result start_feed(const std::string& id);
     // Stops, unsubscribes and forgets it. Only when it is already stopped.
     Result destroy(const std::string& id);
     // The kill switch: stops and disarms everything.
@@ -212,6 +253,11 @@ public:
 
 private:
     void bump();
+    // Unsubscribes those of `symbols` that no other row is still reading.
+    // Unsubscribing is not ref-counted, and a stopped row and a live one can
+    // be on the same instrument, so dropping one row's feed must not take
+    // another's book with it.
+    void drop_feed(const std::string& id, const std::vector<std::string>& symbols);
 
     StrategyHost& host_;
     const StrategyRegistry& registry_;

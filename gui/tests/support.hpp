@@ -83,6 +83,7 @@ struct Daemon {
         env.order_entry = [] { return SessionView{true, ""}; };
         env.recovery = [] { return std::string("live"); };
         env.positions = [this] { return positions; };
+        env.pnl = [this] { return pnl; };
         env.limits = [] {
             LimitsView limits;
             limits.allow_orders = true;
@@ -127,6 +128,7 @@ struct Daemon {
     std::unique_ptr<StrategyHost> host;
     std::unique_ptr<ControlApi> api;
     std::vector<PositionView> positions;
+    std::vector<cpm::trader::PnlView> pnl;
     std::uint64_t counter = 0;
 };
 

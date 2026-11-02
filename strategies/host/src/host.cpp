@@ -72,6 +72,33 @@ StrategyHooks StrategyHost::hooks_for(Entry& entry) const {
         if (!target->armed.load()) return false;
         return !owner_gate || owner_gate();
     };
+    // The id goes to the owner on the way past, so the record files can say
+    // which strategy an order came from. Only the ids we mint are named: a
+    // cancel's own ClOrdID here, and the order's when it was sent.
+    // A strategy that has decided it is done - at its inventory limit, say.
+    // Recorded here and acted on by tick(), because this is called from
+    // inside the pass and the host's lock is already held.
+    hooks.stop_me = [target](const std::string& why) {
+        if (target->stop_requested.empty()) {
+            target->stop_requested = why.empty() ? "the strategy stopped itself" : why;
+        }
+    };
+    if (venue_.attribute) {
+        const std::string id = entry.id;
+        const auto attribute = venue_.attribute;
+        if (const auto send = venue_.send) {
+            hooks.send = [send, attribute, id](const NewOrder& order) {
+                attribute(order.cl_ord_id, id);
+                return send(order);
+            };
+        }
+        if (const auto cancel = venue_.cancel) {
+            hooks.cancel = [cancel, attribute, id](const CancelOrder& request) {
+                attribute(request.cl_ord_id, id);
+                return cancel(request);
+            };
+        }
+    }
     return hooks;
 }
 
@@ -145,6 +172,10 @@ std::string StrategyHost::start(const std::string& id) {
     if (!entry) return "no such strategy: " + id;
     if (entry->state == RunState::Running) return {};
     if (entry->state == RunState::Stopping) return id + " is still stopping";
+    // A strategy with no book to read would quote nothing and not say why,
+    // which is the diagnosis crypto_mm had to print on its way out. The feed
+    // comes first, the way it does when a row is created.
+    if (!entry->feed) return id + " has no feed: start its feed first";
 
     entry->state = RunState::Running;
     entry->note.clear();
@@ -175,6 +206,20 @@ std::string StrategyHost::stop(const std::string& id, const std::string& why) {
     if (!entry) return "no such strategy: " + id;
     if (entry->state == RunState::Stopped || entry->state == RunState::Halted) return {};
     begin_stop(*entry, why.empty() ? "stopped by the operator" : why);
+    return {};
+}
+
+std::string StrategyHost::set_feed(const std::string& id, bool up) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Entry* entry = find(id);
+    if (!entry) return "no such strategy: " + id;
+    if (entry->feed == up) return {};
+    entry->feed = up;
+    // The operator's narrative has every other thing that happens to a row
+    // in it - created, started, armed, stopped, removed - and a row that
+    // went quiet because its book was dropped belongs there too.
+    logger_.info((up ? "feed started for " : "feed stopped for ") + id +
+                 (up ? "" : " (its row stays: Start Feed watches it again)"));
     return {};
 }
 
@@ -438,6 +483,18 @@ void StrategyHost::tick(Clock::time_point now) {
         switch (entry->state) {
             case RunState::Running:
                 drive(*entry, now);
+                // It asked to stop during that pass. Acted on here rather
+                // than inside it: the quotes come off at once, and nothing
+                // of it is driven again.
+                if (!entry->stop_requested.empty()) {
+                    const auto why = entry->stop_requested;
+                    entry->stop_requested.clear();
+                    // Not an operator action, so it is a warning: a strategy
+                    // that took itself out of the market is the one line
+                    // worth seeing on the page.
+                    logger_.warn(entry->id + " stopped itself: " + why);
+                    begin_stop(*entry, why);
+                }
                 break;
             case RunState::Stopping:
                 // Its cancels are confirmed once nothing of its own is left.
@@ -468,6 +525,7 @@ StrategyInfo StrategyHost::describe(const Entry& entry) const {
     info.symbols = entry.symbols;
     info.state = entry.state;
     info.armed = entry.armed.load();
+    info.feed = entry.feed;
     info.note = entry.note;
     info.status = entry.strategy->status();
     // What this window has done, plus what the ones before it did.

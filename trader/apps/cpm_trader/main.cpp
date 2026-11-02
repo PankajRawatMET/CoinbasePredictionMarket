@@ -6,11 +6,17 @@
 // leave a displaced strategy's quotes resting with nobody managing them
 // (docs/open-questions-gui.txt GUI-Q1, spec OE:197-201).
 //
-//   source creds.env && source creds-oe.env && source creds-rest.env
+//   source config/creds.env
 //   ./cpm_trader --allow-orders
 //
-// The third file is the REST instrument catalog (docs/design-roll.md R1b).
-// Without it in the environment a strategy can only name a full ticker: a
+// One at a time, too: it holds an exclusive flock on <bookmark>.lock for its
+// life, so a second daemon on the same durable state is refused with exit 69
+// before it reads a credential (design-gui.md section 2, GUI-N4).
+//
+// One file, one credential, three services: the CPM_ set is market data, the
+// CPM_OE_ set order entry, and the CPM_REST_ set the instrument catalog
+// (docs/design-roll.md R1b). Without the last of them a strategy can only
+// name a full ticker: a
 // series target like BTCD15M is refused, because FIX cannot say which window
 // is open now.
 //
@@ -20,6 +26,8 @@
 // script and the fallback when there is no tunnel.
 #include "cpm/binance/config.hpp"
 #include "cpm/common/config.hpp"
+#include "cpm/common/lock_file.hpp"
+#include "cpm/common/log_files.hpp"
 #include "cpm/common/log_ring.hpp"
 #include "cpm/gui/server.hpp"
 #include "cpm/common/logging.hpp"
@@ -37,6 +45,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -54,6 +63,12 @@ struct Args {
     int duration_secs = 0;  // 0 = until stopped
     std::string dict_dir = CPM_DEFAULT_DICT_DIR;
     std::string bookmark = "cpm-trader-bookmark.txt";
+    // Where the daemon's own log files go, in a directory per UTC day under
+    // it. Empty is stdout only, which is what every run before this did.
+    std::string log_dir = "logs";
+    // Off by default: a market maker changes what it is showing about once a
+    // second per strategy, and most runs do not want that written down.
+    bool quote_records = false;
     // The session's limits, shared by every strategy (GUI-Q10).
     cpm::Qty max_order_qty = 1000;          // 10.00 contracts per order
     double max_orders_per_sec = 8;
@@ -85,6 +100,8 @@ struct Args {
 
 void usage() {
     std::cerr << "usage: cpm_trader [--allow-orders] [--bookmark PATH] [--dict-dir DIR]\n"
+                 "                  [--log-dir DIR] (a directory per day under it;\n"
+                 "                                   empty for stdout only) [--quote-records]\n"
                  "                  [--max-order-qty Q] [--max-orders-per-sec N]\n"
                  "                  [--max-notional A] [--stale-after SECS]\n"
                  "                  [--port PORT] [--book-depth 1|10]\n"
@@ -94,7 +111,9 @@ void usage() {
                  "                  [--binance-config PATH] [--binance-stale-after MS]\n"
                  "env: the market data set (CPM_*), the order entry set (CPM_OE_*), and\n"
                  "     the REST set (CPM_REST_*) to target a series rather than a ticker\n"
-                 "Without --allow-orders no strategy can be armed: it is an observer.\n";
+                 "Without --allow-orders no strategy can be armed: it is an observer.\n"
+                 "One daemon per --bookmark: it is locked (<bookmark>.lock) for the life of\n"
+                 "     the process, and a second daemon on it is refused.\n";
 }
 
 int to_int(std::string_view flag, const char* value) {
@@ -129,6 +148,8 @@ Args parse_args(int argc, char** argv) {
         else if (flag == "--verbose") a.verbose = true;
         else if (flag == "--duration") a.duration_secs = to_int(flag, value());
         else if (flag == "--bookmark") a.bookmark = value();
+        else if (flag == "--log-dir") a.log_dir = value();
+        else if (flag == "--quote-records") a.quote_records = true;
         else if (flag == "--dict-dir") a.dict_dir = value();
         else if (flag == "--stale-after") a.stale_after_secs = to_int(flag, value());
         else if (flag == "--port") a.port = to_int(flag, value());
@@ -187,6 +208,23 @@ void print_snapshot(const Snapshot& snapshot, const char* heading = nullptr) {
                   << "  cash " << cpm::format_amount(position.cash) << "  fees "
                   << cpm::format_amount(position.fees) << "  fills " << position.fills << '\n';
     }
+    // P&L under the positions it belongs to. A dash is "no mark", which is
+    // not the same answer as zero (GUI-Q15).
+    const auto amount = [](const std::optional<cpm::Amount>& value) {
+        return value ? cpm::format_amount(*value) : std::string("-");
+    };
+    for (const auto& pnl : snapshot.pnl) {
+        std::cout << "  " << pnl.symbol << "  realized " << cpm::format_amount(pnl.realized)
+                  << "  unrealized " << amount(pnl.unrealized) << "  total "
+                  << amount(pnl.total)
+                  << (pnl.mark ? "  at mid " + cpm::format_price(*pnl.mark) : "  (no mid)")
+                  << '\n';
+    }
+    if (!snapshot.pnl.empty()) {
+        std::cout << "  P&L  realized " << cpm::format_amount(snapshot.pnl_total.realized)
+                  << "  unrealized " << amount(snapshot.pnl_total.unrealized) << "  total "
+                  << amount(snapshot.pnl_total.total) << '\n';
+    }
 }
 
 void print_help(const ControlApi& api) {
@@ -196,6 +234,7 @@ void print_help(const ControlApi& api) {
                  "  create KIND name=value ...   create a strategy\n"
                  "  set ID name=value ...        retune one that is not armed\n"
                  "  start|stop|arm|disarm|rm ID  act on one\n"
+                 "  start-feed|stop-feed ID      its book, without its quotes\n"
                  "  stop-all                     the kill switch\n"
                  "  quit                         shut down cleanly\n";
     for (const auto& kind : api.kinds()) {
@@ -334,6 +373,8 @@ bool handle(const std::string& line, ControlApi& api) {
     else if (command == "stop") report(api.stop(id));
     else if (command == "arm") report(api.arm(id));
     else if (command == "disarm") report(api.disarm(id));
+    else if (command == "start-feed") report(api.start_feed(id));
+    else if (command == "stop-feed") report(api.stop_feed(id));
     else if (command == "rm" || command == "destroy") report(api.destroy(id));
     else std::cout << "refused: unknown command " << command << " (try help)\n";
     return true;
@@ -364,6 +405,48 @@ int main(int argc, char** argv) {
 
     cpm::Logger logger(std::cout, args.verbose ? cpm::LogLevel::Debug : cpm::LogLevel::Info);
 
+    // The log on disk, before anything else is done: a run whose first line
+    // is a configuration failure is exactly the run whose log is wanted
+    // afterwards. stdout keeps everything either way - these files are a
+    // copy of it, and a daemon that cannot write them still trades.
+    std::optional<cpm::LogFiles> log_files;
+    if (!args.log_dir.empty()) {
+        log_files.emplace(args.log_dir);
+        if (const auto failed = log_files->open_now(cpm::utc_stamp()); !failed.empty()) {
+            logger.warn("logging to stdout only: " + failed);
+            log_files.reset();
+        } else {
+            logger.also_to(log_files->sink());
+            logger.info("log " + log_files->narrative_path() + ", wire traffic in " +
+                        log_files->wire_path() +
+                        " (a new directory under " + args.log_dir + " at midnight UTC)");
+        }
+    }
+
+    // One daemon per bookmark, and this is where that is enforced. Two of
+    // them would allocate ClOrdIDs from the same counter and save over each
+    // other's last_exec_id, so neither could replay after a restart
+    // (OE-Q7); worse, the second logon would displace the first session at
+    // the gateway WITHOUT firing cancel-on-disconnect, leaving a live
+    // strategy's quotes resting with nobody managing them (GUI-Q1).
+    //
+    // The lock is a sidecar and never the bookmark itself: BookmarkFile
+    // replaces that file by rename on every save, so a lock on it would
+    // stop protecting anything after the first write. It follows
+    // --bookmark, so a second daemon on its own state - a simulator run
+    // beside a sandbox one - is still allowed, and two on the same state
+    // are not.
+    //
+    // Before the credentials are read, so a refused daemon never opens a
+    // session; after the log files, so the refusal is in the day's log.
+    cpm::LockFile lock((args.bookmark.empty() ? std::string("cpm-trader") : args.bookmark) +
+                       ".lock");
+    if (const auto refused = lock.acquire(); !refused.empty()) {
+        logger.error("a cpm_trader is already running: " + refused +
+                     " - stop it, or give this one its own --bookmark");
+        return 69;
+    }
+
     try {
         const auto env = cpm::process_env();
 
@@ -372,6 +455,10 @@ int main(int argc, char** argv) {
         options.oe = cpm::load_oe_config(env);
         options.dict_dir = args.dict_dir;
         options.bookmark = args.bookmark;
+        // The record files live beside the .log files, in the same directory
+        // and under the same flag.
+        options.log_dir = args.log_dir;
+        options.quote_records = args.quote_records;
         options.allow_orders = args.allow_orders;
         options.stale_after = std::chrono::seconds(args.stale_after_secs);
         options.book_depth = args.book_depth;
@@ -386,7 +473,7 @@ int main(int argc, char** argv) {
         if (!options.rest.configured()) {
             logger.warn(
                 "REST is not configured, so a series like BTCD15M cannot be resolved: name a "
-                "full ticker, or source creds-rest.env and restart");
+                "full ticker, or source config/creds.env and restart");
         }
         options.reference_enabled = args.binance_on || !args.binance_symbols.empty();
 

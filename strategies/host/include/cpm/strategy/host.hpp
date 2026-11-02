@@ -40,6 +40,14 @@ struct StrategyInfo {
     std::vector<std::string> symbols;
     RunState state = RunState::Stopped;
     bool armed = false;
+    // Whether the owner is subscribed to this row's instrument. Not the
+    // host's own fact - the host has never known what a feed is - but the
+    // owner sets it here, because a row's buttons and whether it may start
+    // at all follow from it, and both of those are read from here.
+    //
+    // A row with its feed stopped keeps everything else: its kind, its
+    // symbol and its parameters are still on the page, ready for Start Feed.
+    bool feed = true;
     // Why it last stopped, withdrew, or could not act. Operator-facing.
     std::string note;
     StrategyStatus status;
@@ -121,6 +129,11 @@ public:
     std::string stop(const std::string& id, const std::string& why);
     std::string arm(const std::string& id);
     std::string disarm(const std::string& id);
+    // The owner saying whether it is subscribed to this row's instrument. It
+    // subscribes and unsubscribes; this is only where the answer is kept, so
+    // that start() can refuse a strategy with nothing to read and the page
+    // can draw the row's buttons.
+    std::string set_feed(const std::string& id, bool up);
     // Only a Stopped strategy can be removed, so nothing is dropped while it
     // still has orders in the market.
     std::string destroy(const std::string& id);
@@ -157,6 +170,11 @@ private:
         RunState state = RunState::Stopped;
         std::atomic<bool> armed{false};
         std::string note;
+        // The owner's answer about the subscription, set through set_feed().
+        bool feed = true;
+        // A stop the strategy asked for during its pass, acted on the moment
+        // the pass returns. Empty when it has not asked.
+        std::string stop_requested;
         // Latched so a standing condition is reported on a cadence rather
         // than four times a second: the same reason the CryptoMM driver only
         // logs a line when it changes.

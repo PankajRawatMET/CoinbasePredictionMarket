@@ -64,6 +64,7 @@ void Reconciler::note_cl_ord_counter(std::uint64_t counter) {
 }
 
 void Reconciler::save_bookmark() {
+    std::lock_guard save_lock(save_mutex_);
     Bookmark bookmark;
     {
         std::lock_guard lock(mutex_);
@@ -132,6 +133,23 @@ OeCallbacks Reconciler::callbacks() {
             logger_.info("up to date with the exchange at ExecID " + begin);
             return;
         }
+        // Which way round? Our bookmark can be NEWER than anything the
+        // exchange still holds: the retention window is up to 24 hours and is
+        // "a present limit rather than a contract", so events we have already
+        // processed age out of it while the bookmark keeps them. There is
+        // then nothing to replay and nothing missing, and asking anyway is
+        // answered with a reject that used to stop the run.
+        if (!exec_id_before(begin, event.exec_id)) {
+            {
+                std::lock_guard lock(mutex_);
+                if (state_value_ == RecoveryState::Reconciling) {
+                    state_value_ = halt_ ? RecoveryState::Halted : RecoveryState::Live;
+                }
+            }
+            logger_.info("ahead of the exchange's retention window: ours " + begin +
+                         ", newest retained " + event.exec_id + " - nothing to replay");
+            return;
+        }
         logger_.warn("behind the exchange: ours " + begin + ", theirs " + event.exec_id +
                      " - replaying");
         {
@@ -155,14 +173,60 @@ OeCallbacks Reconciler::callbacks() {
         }
     };
     callbacks.resend_reject = [this](const ResendReject& event) {
+        // Reason 2 is END_EXEC_ID_TOO_LARGE - our BeginExecID is past the
+        // newest event the exchange holds. That is not a loss: nothing it has
+        // is newer than what we have already processed, so there is nothing
+        // to replay. The check on F2 above normally catches this first; this
+        // still catches the case where the window ages past our bookmark in
+        // between the two messages.
+        if (event.reason == 2) {
+            logger_.info("nothing to replay: " +
+                         (event.text.empty() ? std::string("our bookmark is newer than anything "
+                                                           "the exchange still holds")
+                                             : event.text));
+            std::lock_guard lock(mutex_);
+            replay_requested_ = false;
+            if (state_value_ == RecoveryState::Reconciling) {
+                state_value_ = halt_ ? RecoveryState::Halted : RecoveryState::Live;
+            }
+            return;
+        }
         // Reason 1 means our bookmark predates the window: history is gone, so
-        // there is no way to rebuild and the run must stop.
+        // there is no way to rebuild and the run must stop. So do 3 and 4 (a
+        // replay we cannot get) and 5 (a replay that failed part way), none of
+        // which leave us able to say what happened while we were away.
         raise(Halt::Reason::DataLoss, "replay rejected, reason " + std::to_string(event.reason) +
                                           (event.text.empty() ? "" : ": " + event.text));
     };
     // Any reject halts (OE-Q27 for market data's rule, OE-Q6 here).
     callbacks.cancel_reject = [this](const CancelReject& event) {
-        raise(Halt::Reason::Reject, "OrderCancelReject for " + event.cl_ord_id + ": " + event.text);
+        // Name the ORDER, not just the cancel. ClOrdID here is the cancel
+        // request's own id; the order that could not be cancelled is in
+        // OrigClOrdID, and without it the halt line names nothing that can be
+        // looked up in the log above it.
+        std::string what = "OrderCancelReject";
+        if (!event.orig_cl_ord_id.empty()) what += " for order " + event.orig_cl_ord_id;
+        what += " (cancel " + event.cl_ord_id + ")";
+        if (event.reason) what += ", CxlRejReason " + std::to_string(*event.reason);
+
+        // A cancel for an order that had already finished is a race we lost,
+        // not a fault: the fill, or the venue's own cancel, was already on
+        // its way when ours went out. The spec's own advice for telling the
+        // two apart is to correlate against the reports already received for
+        // that ClOrdID, and the state has them - a single session delivers
+        // in sequence, so the report that ended the order arrives before the
+        // reject for the cancel that was too late. Anything we cannot
+        // account for still halts (OE-Q6).
+        if (!event.orig_cl_ord_id.empty()) {
+            if (const auto record = state_.order(event.orig_cl_ord_id);
+                record && record->terminal) {
+                logger_.warn(what + ": " + event.text +
+                             " - that order had already finished, so the cancel was late, not "
+                             "wrong; carrying on");
+                return;
+            }
+        }
+        raise(Halt::Reason::Reject, what + ": " + event.text);
     };
     callbacks.business_reject = [this](const BusinessReject& event) {
         raise(Halt::Reason::Reject, "BusinessMessageReject for 35=" + event.ref_msg_type + ": " +

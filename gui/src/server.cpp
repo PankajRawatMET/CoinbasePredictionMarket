@@ -541,6 +541,8 @@ HttpResponse Server::route(const HttpRequest& request) {
         else if (action == "stop") result = api_.stop(id);
         else if (action == "arm") result = api_.arm(id);
         else if (action == "disarm") result = api_.disarm(id);
+        else if (action == "start-feed") result = api_.start_feed(id);
+        else if (action == "stop-feed") result = api_.stop_feed(id);
         else if (action == "destroy") result = api_.destroy(id);
         else return refusal(404, "unknown action " + action);
         return json_response(result.ok() ? 200 : 409, result_json(result, api_.revision()));

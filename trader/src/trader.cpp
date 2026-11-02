@@ -4,6 +4,7 @@
 #include <unistd.h>
 
 #include "cpm/oms/order_rules.hpp"
+#include "cpm/oms/pnl.hpp"
 
 #include <utility>
 
@@ -50,6 +51,37 @@ Trader::Trader(TraderOptions options, const cpm::strategy::StrategyRegistry& reg
                 hooks.cancel = [this](const cpm::oms::CancelOrder& request) {
                     orders_.record_cancel_sent(request);
                     return oe_.cancel(request);
+                };
+                hooks.order_finished = [this](const std::string& cl_ord_id) {
+                    const auto record = orders_.order(cl_ord_id);
+                    return record && record->terminal;
+                };
+                hooks.resting_orders = [this](const std::string& symbol) {
+                    // From the order manager rather than the strategy's own
+                    // two slots: anything of ours left on this instrument
+                    // counts, including what an earlier state left behind.
+                    std::vector<cpm::strategy::LiveLeg> out;
+                    for (const auto& order : orders_.open_orders()) {
+                        if (order.symbol != symbol || order.leaves_quantity <= 0) continue;
+                        cpm::strategy::LiveLeg leg;
+                        leg.side = order.side;
+                        leg.cl_ord_id = order.cl_ord_id;
+                        // Where it actually rests, which a post-only slide
+                        // moves away from what we asked for.
+                        leg.price = order.price;
+                        leg.quantity = order.leaves_quantity;
+                        leg.cancel_pending = order.cancel_pending;
+                        out.push_back(std::move(leg));
+                    }
+                    return out;
+                };
+                // Who sent what, for the record files. Called by the host
+                // just before the send it wraps.
+                hooks.attribute = [this](const std::string& cl_ord_id,
+                                         const std::string& strategy_id) {
+                    if (!records_) return;
+                    std::lock_guard lock(attribution_mutex_);
+                    attribution_[cl_ord_id] = strategy_id;
                 };
                 hooks.next_cl_ord_id = [this] {
                     const auto next = ++cl_ord_counter_;
@@ -111,6 +143,7 @@ Trader::Trader(TraderOptions options, const cpm::strategy::StrategyRegistry& reg
             request_halt(std::string("order entry: ") + to_string(halt.reason) + " - " + halt.detail);
         });
     orders_.on_anomaly(reconciler_->anomaly_handler());
+    orders_.on_applied([this](const cpm::oms::AppliedReport& applied) { record(applied); });
     oe_.on_session_event(reconciler_->session_callback());
 
     cpm::oms::OeCallbacks to_strategies;
@@ -158,9 +191,24 @@ Trader::Trader(TraderOptions options, const cpm::strategy::StrategyRegistry& reg
             view.bought = position.bought;
             view.sold = position.sold;
             view.cash = position.cash;
+            view.bought_value = position.bought_value;
+            view.sold_value = position.sold_value;
             view.fees = position.fees;
             view.fills = position.fills;
             view.settlement_payout = position.settlement_payout;
+            out.push_back(std::move(view));
+        }
+        return out;
+    };
+    env.pnl = [this] {
+        std::vector<PnlView> out;
+        for (const auto& marked : marked_positions()) {
+            PnlView view;
+            view.symbol = marked.position.symbol;
+            view.mark = marked.mark;
+            view.realized = marked.pnl.realized;
+            view.unrealized = marked.pnl.unrealized;
+            view.total = marked.pnl.total;
             out.push_back(std::move(view));
         }
         return out;
@@ -178,9 +226,10 @@ Trader::Trader(TraderOptions options, const cpm::strategy::StrategyRegistry& reg
         }
         if (!options_.rest.configured()) {
             out.error = series +
-                        " cannot be resolved: REST is not configured (creds-rest.env), and the "
+                        " cannot be resolved: REST is not configured (the CPM_REST_* set in "
+                        "config/creds.env), and the "
                         "lifecycle feed has not seen this series roll yet - it announces the "
-                        "next window, not the present one. Source creds-rest.env and restart "
+                        "next window, not the present one. Source config/creds.env and restart "
                         "the daemon, or name a full ticker";
             return out;
         }
@@ -369,7 +418,120 @@ void Trader::unsubscribe(const std::string& symbol) {
     subscriptions_.erase(it);
 }
 
+std::string Trader::strategy_of(const std::string& cl_ord_id) const {
+    std::lock_guard lock(attribution_mutex_);
+    const auto it = attribution_.find(cl_ord_id);
+    return it == attribution_.end() ? std::string() : it->second;
+}
+
+std::vector<Trader::MarkedPosition> Trader::marked_positions() const {
+    std::vector<MarkedPosition> out;
+    for (const auto& position : orders_.positions()) {
+        // The mid of the instrument's own book, which is the only honest
+        // mark here - and it is absent exactly when the book is one-sided,
+        // invalid, or gone because the window has closed and the instrument
+        // has been evicted. pnl_of() leaves the unrealized half unset in
+        // that case rather than calling it zero.
+        const auto mark = view_of(position.symbol).mid;
+        out.push_back(MarkedPosition{position, mark, cpm::oms::pnl_of(position, mark)});
+    }
+    return out;
+}
+
+void Trader::record_pnl(Clock::time_point now) {
+    if (!records_ || now - last_pnl_ < options_.pnl_every) return;
+    last_pnl_ = now;
+    for (const auto& marked : marked_positions()) {
+        records_->pnl_row(marked.position, marked.mark, marked.pnl);
+    }
+}
+
+void Trader::record_quotes() {
+    if (!records_ || !records_->quotes_enabled()) return;
+    std::map<std::string, std::string> seen;
+    for (const auto& strategy : host_.list()) {
+        cpm::oms::RecordLog::Quote quote;
+        quote.strategy_id = strategy.id;
+        quote.symbol = strategy.symbols.empty() ? strategy.target : strategy.symbols.front();
+        quote.state = to_string(strategy.state);
+        quote.armed = strategy.armed;
+        quote.reason = strategy.status.reason.empty() ? strategy.note : strategy.status.reason;
+        for (const auto& leg : strategy.status.legs) {
+            // What is actually resting, which a post-only slide moves away
+            // from what the strategy asked for.
+            if (leg.side == cpm::oms::Side::Buy) {
+                quote.bid = leg.price;
+                quote.bid_qty = leg.quantity;
+            } else {
+                quote.ask = leg.price;
+                quote.ask_qty = leg.quantity;
+            }
+        }
+        const auto book = view_of(quote.symbol);
+        quote.mid = book.mid;
+        if (const auto reference = reference_for(quote.symbol); reference.usable()) {
+            quote.reference_mid = cpm::format_scaled(reference.mid, cpm::binance::kScale);
+        }
+
+        // The decision, and not the context around it: the book's mid and
+        // the reference move constantly, and a row every time either ticked
+        // would be a row every pass saying the same thing about our quotes.
+        std::string decision = quote.state + (quote.armed ? "|armed|" : "|disarmed|") +
+                               (quote.bid ? cpm::format_price(*quote.bid) : "-") + "|" +
+                               (quote.bid_qty ? cpm::format_qty(*quote.bid_qty) : "-") + "|" +
+                               (quote.ask ? cpm::format_price(*quote.ask) : "-") + "|" +
+                               (quote.ask_qty ? cpm::format_qty(*quote.ask_qty) : "-") + "|" +
+                               quote.symbol + "|" + quote.reason;
+        const auto last = last_quote_.find(strategy.id);
+        if (last == last_quote_.end() || last->second != decision) records_->quote_row(quote);
+        seen.emplace(strategy.id, std::move(decision));
+    }
+    // A strategy that has been reaped takes its last decision with it, so
+    // the map is the size of what is running rather than of the day.
+    last_quote_.swap(seen);
+}
+
+void Trader::record(const cpm::oms::AppliedReport& applied) {
+    if (!records_) return;
+    const auto& order_id = applied.kind == cpm::oms::AppliedReport::Kind::CancelReject
+                               ? applied.reject.orig_cl_ord_id
+                               : applied.order.cl_ord_id;
+    // The order's own id, not the cancel's: a cancel's report names the
+    // cancel in ClOrdID (OE-O2), and it is the order that belongs to a
+    // strategy.
+    std::string strategy = strategy_of(order_id);
+    if (strategy.empty() && applied.kind == cpm::oms::AppliedReport::Kind::CancelReject) {
+        strategy = strategy_of(applied.reject.cl_ord_id);
+    }
+    records_->write(applied, strategy);
+
+    // Forget what is finished with, so the map stays the size of what is
+    // live rather than of the day.
+    std::lock_guard lock(attribution_mutex_);
+    if (applied.kind == cpm::oms::AppliedReport::Kind::Report) {
+        if (applied.order.terminal) attribution_.erase(applied.order.cl_ord_id);
+        // A cancel is answered once, by this report.
+        if (!applied.report.orig_cl_ord_id.empty()) attribution_.erase(applied.report.cl_ord_id);
+    } else {
+        attribution_.erase(applied.reject.cl_ord_id);
+    }
+}
+
 std::string Trader::start(std::chrono::milliseconds timeout) {
+    // Before the sessions: a report that arrives in the first millisecond
+    // belongs in the records like any other.
+    if (!options_.log_dir.empty()) {
+        records_ = std::make_unique<cpm::oms::RecordLog>(options_.log_dir, options_.quote_records);
+        if (const auto failed = records_->open_now(cpm::utc_stamp()); !failed.empty()) {
+            logger_.warn("no record files: " + failed);
+            records_.reset();
+        } else {
+            logger_.info("records " + records_->fills_path() + ", " + records_->orders_path() +
+                         " and " + records_->pnl_path() +
+                         (records_->quotes_enabled() ? ", quotes as well" : ""));
+        }
+    }
+
     // The reference feed first, so a strategy created a second later has a
     // price rather than a gap. It is optional: no symbols, no feed, and the
     // guard is simply off for every strategy (B-Q4 is about a feed that was
@@ -490,6 +652,10 @@ void Trader::tick(Clock::time_point now) {
     }
 
     roll_series(now);
+    // After the strategies have run and before the evictions: what is
+    // written is what this pass left behind.
+    record_quotes();
+    record_pnl(now);
 
     if (now - last_evict_ >= options_.evict_every) {
         last_evict_ = now;
@@ -507,6 +673,10 @@ void Trader::roll_series(Clock::time_point now) {
     if (host_.halted()) return;
     for (const auto& strategy : host_.list()) {
         if (strategy.target.empty()) continue;  // pinned to one instrument
+        // A row whose feed is stopped is watching nothing, and rolling it
+        // would subscribe the feed the operator has just stopped. It picks
+        // up whatever window is open when Start Feed is pressed.
+        if (!strategy.feed) continue;
         const auto window = series_.current(strategy.target, now);
         if (!window) continue;  // between windows, or the series has gone quiet
         if (!strategy.symbols.empty() && strategy.symbols.front() == window->symbol) continue;

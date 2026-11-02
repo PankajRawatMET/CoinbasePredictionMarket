@@ -1,8 +1,11 @@
-# Credentials - never commit. The sandbox/production API keys live in
-# creds.env (market data) and creds-oe.env (order entry), both chmod 600.
+# Credentials - never commit. The sandbox API key, secret and passphrase live
+# in config/creds.env (one file, one credential, three services), chmod 600.
 *.env
 # ...except the simulator settings, which are fake and belong in the project.
-!config/*.env
+# Named one by one, not config/*.env: a blanket negation would have made the
+# real credentials in config/ committable the moment they were put there.
+!config/sim.env
+!config/oe-sim.env
 
 # Build output
 build*/
@@ -18,8 +21,11 @@ log/
 store/
 
 # Client runtime state: the last ExecID / ClOrdID counter each app resumes
-# from (--bookmark).
+# from (--bookmark), and the sidecar the daemon flocks to keep a second
+# daemon off that state. The lock file is runtime, not configuration: it
+# holds nothing once the process that took it is gone.
 *-bookmark.txt
+*.lock
 
 # Editor and OS noise
 *.swp
@@ -33,6 +39,11 @@ core.*
 # Scratch / working area: the vendor API spec PDF, the project brief and the
 # throwaway logon probe. Local reference only, not part of the repo.
 Temp/
+
+# The design record and the vendor spec. Local reference only, like Temp/:
+# the documents are written for this machine and the spec PDF is the
+# vendor's to distribute, not ours.
+docs/
 
 # clangd's index, which comes along with compile_commands.json above.
 .cache/

@@ -3,7 +3,11 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <atomic>
+#include <cerrno>
 #include <cstdio>
+#include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -15,6 +19,27 @@ namespace {
 // when something has gone wrong at four in the morning.
 constexpr const char* kExecKey = "last_exec_id=";
 constexpr const char* kCounterKey = "cl_ord_counter=";
+
+// A temporary name no other write can be using. One fixed ".tmp" was shared by
+// every writer, and two saves at the same moment - an ExecutionReport on the
+// session's callback thread, a ClOrdID allocation on the strategy's - then
+// truncated each other's half-written file, so the loser's rename found nothing
+// to rename and the winner could carry a torn pair of lines into place.
+std::string temporary_name(const std::string& path) {
+    static std::atomic<std::uint64_t> sequence{0};
+    return path + ".tmp." + std::to_string(::getpid()) + "." +
+           std::to_string(sequence.fetch_add(1, std::memory_order_relaxed) + 1);
+}
+
+// The rename is only as durable as the directory entry that records it.
+void sync_directory(const std::string& path) {
+    const auto parent = std::filesystem::path(path).parent_path();
+    const std::string directory = parent.empty() ? "." : parent.string();
+    if (const int fd = ::open(directory.c_str(), O_RDONLY | O_DIRECTORY); fd >= 0) {
+        ::fsync(fd);
+        ::close(fd);
+    }
+}
 
 }  // namespace
 
@@ -46,10 +71,14 @@ std::optional<Bookmark> BookmarkFile::read() const {
 }
 
 void BookmarkFile::write(const Bookmark& bookmark) const {
-    const std::string temporary = path_ + ".tmp";
+    const std::string temporary = temporary_name(path_);
     {
+        errno = 0;
         std::ofstream out(temporary, std::ios::trunc);
-        if (!out.is_open()) throw std::runtime_error("cannot write bookmark " + temporary);
+        if (!out.is_open()) {
+            throw std::runtime_error("cannot write bookmark " + temporary + ": " +
+                                     std::strerror(errno));
+        }
         out << kExecKey << bookmark.last_exec_id << '\n'
             << kCounterKey << bookmark.cl_ord_counter << '\n';
         out.flush();
@@ -62,8 +91,13 @@ void BookmarkFile::write(const Bookmark& bookmark) const {
         ::close(fd);
     }
     if (std::rename(temporary.c_str(), path_.c_str()) != 0) {
-        throw std::runtime_error("cannot replace bookmark " + path_);
+        const int failure = errno;
+        // Leave no litter beside the bookmark for the next operator to puzzle over.
+        std::remove(temporary.c_str());
+        throw std::runtime_error("cannot replace bookmark " + path_ + ": " +
+                                 std::strerror(failure));
     }
+    sync_directory(path_);
 }
 
 }  // namespace cpm::oms

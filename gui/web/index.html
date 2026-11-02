@@ -184,11 +184,9 @@
   .logbody .WARN .lvl, .logbody .WARN { color: var(--warn); }
   .logbody .ERROR .lvl, .logbody .ERROR { color: var(--bad); }
   .logbody .empty { color: var(--dim); }
-  footer { color: var(--dim); padding: 0 16px 24px; max-width: 1400px; }
   .ladders { display: flex; flex-wrap: wrap; gap: 20px; align-items: flex-start; }
   .ladder { min-width: 330px; }
   .ladder .name { color: var(--ink); padding-bottom: 6px; }
-  .ladder .name small { color: var(--dim); }
   .ladder table { width: auto; min-width: 330px; }
   .ladder th { padding: 4px 8px; }
   .ladder td { padding: 2px 8px; border-bottom: 0; text-align: right; }
@@ -214,7 +212,6 @@
   .ladder td.off-grid { color: var(--warn); }
   .ladder td.unquotable { color: #5c6478; font-style: italic; }
   .ladder .name button { padding: 1px 8px; font-size: 11px; }
-  .ladder .foot { color: var(--dim); padding-top: 6px; }
   .modal {
     position: fixed; inset: 0; z-index: 10; padding: 16px;
     background: rgba(5, 7, 12, .72);
@@ -238,7 +235,6 @@
   /* Nothing on the page is current any more. Saying so in a banner is not
      enough while the numbers beside it still look alive. */
   body.stale main,
-  body.stale footer,
   body.stale .pill:not(#pill-stream) { opacity: .45; }
 </style>
 </head>
@@ -318,9 +314,17 @@
             <th class="num">net</th><th class="num">bought</th><th class="num">sold</th>
             <th class="num">cash</th><th class="num">fees</th><th class="num">fills</th>
             <th class="num">settlement</th>
+            <th class="num">mark</th><th class="num">realized</th>
+            <th class="num">unrealized</th><th class="num">P&amp;L</th>
           </tr>
         </thead>
         <tbody></tbody>
+        <tfoot>
+          <tr id="pnl-total">
+            <th colspan="8">total</th>
+            <th class="num"></th><th class="num"></th><th class="num"></th><th class="num"></th>
+          </tr>
+        </tfoot>
       </table>
       <p class="empty" id="positions-empty">Nothing filled.</p>
     </div>
@@ -336,7 +340,6 @@
   </section>
 </main>
 
-<footer id="limits"></footer>
 
 <script>
 (function () {
@@ -627,58 +630,95 @@
 
   function dirty(strategy) { return Object.keys(changedParams(strategy)).length > 0; }
 
-  // Five buttons: the three a blank row has (GUI-Q26), then Apply and Revert
-  // for the parameters typed into this row. Arm and Remove are still not
-  // here: Start arms, and nothing on this page destroys a strategy.
+  // Strategies that have been stopped and whose feed is still to go,
+  // id -> true. A stop is not instant: the host holds a strategy in
+  // `stopping` until its cancels come back, and the daemon refuses to drop
+  // the book they were quoting before then.
+  var closing = {};
+
+  // Drops the feed of each of those that has now stopped. Called as each
+  // snapshot lands. If this page is closed in between, the strategy is left
+  // stopped with its feed up, which is a state its own row can finish from.
+  function closeStopped() {
+    Object.keys(closing).forEach(function (id) {
+      var strategy = (snapshot.strategies || []).filter(function (row) {
+        return row.id === id;
+      })[0];
+      if (!strategy) { delete closing[id]; return; }   // already gone
+      // Halted counts: a halted strategy never reaches stopped, and its
+      // book should not be left subscribed because of that.
+      if (strategy.state !== 'stopped' && strategy.state !== 'halted') return;
+      // Dropped before the call, so the next snapshot does not send a second.
+      delete closing[id];
+      act('POST', '/api/strategies/' + encodeURIComponent(id) + '/stop-feed', undefined, true);
+    });
+  }
+
+  // Three buttons, the same three a blank row has (GUI-Q26). Arm is still not
+  // one of them: Start arms. Stop takes the feed with it, and the row stays
+  // where it is with its parameters: a stopped row is one Start Feed away
+  // from being watched again, and the x is what throws it away.
+  //
+  //   feed up, stopped    Start Feed off  |  Start on   |  Stop on
+  //   feed up, running    Start Feed off  |  Start off  |  Stop on
+  //   feed down           Start Feed on   |  Start off  |  Stop off  | x on
   function strategyActions(strategy) {
     var box = el('div', 'controls');
     var halted = snapshot.state === 'halted';
     var base = '/api/strategies/' + encodeURIComponent(strategy.id) + '/';
     var stopped = strategy.state === 'stopped';
+    // Nothing of ours is live on it, so its feed can go at once. A halted
+    // strategy never reaches stopped and must not be stuck holding a book.
+    var quiet = stopped || strategy.state === 'halted';
+    // Older daemons did not send it; a row with no answer has its feed.
+    var feedUp = strategy.feed !== false;
 
-    var feed = actionButton('Start Feed', '', false, function () {});
-    feed.title = strategy.id + ' already has its feed.';
+    var feed = actionButton('Start Feed', '', !feedUp && !halted, function () {
+      act('POST', base + 'start-feed');
+    });
+    feed.title = feedUp
+      ? strategy.id + ' already has its feed.'
+      : 'Subscribes the book for ' + strategy.id + ' again. It quotes nothing until Start.';
     box.appendChild(feed);
 
-    var start = actionButton('Start', '', stopped && !halted, function () {
+    var start = actionButton('Start', '', feedUp && stopped && !halted, function () {
       startQuoting(strategy.kind, strategy.series || strategy.symbols.join(', '),
                    strategy.params, strategy, null);
     });
-    if (!stopped) start.title = strategy.id + ' is already running.';
+    if (!feedUp) start.title = strategy.id + ' has no feed: start its feed first.';
+    else if (!stopped) start.title = strategy.id + ' is already running.';
     box.appendChild(start);
 
-    box.appendChild(actionButton('Stop', '', !stopped, function () {
+    // Stop means stop: the quotes come off and the feed goes with them. The
+    // daemon will not drop the book a strategy was quoting until its cancels
+    // are confirmed, so a running one is stopped here and its feed dropped by
+    // closeStopped() once it has gone quiet. A row that is already stopped
+    // has nothing to withdraw and loses its feed at once.
+    var stop = actionButton('Stop', '', feedUp && !closing[strategy.id], function () {
+      if (quiet) {
+        act('POST', base + 'stop-feed');
+        return;
+      }
+      closing[strategy.id] = true;
       act('POST', base + 'stop');
-    }));
-
-    // Both are always here, enabled or not, so the column does not change
-    // width when a row becomes dirty and shift every row's fields sideways.
-    var apply = actionButton('Apply', '', editable(strategy) && dirty(strategy), function () {
-      act('POST', base + 'params', { params: changedParams(strategy) })
-        .then(function (result) {
-          // Only on success: a refused edit stays in the boxes, where the
-          // operator can see what they typed next to the reason it was
-          // refused.
-          if (result && result.ok) {
-            delete edits[strategy.id];
-            render();
-          }
-        });
     });
-    apply.id = 'apply-' + strategy.id;
-    apply.title = !editable(strategy)
-      ? strategy.id + ' is armed: disarm it to change its parameters.'
-      : (dirty(strategy) ? 'Rebuilds ' + strategy.id + ' with these parameters.'
-                         : 'Nothing has been changed on this row.');
-    box.appendChild(apply);
+    stop.title = !feedUp
+      ? strategy.id + ' is stopped and has no feed.'
+      : (quiet
+          ? 'Stops the feed for ' + strategy.id + '. The row stays.'
+          : 'Withdraws the quotes, then stops the feed once the cancels are confirmed.');
+    box.appendChild(stop);
 
-    var revert = actionButton('Revert', '', dirty(strategy), function () {
-      delete edits[strategy.id];
-      render();
+    // Only on a row with nothing live behind it: no quotes, no feed. It is
+    // the same button a blank row has, and here it is the one call that
+    // removes a strategy.
+    var drop = actionButton('\u00d7', 'drop', !feedUp, function () {
+      act('POST', base + 'destroy');
     });
-    revert.id = 'revert-' + strategy.id;
-    revert.title = 'Puts back what the daemon is running with.';
-    box.appendChild(revert);
+    drop.title = feedUp
+      ? 'Stop ' + strategy.id + ' first; a row with a feed is not thrown away.'
+      : 'Removes ' + strategy.id + ' and this row.';
+    box.appendChild(drop);
     return box;
   }
 
@@ -695,16 +735,11 @@
     var specs = kind && kind.name === strategy.kind ? kind.params : [];
     var byName = {};
     specs.forEach(function (spec) { byName[spec.name] = spec; });
-    var open = editable(strategy);
-
-    // Enabling or disabling the two buttons as the boxes are typed into,
-    // without redrawing the row under the caret.
-    function refreshButtons() {
-      var apply = document.getElementById('apply-' + strategy.id);
-      var revert = document.getElementById('revert-' + strategy.id);
-      if (apply) apply.disabled = busy || !editable(strategy) || !dirty(strategy);
-      if (revert) revert.disabled = busy || !dirty(strategy);
-    }
+    // Read-only. With no Apply button there is nothing to send an edit with,
+    // and a box that accepts typing it can never act on is worse than one
+    // that does not. Retuning is `set ID name=value` on the daemon's stdin,
+    // or Stop and start a fresh row.
+    var open = false;
 
     function cell(value, classes, help, spec) {
       var holder = el('div', 'field ' + classes);
@@ -717,7 +752,6 @@
         input.addEventListener('input', function () {
           if (!edits[strategy.id]) edits[strategy.id] = {};
           edits[strategy.id][spec.name] = input.value.trim();
-          refreshButtons();
         });
       }
       if (help) input.title = help;
@@ -757,16 +791,17 @@
   // and did not say so would be the worst thing on this page.
   function strategyStatus(strategy) {
     var line = el('p', 'status');
-    line.appendChild(el('span', 'tag ' + strategy.state, strategy.state));
-    line.appendChild(el('span', 'tag ' + (strategy.armed ? 'armed' : ''),
-                        strategy.armed ? 'armed' : 'disarmed'));
-    var where = strategy.series ? strategy.series + ' · ' + strategy.symbols.join(', ')
-                                : strategy.symbols.join(', ');
-    line.appendChild(document.createTextNode(' ' + strategy.id + ' · ' + where));
-    // Why it is not acting, and why it last stopped: the two questions an
-    // operator asks of a strategy that is quoting nothing.
+    // The state and armed tags, the id, the series and the window are not
+    // here any more (2026-11-02): the row above says what this strategy is
+    // and what may be done to it, and repeating it underneath was a second
+    // place to read the same thing from.
+    //
+    // Why it is not acting, and why it last stopped, stay: they are the two
+    // questions an operator asks of a strategy that is quoting nothing, and
+    // a strategy that halted and did not say so would be the worst thing on
+    // this page (GUI-Q28). The line is empty while there is nothing wrong.
     var why = [strategy.reason, strategy.note].filter(Boolean).join(' · ');
-    if (why) line.appendChild(el('span', 'muted', ' · ' + why));
+    if (why) line.appendChild(el('span', 'muted', why));
     return line;
   }
 
@@ -776,8 +811,8 @@
   // the buttons flickering under the pointer.
   function rowsSignature() {
     return snapshot.strategies.map(function (strategy) {
-      return [strategy.id, strategy.kind, strategy.state, strategy.armed, strategy.series,
-              strategy.symbols.join(','), strategy.reason, strategy.note,
+      return [strategy.id, strategy.kind, strategy.state, strategy.armed, strategy.feed,
+              strategy.series, strategy.symbols.join(','), strategy.reason, strategy.note,
               JSON.stringify(strategy.params)].join('|');
     }).join('||') + '#' + snapshot.state + '#' + snapshot.allow_orders + '#' + busy;
   }
@@ -909,6 +944,13 @@
     return legs;
   }
 
+  // The hover text for one of our own rungs: who is quoting it, and whether
+  // the quote is on its way out. That last part used to be an asterisk on the
+  // size; it is the row's colour and this line now.
+  function ours(side, mine) {
+    return 'our ' + side + ': ' + mine.who.join(', ') + (mine.cancelling ? ' (cancelling)' : '');
+  }
+
   // What is on each rung right now, keyed by tick count.
   function rungState(book, legs) {
     var state = {};
@@ -959,9 +1001,12 @@
 
   function buildLadder(symbol, rungs) {
     var panel = el('div', 'ladder');
+    // The ticker and the centre button, and nothing else. What used to be
+    // written beside it - the grid, the rung count, the spread, the mid, and
+    // whether the book was valid or crossed - is all on Books, a column or a
+    // tag each, and a feed that is down is a pill in the header. A ladder is
+    // opened to look at the rungs.
     var name = el('div', 'name', symbol);
-    var note = el('small', null, '');
-    name.appendChild(note);
     var centre = el('button', '', 'centre');
     centre.type = 'button';
     name.appendChild(document.createTextNode(' '));
@@ -1002,7 +1047,7 @@
     scroll.appendChild(table);
     panel.appendChild(scroll);
 
-    var entry = { panel: panel, scroll: scroll, note: note, rows: rows, centred: false,
+    var entry = { panel: panel, scroll: scroll, rows: rows, centred: false,
                   signature: rungs.length + ':' + (rungs.length ? rungs[0].price_ticks : 0) };
     centre.addEventListener('click', function () { centreOn(entry, symbol); });
     return entry;
@@ -1084,24 +1129,17 @@
         if (!here.bid && !here.ask && !here.mineBid && !here.mineAsk) classes.push('quiet');
         row.line.className = classes.join(' ');
 
-        row.ourBid.textContent = here.mineBid
-          ? here.mineBid.sizes.join('+') + (here.mineBid.cancelling ? '*' : '') : '';
-        row.ourBid.title = here.mineBid ? 'our bid: ' + here.mineBid.who.join(', ') : '';
+        // The size alone. A quote whose cancel is in flight is already the
+        // warning colour (.ladder tr.cancelling), and a character that comes
+        // and goes on every re-quote is movement in the corner of the eye
+        // for something the colour has said.
+        row.ourBid.textContent = here.mineBid ? here.mineBid.sizes.join('+') : '';
+        row.ourBid.title = here.mineBid ? ours('bid', here.mineBid) : '';
         row.bid.textContent = here.bid ? here.bid.qty : '';
         row.ask.textContent = here.ask ? here.ask.qty : '';
-        row.ourAsk.textContent = here.mineAsk
-          ? here.mineAsk.sizes.join('+') + (here.mineAsk.cancelling ? '*' : '') : '';
-        row.ourAsk.title = here.mineAsk ? 'our ask: ' + here.mineAsk.who.join(', ') : '';
+        row.ourAsk.textContent = here.mineAsk ? here.mineAsk.sizes.join('+') : '';
+        row.ourAsk.title = here.mineAsk ? ours('ask', here.mineAsk) : '';
       });
-
-      clear(entry.note);
-      entry.note.appendChild(document.createTextNode(
-        '  ' + axis.structure + ' grid, ' + axis.rungs.length + ' rungs, 0-100%' +
-        (book.valid ? '' : '   no valid book') +
-        (book.crossed_or_locked ? '   CROSSED' : '') +
-        (snapshot.market_data.logged_on ? '' : '   feed down: last known') +
-        (book.spread ? '   spread ' + book.spread + '%' : '') +
-        (book.mid ? '   mid ' + book.mid + '%' : '')));
 
       // A hidden section has no height, so centring in it would scroll to
       // nowhere and never be tried again. The nav asks for it instead when
@@ -1141,8 +1179,29 @@
       cell(row, position.fees, 'num');
       cell(row, position.fills, 'num');
       cell(row, position.settlement_payout, 'num');
+      // The P&L rows come in the same order as the positions, but they are
+      // matched on the symbol rather than the index: a snapshot where one is
+      // shorter than the other should leave a dash, not shift a column.
+      var pnl = (snapshot.pnl || []).find(function (row) {
+        return row.symbol === position.symbol;
+      }) || {};
+      cell(row, pnl.mark, 'num');
+      cell(row, pnl.realized, 'num');
+      cell(row, pnl.unrealized, 'num');
+      cell(row, pnl.total, 'num');
       body.appendChild(row);
     });
+
+    // The daemon's own line. Its unrealized half is null as soon as one open
+    // position has no mark, and a dash is the honest rendering of that.
+    var totals = snapshot.pnl_total || {};
+    var foot = document.getElementById('pnl-total');
+    foot.hidden = snapshot.positions.length === 0;
+    var cells = foot.querySelectorAll('th.num');
+    cells[0].textContent = '';
+    cells[1].textContent = show(totals.realized);
+    cells[2].textContent = show(totals.unrealized);
+    cells[3].textContent = show(totals.total);
   }
 
   // ---- the blank rows the operator adds -----------------------------------
@@ -1154,10 +1213,12 @@
   // becomes a live strategy and the blank row goes, because the strategy's
   // own row is now there in its place.
   //
-  // Each row's three buttons are the daemon's verbs: Start Feed is create,
-  // which subscribes the book and quotes nothing; Start is create (if
-  // needed) then start then arm - it puts live orders in the market, which
-  // is why it asks first; Stop is stop, and leaves the feed up.
+  // Each row's buttons are the daemon's verbs: Start Feed is create on a
+  // blank row and start-feed on a row that has been stopped, and either way
+  // it subscribes the book and quotes nothing; Start is create (if needed)
+  // then start then arm - it puts live orders in the market, which is why it
+  // asks first; Stop is stop and then stop-feed, which leaves the row where
+  // it is with no feed; and the x on such a row is destroy.
   var drafts = [];
   var nextDraft = 1;
 
@@ -1563,14 +1624,11 @@
         'this process: stop the daemon, fix what caused this, and start a new one.'));
     }
 
-    var limits = snapshot.limits;
-    // Per order, not exposure: max_inventory is the only position cap and it
-    // is per strategy (GUI-Q10).
-    document.getElementById('limits').textContent =
-      'Session limits, shared by every strategy: at most ' + limits.max_quantity +
-      ' contracts and ' + limits.max_notional + ' notional per order, ' +
-      limits.max_orders_per_sec + ' orders/sec across the session' +
-      '  ·  revision ' + snapshot.revision;
+    // The session limits are not written on the page (2026-11-02). They are
+    // fixed for the life of the run, set on the command line, and the
+    // daemon logs them at startup; the Start dialog still names them, which
+    // is where an operator is actually deciding to send an order. They are
+    // still in the snapshot for anything scripted (GET /api/snapshot).
   }
 
   // A page nobody is looking at still has news: the counts sit in the nav so
@@ -1620,6 +1678,7 @@
 
     stream.addEventListener('snapshot', function (event) {
       snapshot = JSON.parse(event.data);
+      closeStopped();
       lastEventAt = Date.now();
       failedConnects = 0;
       document.body.className = '';

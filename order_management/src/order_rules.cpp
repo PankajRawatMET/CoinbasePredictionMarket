@@ -147,6 +147,14 @@ std::optional<std::string> check_mass_cancel(const MassCancel& request) {
     return std::nullopt;
 }
 
+bool exec_id_before(const std::string& a, const std::string& b) {
+    if (a == b) return false;
+    if (a.empty()) return true;
+    if (b.empty()) return false;
+    if (a.size() != b.size()) return a.size() < b.size();
+    return a < b;
+}
+
 std::string make_cl_ord_id(const std::string& prefix, std::uint64_t counter) {
     static constexpr char kDigits[] = "0123456789abcdefghijklmnopqrstuvwxyz";
     std::string suffix;

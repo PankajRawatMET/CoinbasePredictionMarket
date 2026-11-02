@@ -2,6 +2,7 @@
 // submit rule, the flatten-reconcile-halt sequence of OE-Q6, and settlement.
 #include "cpm/oms/bookmark.hpp"
 #include "cpm/oms/oe_client.hpp"
+#include "cpm/oms/order_rules.hpp"
 #include "cpm/oms/order_state.hpp"
 #include "cpm/oms/reconciler.hpp"
 #include "cpm/oms/sim/simulator.hpp"
@@ -21,6 +22,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -28,7 +30,12 @@ using namespace std::chrono_literals;
 using cpm::oms::Bookmark;
 using cpm::oms::BookmarkFile;
 using cpm::oms::CancelOrder;
+using cpm::oms::CancelReject;
+using cpm::oms::ExecType;
+using cpm::oms::ExecutionReport;
+using cpm::oms::Fill;
 using cpm::oms::Halt;
+using cpm::oms::OrdStatus;
 using cpm::oms::NewOrder;
 using cpm::oms::OrderState;
 using cpm::oms::OrderType;
@@ -85,6 +92,47 @@ TEST(BookmarkTest, RoundTripsAndStartsEmpty) {
     file.write({"480837843678134272", 43});
     EXPECT_EQ(file.read()->last_exec_id, "480837843678134272");
     EXPECT_FALSE(std::filesystem::exists(path + ".tmp"));
+    std::filesystem::remove(path);
+}
+
+// Two threads saving at once is the normal case once a strategy is armed: the
+// session thread bookmarks each ExecutionReport while the strategy thread
+// bookmarks each ClOrdID it allocates. Neither may fail, and neither may leave
+// a half-written file or a stray temporary behind.
+TEST(BookmarkTest, SurvivesConcurrentWriters) {
+    const auto path = temp_path("cpm-bookmark-race-");
+    std::filesystem::remove(path);
+    BookmarkFile file(path);
+
+    constexpr int kWriters = 4;
+    constexpr int kWrites = 200;
+    std::atomic<int> failures{0};
+    std::atomic<bool> go{false};
+    std::vector<std::thread> writers;
+    for (int writer = 0; writer < kWriters; ++writer) {
+        writers.emplace_back([&, writer] {
+            while (!go.load()) std::this_thread::yield();
+            for (int i = 0; i < kWrites; ++i) {
+                try {
+                    file.write({"4808377765944360" + std::to_string(writer) + std::to_string(i),
+                                static_cast<std::uint64_t>(i)});
+                } catch (const std::exception&) {
+                    ++failures;
+                }
+            }
+        });
+    }
+    go.store(true);
+    for (auto& thread : writers) thread.join();
+
+    EXPECT_EQ(failures.load(), 0) << "a concurrent save must not lose the bookmark";
+    // Whichever save landed last, the file is one whole version and parses.
+    EXPECT_NO_THROW(BookmarkFile(path).read());
+    for (const auto& entry :
+         std::filesystem::directory_iterator(std::filesystem::temp_directory_path())) {
+        EXPECT_EQ(entry.path().string().find(path + ".tmp"), std::string::npos)
+            << "left a temporary behind: " << entry.path();
+    }
     std::filesystem::remove(path);
 }
 
@@ -187,6 +235,150 @@ struct Rig {
     std::unique_ptr<cpm::oms::OeClient> client;
     std::unique_ptr<Reconciler> reconciler;
 };
+
+// ExecIDs are decimal integers carried as strings, so the newer of two is the
+// longer one, or the greater when they are the same length. Comparing them
+// lexically alone reads 9 as newer than 10, which is how a bookmark ahead of
+// the retention window came to look like one behind it.
+TEST(ExecIdOrder, OrdersByLengthThenValue) {
+    using cpm::oms::exec_id_before;
+    EXPECT_TRUE(exec_id_before("9", "10")) << "length first, or 9 reads as newer than 10";
+    EXPECT_FALSE(exec_id_before("10", "9"));
+    EXPECT_TRUE(exec_id_before("483656036197072901", "483656078886699010"));
+    EXPECT_FALSE(exec_id_before("483656078886699010", "483656036197072901"));
+    EXPECT_FALSE(exec_id_before("150", "150")) << "neither is before the other";
+    EXPECT_TRUE(exec_id_before("", "1")) << "nothing processed is older than anything";
+    EXPECT_FALSE(exec_id_before("1", ""));
+    EXPECT_FALSE(exec_id_before("", ""));
+}
+
+// A bookmark NEWER than anything the exchange still holds is the ordinary
+// state of affairs after a quiet spell: the retention window is up to 24
+// hours and not guaranteed, so our own events age out of it while the
+// bookmark keeps them. There is nothing to replay and nothing missing, and
+// the run must go live rather than stop. This halted a live run on
+// 2026-10-30T07:41:55Z.
+TEST(Recovery, ABookmarkNewerThanTheRetentionWindowIsNotAGap) {
+    // A bookmark left by an earlier run, as a restart would find it.
+    const auto path = temp_path("cpm-rec-ahead-");
+    std::filesystem::remove(path);
+    BookmarkFile(path).write({"483656078886699010", 3});
+
+    Rig rig("cpm-rec-ahead-");
+    ASSERT_TRUE(rig.client->wait_logged_on(5s)) << rig.client_log.str();
+    ASSERT_TRUE(eventually([&] { return rig.reconciler->state() != RecoveryState::Starting; }, 5s));
+
+    // F2 answers with an older ExecID than ours: everything we processed has
+    // aged out of the window. Driven directly, so the test does not depend on
+    // the simulator's own retention.
+    cpm::oms::LastExecId newest;
+    newest.exec_id = "483656036197072901";
+    rig.reconciler->callbacks().last_exec_id(newest);
+
+    EXPECT_EQ(rig.halt_count(), 0u) << "being ahead of the window stopped the run";
+    EXPECT_TRUE(eventually([&] { return rig.reconciler->state() == RecoveryState::Live; }, 5s))
+        << "it must go live: there is nothing to replay";
+    EXPECT_NE(rig.client_log.str().find("ahead of the exchange's retention window"),
+              std::string::npos)
+        << rig.client_log.str();
+    // And it asked for no replay, which is the request that was rejected.
+    EXPECT_EQ(rig.client_log.str().find("- replaying"), std::string::npos) << rig.client_log.str();
+}
+
+// And the backstop, for the window ageing past the bookmark between F2 and
+// F3: reason 2 is "your BeginExecID is past the newest stored event", which
+// is not data loss. Reason 1 - the bookmark predating the window - still is.
+TEST(Recovery, AResendRejectForBeingAheadDoesNotHaltButOneForBeingBehindDoes) {
+    Rig rig("cpm-rec-reject2-");
+    auto callbacks = rig.reconciler->callbacks();
+
+    cpm::oms::ResendReject ahead;
+    ahead.reason = 2;
+    ahead.text = "begin ExecID is after the last retained fill";
+    callbacks.resend_reject(ahead);
+    EXPECT_EQ(rig.halt_count(), 0u) << "nothing to replay is not data loss";
+
+    cpm::oms::ResendReject behind;
+    behind.reason = 1;
+    behind.text = "begin ExecID predates the retention window";
+    callbacks.resend_reject(behind);
+    ASSERT_TRUE(eventually([&] { return rig.halt_count() > 0; }, 5s));
+    EXPECT_EQ(rig.halt().value().reason, Halt::Reason::DataLoss);
+}
+
+// A cancel that lost a race with the fill it was chasing is not a fault, and
+// must not stop a live run. The order manager learns of a fill on the session
+// thread while a strategy's own view of its quotes waits for the next tick,
+// so a cancel for an order that has just finished does go out - and the
+// venue answers UNKNOWN_ORDER. This halted a live run on 2026-10-30.
+//
+// One session delivers in sequence, so the report that ended the order is
+// always applied before the reject for the cancel that was too late, which is
+// what makes the correlation the spec advises reliable.
+TEST(Recovery, ALateCancelForAFinishedOrderDoesNotHalt) {
+    Rig rig("cpm-rec-late-cancel-");
+    auto callbacks = rig.reconciler->callbacks();
+
+    rig.state.record_sent(rig.order("mm-1"));
+    ExecutionReport fill;
+    fill.cl_ord_id = "mm-1";
+    fill.exec_id = "480837776594436096";
+    fill.symbol = kSym;
+    fill.side = Side::Buy;
+    fill.exec_type = ExecType::Trade;
+    fill.status = OrdStatus::Filled;
+    fill.leaves_quantity = 0;
+    fill.cumulative_quantity = 100;
+    fill.fill = Fill{100, 400, "t1", false, 0};
+    rig.state.apply(fill);
+    ASSERT_TRUE(rig.state.order("mm-1")->terminal);
+
+    CancelReject late;
+    late.cl_ord_id = "mm-2";
+    late.orig_cl_ord_id = "mm-1";
+    late.order_id = "0";
+    late.reason = 1;  // UNKNOWN_ORDER, which is what this venue sends for a fill
+    late.text = "UNKNOWN_ORDER";
+    callbacks.cancel_reject(late);
+    EXPECT_EQ(rig.halt_count(), 0u) << "a cancel that was merely late stopped the run";
+    EXPECT_FALSE(rig.reconciler->halt().has_value());
+
+    // A reject for an order that is still live is a different thing: nothing
+    // explains it, so the run still stops (OE-Q6).
+    rig.state.record_sent(rig.order("mm-3"));
+    ExecutionReport resting;
+    resting.cl_ord_id = "mm-3";
+    resting.exec_id = "480837776594436097";
+    resting.symbol = kSym;
+    resting.side = Side::Buy;
+    resting.exec_type = ExecType::New;
+    resting.status = OrdStatus::New;
+    resting.leaves_quantity = 100;
+    rig.state.apply(resting);
+    ASSERT_FALSE(rig.state.order("mm-3")->terminal);
+
+    CancelReject unexplained = late;
+    unexplained.cl_ord_id = "mm-4";
+    unexplained.orig_cl_ord_id = "mm-3";
+    callbacks.cancel_reject(unexplained);
+    ASSERT_TRUE(eventually([&] { return rig.halt_count() > 0; }, 5s));
+    EXPECT_EQ(rig.halt().value().reason, Halt::Reason::Reject);
+    EXPECT_NE(rig.halt().value().detail.find("mm-3"), std::string::npos)
+        << "the halt must name the order, not only the cancel: " << rig.halt().value().detail;
+}
+
+// An order we have never heard of is not explained either.
+TEST(Recovery, ACancelRejectForAnUnknownOrderStillHalts) {
+    Rig rig("cpm-rec-unknown-cancel-");
+    CancelReject reject;
+    reject.cl_ord_id = "mm-9";
+    reject.orig_cl_ord_id = "mm-8";
+    reject.reason = 1;
+    reject.text = "UNKNOWN_ORDER";
+    rig.reconciler->callbacks().cancel_reject(reject);
+    ASSERT_TRUE(eventually([&] { return rig.halt_count() > 0; }, 5s));
+    EXPECT_EQ(rig.halt().value().reason, Halt::Reason::Reject);
+}
 
 // Nothing may be submitted until the session has been reconciled.
 TEST(Recovery, ReconcilesBeforeAllowingAnyOrder) {
@@ -367,14 +559,22 @@ TEST(Settlement, RecordsThePayoutAndChecksItAgainstOurFills) {
     EXPECT_EQ(rig.state.anomalies(), 0u);
 }
 
-// A settlement that disagrees with our fills means we missed one, which is
-// exactly the condition worth halting on.
-TEST(Settlement, AMismatchWithOurFillsIsAnAnomaly) {
+// A settlement that disagrees with fills we did see means we missed one,
+// which is exactly the condition worth halting on.
+TEST(Settlement, AMismatchWithFillsWeSawIsAMissedFill) {
     Rig rig("cpm-settle-bad-");
     ASSERT_TRUE(rig.client->wait_logged_on(5s)) << rig.client_log.str();
     ASSERT_TRUE(eventually([&] { return rig.reconciler->state() == RecoveryState::Live; }, 5s));
 
-    // We hold nothing, but the exchange settles 5 contracts long for us.
+    // One contract of ours, seen and recorded.
+    rig.state.record_sent(rig.order("buy", 600));
+    rig.client->send(rig.order("buy", 600));
+    ASSERT_TRUE(eventually([&] { return rig.state.position(kSym).has_value() &&
+                                        rig.state.position(kSym)->net == 100; }, 5s))
+        << rig.client_log.str();
+
+    // The exchange settles five. We traded this instrument here, so the four
+    // we cannot account for are fills that never reached us.
     rig.sim->settle(kSym, SettlementReport::Outcome::Yes, cpm::kPriceOne, 500, 0);
     ASSERT_TRUE(eventually([&] { return rig.state.anomalies() > 0; }, 5s)) << rig.client_log.str();
     EXPECT_TRUE(eventually([&] { return rig.halt_count() > 0; }, 5s));
@@ -382,6 +582,40 @@ TEST(Settlement, AMismatchWithOurFillsIsAnAnomaly) {
     ASSERT_TRUE(halt.has_value());
     EXPECT_EQ(halt->reason, Halt::Reason::Anomaly);
     EXPECT_NE(halt->detail.find("a fill was missed"), std::string::npos) << halt->detail;
+    EXPECT_NE(halt->detail.find("settled net 5 but our fills make 1"), std::string::npos)
+        << halt->detail;
+}
+
+// The same disagreement, but on an instrument this session never touched.
+// That is a restart past the exchange's replay window, not a missed fill,
+// and the operator reading the halt at 3am must be told which.
+TEST(Settlement, AMismatchOnAnInstrumentWeNeverTradedHereSaysItIsARestart) {
+    Rig rig("cpm-settle-restart-");
+    ASSERT_TRUE(rig.client->wait_logged_on(5s)) << rig.client_log.str();
+    ASSERT_TRUE(eventually([&] { return rig.reconciler->state() == RecoveryState::Live; }, 5s));
+
+    // No order sent, no fill seen: the position behind this settlement was
+    // built by a process that is gone.
+    rig.sim->settle(kSym, SettlementReport::Outcome::Yes, cpm::kPriceOne, 500, 0);
+    ASSERT_TRUE(eventually([&] { return rig.state.anomalies() > 0; }, 5s)) << rig.client_log.str();
+    const auto halt = rig.halt();
+    ASSERT_TRUE(halt.has_value());
+    EXPECT_NE(halt->detail.find("a restart, not a missed fill"), std::string::npos) << halt->detail;
+    EXPECT_EQ(halt->detail.find("a fill was missed"), std::string::npos) << halt->detail;
+}
+
+TEST(Settlement, AShortPositionIsReportedAsShortAndNotAsFlat) {
+    Rig rig("cpm-settle-short-");
+    ASSERT_TRUE(rig.client->wait_logged_on(5s)) << rig.client_log.str();
+    ASSERT_TRUE(eventually([&] { return rig.reconciler->state() == RecoveryState::Live; }, 5s));
+
+    // The exchange settles us short five. format_qty renders a negative as a
+    // flat 0, which would make the message disagree with itself.
+    rig.sim->settle(kSym, SettlementReport::Outcome::Yes, cpm::kPriceOne, 0, 500);
+    ASSERT_TRUE(eventually([&] { return rig.state.anomalies() > 0; }, 5s)) << rig.client_log.str();
+    const auto halt = rig.halt();
+    ASSERT_TRUE(halt.has_value());
+    EXPECT_NE(halt->detail.find("settled net -5"), std::string::npos) << halt->detail;
 }
 
 }  // namespace

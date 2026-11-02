@@ -52,6 +52,17 @@ std::optional<std::string> check_cl_ord_id(const std::string& cl_ord_id);
 // for 36^10 (about 3.6e15) orders.
 std::string make_cl_ord_id(const std::string& prefix, std::uint64_t counter);
 
+// Is ExecID `a` older than `b`? ExecIDs are decimal integers in one increasing
+// space, carried as strings because they are identifiers and not arithmetic
+// (OE-Q15), so they order by length first and then lexically. An empty id is
+// older than anything, which is "we have processed nothing".
+//
+// There is one of these rather than one per caller because the bookmark and
+// the gap check must agree about which of two ids is newer; when they did
+// not, a bookmark that was newer than the exchange's retention window read as
+// "behind" and asked for a replay that could not exist.
+bool exec_id_before(const std::string& a, const std::string& b);
+
 // Waits for a condition, polling. Used where a client has to wait for the
 // session or the reconciler before it may act.
 bool wait_for(const std::function<bool()>& ready, std::chrono::milliseconds timeout);

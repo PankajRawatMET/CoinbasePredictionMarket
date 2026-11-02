@@ -6,9 +6,8 @@
 #include <string>
 
 namespace cpm {
-namespace {
 
-const char* level_name(LogLevel level) {
+const char* to_string(LogLevel level) {
     switch (level) {
         case LogLevel::Debug: return "DEBUG";
         case LogLevel::Info: return "INFO ";
@@ -18,12 +17,12 @@ const char* level_name(LogLevel level) {
     return "?    ";
 }
 
-// 2026-10-23T05:41:10.414Z
-std::string utc_now() {
+std::string utc_stamp() { return utc_stamp(std::chrono::system_clock::now()); }
+
+std::string utc_stamp(std::chrono::system_clock::time_point when) {
     using namespace std::chrono;
-    const auto now = system_clock::now();
-    const auto ms = duration_cast<milliseconds>(now.time_since_epoch()).count() % 1000;
-    const std::time_t t = system_clock::to_time_t(now);
+    const auto ms = duration_cast<milliseconds>(when.time_since_epoch()).count() % 1000;
+    const std::time_t t = system_clock::to_time_t(when);
     std::tm tm{};
     gmtime_r(&t, &tm);
     char buf[64];  // 24 chars used; sized for the widest int values GCC can prove
@@ -32,22 +31,20 @@ std::string utc_now() {
     return buf;
 }
 
-}  // namespace
-
 Logger::Logger(std::ostream& out, LogLevel min_level) : out_(out), min_level_(min_level) {}
 
 void Logger::also_to(Sink sink) {
     std::lock_guard lock(mutex_);
-    sink_ = std::move(sink);
+    sinks_.push_back(std::move(sink));
 }
 
 void Logger::log(LogLevel level, std::string_view message, LogSource source) {
     if (level < min_level_) return;
-    const std::string stamp = utc_now();
+    const std::string stamp = utc_stamp();
     std::lock_guard lock(mutex_);
-    out_ << stamp << ' ' << level_name(level) << ' ' << message << '\n';
+    out_ << stamp << ' ' << to_string(level) << ' ' << message << '\n';
     out_.flush();
-    if (sink_) sink_(level, source, stamp, message);
+    for (const auto& sink : sinks_) sink(level, source, stamp, message);
 }
 
 }  // namespace cpm

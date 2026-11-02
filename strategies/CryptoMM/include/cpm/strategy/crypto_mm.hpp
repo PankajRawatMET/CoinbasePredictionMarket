@@ -12,8 +12,10 @@
 #include <vector>
 
 // CryptoMM: a two-sided quoting strategy. It quotes a bid and an ask a fixed
-// number of ticks either side of the mid, each for a fixed quantity, and
-// re-quotes when the target moves.
+// number of ticks apart around the mid, each for a fixed quantity, and
+// re-quotes when the target moves. Which of the two the mid's rounding
+// favours is the lean: the resting sizes, or the position once there is one.
+// See desired_quotes() below.
 //
 // It depends on both containers - the book from market_data, the order path
 // from order_management - and on neither of them depending on it.
@@ -33,12 +35,21 @@ using cpm::md::tick_at;
 
 struct Params {
     std::string symbol;
-    // How far either side of the mid to quote, in ticks (the "x").
-    int half_width_ticks = 2;
+    // The whole width of the market we make, in ticks: each side is quoted
+    // half of this away from the mid, so 2 is a two-tick-wide market. An odd
+    // width puts the pair on a half tick, which is what the rounding tilt
+    // below resolves - and it resolves it without ever widening us.
+    int spread_ticks = 4;
     // How much to show on each side (the "y"), in hundredths of a contract.
     Qty quantity = 100;
-    // Stop adding to a side once the net position reaches this, so the
-    // strategy cannot accumulate without limit. 0 disables the check.
+    // Stop the strategy once the net position reaches this, long or short,
+    // so it cannot accumulate without limit. 0 disables the check.
+    //
+    // It stops rather than quoting only the reducing side: a position at the
+    // limit is the operator's to decide about, and a strategy that went on
+    // working it off by itself would be making that decision for them. What
+    // it leaves behind is the position - nothing flattens it, and the row
+    // stays on the page with its feed up, saying why it stopped.
     Qty max_inventory = 500;
     TickStructure ticks = TickStructure::TaperedDeciCent;
     // Re-quote only when the target has moved at least this many ticks, so a
@@ -75,8 +86,18 @@ struct Quote {
 struct DesiredQuotes {
     std::optional<Quote> bid;
     std::optional<Quote> ask;
+    // The inventory limit has been reached, so this strategy is done: both
+    // sides come off and it stops itself, rather than quoting the one side
+    // that would reduce the position. Decided here with everything else, and
+    // acted on by on_market, which is the only thing that may touch a hook.
+    bool stop = false;
     // Why a side is absent, for the log. Empty when both sides are quoted.
     std::string reason;
+    // Which way the pair was rounded onto the grid, and what decided it
+    // ("position" or "qty imbalance"), for the log. Both quotes always round
+    // the same way, so this is one answer and not one per side.
+    bool rounded_up = false;
+    std::string round_reason;
 };
 
 // The whole decision, as a pure function of the book, the position and the
@@ -86,7 +107,30 @@ struct DesiredQuotes {
 // The mid comes from both sides of the YES book: the best YES bid and the YES
 // ask implied by the best NO bid (1.000 - best NO bid). Without both there is
 // no mid and nothing is quoted.
-DesiredQuotes desired_quotes(const InstrumentView& book, const Position& position, const Params& params);
+//
+// Both quotes are mid +/- half the spread, and both round the same way onto
+// the grid. Which way is the whole of the lean:
+//
+//   * past a third of the maximum position, the position decides - round down
+//     when long, so the ask lands on the offer and sells first; round up when
+//     short, so the bid lands on the bid and buys first;
+//   * otherwise the resting sizes decide - round up towards the heavier bid,
+//     down towards the heavier ask, and down on a tie.
+//
+// Rounding both prices the same way is what keeps the width exactly as
+// configured: rounding each away from the touch instead would widen us by a
+// tick whenever the mid fell between two of them.
+// `ours` is what this daemon has resting on the instrument. Those quantities
+// come off the book before the mid and the sizes are read: the touch we lean
+// on is the one other people are making. A level whose whole size is ours
+// stops being the touch, and if nothing of anyone else's is left on a side
+// there is no mid and nothing is quoted.
+//
+// The raw best bid and ask keep their own jobs - the crossed-book check and
+// the guard that never quotes through what is resting - because a post-only
+// order crosses our own orders exactly as it crosses anyone's.
+DesiredQuotes desired_quotes(const InstrumentView& book, const Position& position,
+                             const Params& params, const std::vector<LiveLeg>& ours = {});
 
 // Drives the desired quotes onto the venue: places what is missing, cancels
 // what has moved, and leaves alone what is still right. The venue has no

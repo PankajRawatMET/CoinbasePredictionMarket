@@ -11,6 +11,7 @@ namespace {
 using cpm::trader::BookView;
 using cpm::trader::KindView;
 using cpm::trader::LadderLevel;
+using cpm::trader::PnlView;
 using cpm::trader::PositionView;
 using cpm::trader::SessionView;
 using cpm::trader::Snapshot;
@@ -62,6 +63,10 @@ void write_strategy(JsonWriter& out, const StrategyInfo& strategy) {
     out.field("series", series_of(strategy));
     out.field("state", to_string(strategy.state));
     out.field("armed", strategy.armed);
+    // Whether its instrument is subscribed. A row whose feed is stopped
+    // keeps its place, its symbol and its parameters, and Start Feed is the
+    // only thing left that can be done to it.
+    out.field("feed", strategy.feed);
     out.field("note", strategy.note);
     out.field("reason", strategy.status.reason);
 
@@ -146,9 +151,26 @@ void write_position(JsonWriter& out, const PositionView& position) {
     out.field_qty("bought", position.bought);
     out.field_qty("sold", position.sold);
     out.field_scaled("cash", position.cash, kAmtScale);
+    out.field_scaled("bought_value", position.bought_value, kAmtScale);
+    out.field_scaled("sold_value", position.sold_value, kAmtScale);
     out.field_scaled("fees", position.fees, kAmtScale);
     out.field("fills", position.fills);
     out.field_scaled("settlement_payout", position.settlement_payout, kAmtScale);
+    out.object_end();
+}
+
+// P&L (GUI-Q15). The unrealized half and the total are null, not zero, when
+// there is no mark for an open position: the page shows a dash for them,
+// which is the difference between "flat" and "not known".
+void write_pnl(JsonWriter& out, const PnlView& pnl) {
+    out.object_begin();
+    out.field("symbol", pnl.symbol);
+    // The mark as a percentage, the same way every other price reaches the
+    // page.
+    out.field_percent("mark", pnl.mark);
+    out.field_scaled("realized", pnl.realized, kAmtScale);
+    out.field_scaled("unrealized", pnl.unrealized, kAmtScale);
+    out.field_scaled("total", pnl.total, kAmtScale);
     out.object_end();
 }
 
@@ -192,6 +214,15 @@ std::string snapshot_json(const Snapshot& snapshot) {
     out.key("positions").array_begin();
     for (const auto& position : snapshot.positions) write_position(out, position);
     out.array_end();
+
+    out.key("pnl").array_begin();
+    for (const auto& pnl : snapshot.pnl) write_pnl(out, pnl);
+    out.array_end();
+    out.key("pnl_total").object_begin();
+    out.field_scaled("realized", snapshot.pnl_total.realized, kAmtScale);
+    out.field_scaled("unrealized", snapshot.pnl_total.unrealized, kAmtScale);
+    out.field_scaled("total", snapshot.pnl_total.total, kAmtScale);
+    out.object_end();
 
     out.object_end();
     return out.take();

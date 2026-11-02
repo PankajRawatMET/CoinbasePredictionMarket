@@ -109,6 +109,11 @@ private:
     Logger& logger_;
     const HaltHandler on_halt_;
 
+    // Serialises save_bookmark. The file is written whole, so two threads
+    // saving at once must not interleave, and a save that started earlier must
+    // not land after a later one and put an older ClOrdID counter on disk.
+    std::mutex save_mutex_;
+
     mutable std::mutex mutex_;
     RecoveryState state_value_ = RecoveryState::Starting;
     std::optional<Halt> halt_;

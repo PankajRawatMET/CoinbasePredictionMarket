@@ -14,6 +14,12 @@ namespace cpm::oms {
 
 using Clock = std::chrono::system_clock;
 
+// For measuring how long the venue took to answer, and for nothing else.
+// Clock above is a wall clock that NTP can step, and a step mid-flight would
+// make a latency negative or absurd; this one cannot go backwards. It is
+// never written down as a time, only subtracted (docs/design-logs.md).
+using SteadyClock = std::chrono::steady_clock;
+
 // Side(54). Both values refer to the YES contract: there is no NO-side order
 // entry on FIX, so BUY_NO at P is submitted as SELL YES at 1.000 - P (OE-Q14).
 enum class Side { Buy, Sell };

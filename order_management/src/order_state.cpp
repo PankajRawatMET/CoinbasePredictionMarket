@@ -1,5 +1,7 @@
 #include "cpm/oms/order_state.hpp"
 
+#include "cpm/oms/order_rules.hpp"
+
 #include <algorithm>
 
 namespace cpm::oms {
@@ -54,6 +56,11 @@ void OrderState::on_anomaly(AnomalyHandler handler) {
     on_anomaly_ = std::move(handler);
 }
 
+void OrderState::on_applied(AppliedHandler handler) {
+    std::lock_guard lock(mutex_);
+    on_applied_ = std::move(handler);
+}
+
 OeCallbacks OrderState::callbacks() {
     OeCallbacks callbacks;
     callbacks.report = [this](const ExecutionReport& e) { apply(e); };
@@ -80,6 +87,8 @@ void OrderState::record_sent(const NewOrder& order) {
         record.leaves_quantity = order.quantity;
         record.created = Clock::now();
         record.updated = record.created;
+        // T0: the order is ours until this instant and the venue's after it.
+        record.sent = SteadyClock::now();
     }
     dispatch();
 }
@@ -97,7 +106,7 @@ void OrderState::record_cancel_sent(const CancelOrder& cancel) {
                 }
             }
         }
-        cancels_[cancel.cl_ord_id] = target;
+        cancels_[cancel.cl_ord_id] = SentCancel{target, SteadyClock::now()};
         const auto it = orders_.find(target);
         if (it != orders_.end()) {
             it->second.cancel_pending = true;
@@ -119,7 +128,7 @@ OrderRecord* OrderState::find(const ExecutionReport& report) {
     // A cancel we sent, whose target we recorded when we sent it.
     const auto cancel = cancels_.find(report.cl_ord_id);
     if (cancel != cancels_.end()) {
-        const auto target = orders_.find(cancel->second);
+        const auto target = orders_.find(cancel->second.order_cl_ord_id);
         if (target != orders_.end()) return &target->second;
     }
     // Finally by OrderID, for anything unsolicited.
@@ -153,10 +162,12 @@ void OrderState::apply_fill(OrderRecord& record, const ExecutionReport& report) 
     if (record.side == Side::Buy) {
         position.net += fill.quantity;
         position.bought += fill.quantity;
+        position.bought_value += notional;
         position.cash += notional;  // paid away
     } else {
         position.net -= fill.quantity;
         position.sold += fill.quantity;
+        position.sold_value += notional;
         position.cash -= notional;  // received
     }
     if (fill.fee) {
@@ -166,6 +177,9 @@ void OrderState::apply_fill(OrderRecord& record, const ExecutionReport& report) 
 }
 
 void OrderState::apply(const ExecutionReport& report) {
+    // T1, before the lock: the instant the answer reached this process, not
+    // the instant we got round to recording it.
+    const auto answered_at = SteadyClock::now();
     {
         std::lock_guard lock(mutex_);
         // Event Resend delivers the same events again, with the same ExecID
@@ -176,10 +190,7 @@ void OrderState::apply(const ExecutionReport& report) {
         }
         if (!report.exec_id.empty()) {
             // ExecIDs share one increasing space, so the newest is the bookmark.
-            if (last_exec_id_.empty() || report.exec_id.size() > last_exec_id_.size() ||
-                (report.exec_id.size() == last_exec_id_.size() && report.exec_id > last_exec_id_)) {
-                last_exec_id_ = report.exec_id;
-            }
+            if (exec_id_before(last_exec_id_, report.exec_id)) last_exec_id_ = report.exec_id;
         }
 
         OrderRecord* found = find(report);
@@ -258,29 +269,105 @@ void OrderState::apply(const ExecutionReport& report) {
             record.terminal = true;
             record.cancel_pending = false;
         }
+
+        // --- latency ------------------------------------------------------
+        // Only the first answer to something this session sent is a latency.
+        // An unsolicited cancel, an expiry at the bell and a copy replayed
+        // from a previous run are left empty rather than measured against an
+        // instant that means nothing (docs/design-logs.md section 3).
+        const auto since = [answered_at](SteadyClock::time_point sent) {
+            return std::chrono::duration_cast<std::chrono::microseconds>(answered_at - sent);
+        };
+        const bool we_sent_it = record.sent != SteadyClock::time_point{};
+        std::optional<std::chrono::microseconds> latency;
+        std::optional<std::chrono::microseconds> rested;
+        if (!report.replayed) {
+            switch (report.exec_type) {
+                case ExecType::PendingNew:
+                    // Taken, but held in the instrument's speed bump: not on
+                    // the book yet, so this is not the add.
+                    if (we_sent_it && !record.pending_latency) {
+                        record.pending_latency = since(record.sent);
+                        latency = record.pending_latency;
+                    }
+                    break;
+                case ExecType::New:
+                    // The add: resting on the book and matchable.
+                    if (we_sent_it && !record.ack_latency) {
+                        record.ack_latency = since(record.sent);
+                        latency = record.ack_latency;
+                    }
+                    if (record.rested == SteadyClock::time_point{}) record.rested = answered_at;
+                    break;
+                case ExecType::Rejected:
+                    if (we_sent_it) latency = since(record.sent);
+                    break;
+                case ExecType::Canceled: {
+                    // Ours only if we can name the cancel that asked for it:
+                    // the report names the cancel in ClOrdID (OE-O2).
+                    const auto cancel = cancels_.find(report.cl_ord_id);
+                    if (cancel != cancels_.end()) latency = since(cancel->second.sent);
+                    break;
+                }
+                case ExecType::Trade:
+                    if (record.rested != SteadyClock::time_point{}) rested = since(record.rested);
+                    break;
+                case ExecType::Expired:
+                case ExecType::Replaced:
+                case ExecType::PendingCancel:
+                case ExecType::Unknown:
+                    break;
+            }
+        }
+
+        if (on_applied_) {
+            AppliedReport applied;
+            applied.kind = AppliedReport::Kind::Report;
+            applied.report = report;
+            applied.order = record;
+            if (report.exec_type == ExecType::Trade) {
+                const auto position = positions_.find(record.symbol);
+                if (position != positions_.end()) applied.position = position->second;
+            }
+            applied.latency = latency;
+            applied.rested = rested;
+            applied_.push_back(std::move(applied));
+        }
     }
     dispatch();
 }
 
 void OrderState::apply(const CancelReject& reject) {
+    const auto answered_at = SteadyClock::now();
     {
         std::lock_guard lock(mutex_);
         std::string target;
         if (!reject.orig_cl_ord_id.empty()) target = reject.orig_cl_ord_id;
-        if (target.empty()) {
-            const auto it = cancels_.find(reject.cl_ord_id);
-            if (it != cancels_.end()) target = it->second;
-        }
+        const auto cancel = cancels_.find(reject.cl_ord_id);
+        if (target.empty() && cancel != cancels_.end()) target = cancel->second.order_cl_ord_id;
         const auto it = orders_.find(target);
-        if (it == orders_.end()) {
-            // A cancel for an order we never had, which is the gateway telling
-            // us the order is unknown to it either.
-            return;
+
+        if (on_applied_) {
+            AppliedReport applied;
+            applied.kind = AppliedReport::Kind::CancelReject;
+            applied.reject = reject;
+            // A cancel for an order we never had is the gateway telling us it
+            // does not know the order either: the row is written with no
+            // order behind it, because that is the fact worth keeping.
+            if (it != orders_.end()) applied.order = it->second;
+            if (cancel != cancels_.end()) {
+                applied.latency = std::chrono::duration_cast<std::chrono::microseconds>(
+                    answered_at - cancel->second.sent);
+            }
+            applied_.push_back(std::move(applied));
         }
+
         // The cancel did not take effect; the order is whatever it was.
-        it->second.cancel_pending = false;
-        it->second.pending_cancel_id.clear();
-        if (!reject.text.empty()) it->second.text = reject.text;
+        if (it != orders_.end()) {
+            it->second.cancel_pending = false;
+            it->second.pending_cancel_id.clear();
+            if (!reject.text.empty()) it->second.text = reject.text;
+        }
     }
     dispatch();
 }
@@ -330,9 +417,30 @@ void OrderState::apply(const SettlementReport& report) {
         if (report.net_aggregation) {
             const Qty settled_net = report.long_quantity - report.short_quantity;
             if (settled_net != position.net) {
+                // Which of the two it is. A session that sent no order and
+                // saw no fill on this instrument was not here when the
+                // position was built: that is a restart past the exchange's
+                // replay window (OE-Q7), after which nothing rebuilds a
+                // position, because none is persisted. Only a session that
+                // did trade it can have missed a fill, and telling the two
+                // apart is the difference between looking for a bug and
+                // remembering that the daemon was restarted.
+                const bool traded_here =
+                    position.fills > 0 ||
+                    std::any_of(orders_.begin(), orders_.end(), [&](const auto& entry) {
+                        return entry.second.symbol == report.symbol;
+                    });
+                // Signed: a short position is negative, and format_qty
+                // renders a negative as a flat 0 - which would make this
+                // message disagree with itself.
                 note(OrderAnomaly::Kind::PositionMismatch, {}, report.symbol,
-                     "settled net " + format_qty(settled_net) + " but our fills make " +
-                         format_qty(position.net) + " - a fill was missed");
+                     "settled net " + format_signed(settled_net, kQtyScale) +
+                         " but our fills make " + format_signed(position.net, kQtyScale) +
+                         (traded_here
+                              ? " - a fill was missed"
+                              : " - this session sent no order and saw no fill on it, so the "
+                                "position was built before it started: a restart, not a missed "
+                                "fill"));
             }
         }
     }
@@ -341,11 +449,20 @@ void OrderState::apply(const SettlementReport& report) {
 
 void OrderState::dispatch() {
     std::vector<OrderAnomaly> anomalies;
+    std::vector<AppliedReport> applied;
     AnomalyHandler handler;
+    AppliedHandler applied_handler;
     {
         std::lock_guard lock(mutex_);
         anomalies.swap(pending_);
+        applied.swap(applied_);
         handler = on_anomaly_;
+        applied_handler = on_applied_;
+    }
+    // The records first: an anomaly can halt the run, and the row that
+    // explains why has to be on disk before it does.
+    if (applied_handler) {
+        for (const auto& one : applied) applied_handler(one);
     }
     if (!handler) return;
     for (const auto& anomaly : anomalies) handler(anomaly);

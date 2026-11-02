@@ -55,7 +55,7 @@ Result ControlApi::create(const StrategySpec& spec) {
         if (!env_.resolve) {
             result.error = symbol->second +
                            " looks like a series, and this daemon cannot resolve one: REST is "
-                           "not configured (creds-rest.env)";
+                           "not configured (the CPM_REST_* set in config/creds.env)";
             return result;
         }
         const auto found = env_.resolve(symbol->second);
@@ -144,14 +144,113 @@ Result ControlApi::disarm(const std::string& id) {
     return result;
 }
 
+void ControlApi::drop_feed(const std::string& id, const std::vector<std::string>& symbols) {
+    if (!env_.unsubscribe) return;
+    const auto rows = host_.list();
+    for (const auto& symbol : symbols) {
+        const bool another_reads_it =
+            std::any_of(rows.begin(), rows.end(), [&](const StrategyInfo& row) {
+                return row.id != id && row.feed &&
+                       std::find(row.symbols.begin(), row.symbols.end(), symbol) !=
+                           row.symbols.end();
+            });
+        if (!another_reads_it) env_.unsubscribe(symbol);
+    }
+}
+
+Result ControlApi::stop_feed(const std::string& id) {
+    Result result;
+    const auto info = host_.info(id);
+    if (!info) {
+        result.error = "no such strategy: " + id;
+        return result;
+    }
+    if (!info->feed) {
+        result.error = id + " has no feed to stop";
+        return result;
+    }
+    if (info->state != cpm::strategy::RunState::Stopped &&
+        info->state != cpm::strategy::RunState::Halted) {
+        result.error = id + " is " + to_string(info->state) + "; stop it first";
+        return result;
+    }
+    if (const auto error = host_.set_feed(id, false); !error.empty()) {
+        result.error = error;
+        return result;
+    }
+    drop_feed(id, info->symbols);
+    result.id = id;
+    bump();
+    return result;
+}
+
+Result ControlApi::start_feed(const std::string& id) {
+    Result result;
+    const auto info = host_.info(id);
+    if (!info) {
+        result.error = "no such strategy: " + id;
+        return result;
+    }
+    if (info->feed) {
+        result.error = id + " already has its feed";
+        return result;
+    }
+
+    std::string symbol = info->symbols.empty() ? std::string() : info->symbols.front();
+    // A series row stopped for longer than a window is pointed at an
+    // instrument that has closed. Resolve the series again and move it,
+    // exactly as create does, rather than subscribing to a closed one.
+    if (!info->target.empty() && env_.resolve) {
+        const auto found = env_.resolve(info->target);
+        if (!found.error.empty()) {
+            result.error = found.error;
+            return result;
+        }
+        if (found.symbol != symbol) {
+            if (const auto error = host_.roll(id, found.symbol); !error.empty()) {
+                result.error = error;
+                return result;
+            }
+            symbol = found.symbol;
+        }
+    }
+
+    const auto moved = host_.info(id);
+    const auto symbols = moved ? moved->symbols : std::vector<std::string>{};
+    std::vector<std::string> subscribed;
+    for (const auto& name : symbols) {
+        std::string error;
+        if (!cpm::md::looks_like_instrument(name)) {
+            error = name + " is not an instrument - it looks like a series";
+        } else if (env_.subscribe) {
+            error = env_.subscribe(name);
+        }
+        if (!error.empty()) {
+            // Unwind: the row keeps no feed rather than half of one.
+            drop_feed(id, subscribed);
+            result.error = error;
+            return result;
+        }
+        subscribed.push_back(name);
+    }
+    if (const auto error = host_.set_feed(id, true); !error.empty()) {
+        drop_feed(id, subscribed);
+        result.error = error;
+        return result;
+    }
+    result.id = id;
+    bump();
+    return result;
+}
+
 Result ControlApi::destroy(const std::string& id) {
     // Read the symbols before it goes: afterwards there is nothing to ask.
     const auto info = host_.info(id);
     Result result{host_.destroy(id), {}};
     if (!result.ok()) return result;
-    if (info && env_.unsubscribe) {
-        for (const auto& symbol : info->symbols) env_.unsubscribe(symbol);
-    }
+    // A row whose feed was already stopped has nothing to drop, and the
+    // symbol it used to read may belong to another row by now.
+    if (info && info->feed) drop_feed(id, info->symbols);
     bump();
     return result;
 }
@@ -229,6 +328,26 @@ Snapshot ControlApi::snapshot() const {
     if (env_.recovery) out.recovery = env_.recovery();
     if (env_.reference) out.reference = env_.reference();
     if (env_.positions) out.positions = env_.positions();
+    if (env_.pnl) {
+        out.pnl = env_.pnl();
+        // Realized always sums. Unrealized only sums while every row has one:
+        // one unmarked position and the total is not known, which is a
+        // different thing from the total being smaller.
+        Amount unrealized = 0;
+        bool all_marked = true;
+        for (const auto& row : out.pnl) {
+            out.pnl_total.realized += row.realized;
+            if (row.unrealized) {
+                unrealized += *row.unrealized;
+            } else {
+                all_marked = false;
+            }
+        }
+        if (all_marked) {
+            out.pnl_total.unrealized = unrealized;
+            out.pnl_total.total = out.pnl_total.realized + unrealized;
+        }
+    }
     if (env_.limits) out.limits = env_.limits();
 
     // One book per symbol some strategy claims, in the order the strategies

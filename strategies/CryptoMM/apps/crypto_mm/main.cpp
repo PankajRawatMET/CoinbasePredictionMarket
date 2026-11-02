@@ -1,11 +1,11 @@
-// crypto_mm: quotes a bid and an ask a fixed number of ticks either side of the
+// crypto_mm: quotes a bid and an ask a fixed number of ticks apart around the
 // mid, each for a fixed quantity, on one instrument.
 //
 // It is the first binary that uses both services: the book comes from the
 // market data session and the orders go out on the order entry session, each
 // with its own credentials and its own endpoint guard.
 //
-//   source creds.env && source creds-oe.env
+//   source config/creds.env
 //   ./crypto_mm --symbol BTCD15M-... --width-ticks 2 --qty 1 --allow-orders
 //
 // Without --allow-orders it runs as a dry run: it computes and logs the quotes
@@ -190,6 +190,24 @@ int main(int argc, char** argv) {
         venue.cancel = [&](const cpm::oms::CancelOrder& request) {
             orders.record_cancel_sent(request);
             return oe.cancel(request);
+        };
+        venue.order_finished = [&](const std::string& cl_ord_id) {
+            const auto record = orders.order(cl_ord_id);
+            return record && record->terminal;
+        };
+        venue.resting_orders = [&](const std::string& symbol) {
+            std::vector<cpm::strategy::LiveLeg> out;
+            for (const auto& order : orders.open_orders()) {
+                if (order.symbol != symbol || order.leaves_quantity <= 0) continue;
+                cpm::strategy::LiveLeg leg;
+                leg.side = order.side;
+                leg.cl_ord_id = order.cl_ord_id;
+                leg.price = order.price;
+                leg.quantity = order.leaves_quantity;
+                leg.cancel_pending = order.cancel_pending;
+                out.push_back(std::move(leg));
+            }
+            return out;
         };
         venue.next_cl_ord_id = [&] {
             const auto next = ++counter;

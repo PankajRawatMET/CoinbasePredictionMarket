@@ -127,6 +127,8 @@ TEST(OrderStateTest, AccumulatesFillsIntoTheOrderAndThePosition) {
     EXPECT_EQ(position->fills, 2u);
     // Paid 40x0.500 + 60x0.510 plus fees.
     EXPECT_EQ(position->cash, 40 * 500 * 10 + 60 * 510 * 10 + 5060);
+    EXPECT_EQ(position->bought_value, 40 * 500 * 10 + 60 * 510 * 10) << "without the fees";
+    EXPECT_EQ(position->sold_value, 0);
     EXPECT_EQ(rig.state.anomalies(), 0u) << rig.first_anomaly();
 }
 
@@ -151,6 +153,12 @@ TEST(OrderStateTest, SellsSubtractFromThePosition) {
     EXPECT_EQ(position->fees, -1000) << "the rebate is received";
     // Paid 1.00 at 0.400, received 1.50 at 0.600, less the rebate.
     EXPECT_EQ(position->cash, 100 * 400 * 10 - 150 * 600 * 10 - 1000);
+    // And the two halves of it, kept apart and without the rebate in them,
+    // which is what an average cost needs (GUI-Q15).
+    EXPECT_EQ(position->bought_value, 100 * 400 * 10);
+    EXPECT_EQ(position->sold_value, 150 * 600 * 10);
+    EXPECT_EQ(position->cash, position->bought_value - position->sold_value + position->fees)
+        << "the invariant pnl_of() leans on";
 }
 
 // A cancel's report names the CANCEL in ClOrdID, with the order in

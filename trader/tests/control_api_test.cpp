@@ -75,6 +75,7 @@ struct Fixture {
         env.order_entry = [this] { return SessionView{oe_up, oe_up ? "" : "not connected"}; };
         env.recovery = [] { return std::string("live"); };
         env.positions = [this] { return positions; };
+        env.pnl = [this] { return pnl; };
         env.limits = [] {
             LimitsView limits;
             limits.allow_orders = true;
@@ -131,6 +132,7 @@ struct Fixture {
     std::vector<std::string> subscribed, unsubscribed, sent, cancelled, resolved;
     std::string resolve_error;
     std::vector<PositionView> positions;
+    std::vector<cpm::trader::PnlView> pnl;
     std::uint64_t counter = 0;
 };
 
@@ -288,6 +290,101 @@ TEST(ControlApi, ARunningStrategyCannotBeRemoved) {
     EXPECT_FALSE(result.ok());
     EXPECT_NE(result.error.find("stop it first"), std::string::npos);
     EXPECT_TRUE(f.unsubscribed.empty());
+}
+
+// --- Stop keeps the row, and takes the feed ------------------------------
+
+TEST(ControlApi, StoppingTheFeedKeepsTheRowAndEverythingOnIt) {
+    Fixture f;
+    const auto id = f.api->create(f.spec()).id;
+    ASSERT_TRUE(f.api->stop_feed(id).ok());
+
+    EXPECT_EQ(f.unsubscribed, std::vector<std::string>{kSym});
+    // The row is still there, with its kind, its symbol and its parameters:
+    // Start Feed is one call away, and nothing had to be typed again.
+    const auto rows = f.api->snapshot().strategies;
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(rows.front().id, id);
+    EXPECT_FALSE(rows.front().feed);
+    EXPECT_EQ(rows.front().symbols, std::vector<std::string>{kSym});
+    EXPECT_FALSE(rows.front().params.empty());
+}
+
+TEST(ControlApi, AStrategyWithNoFeedCannotStart) {
+    Fixture f;
+    const auto id = f.api->create(f.spec()).id;
+    ASSERT_TRUE(f.api->stop_feed(id).ok());
+
+    // The page disables the button; the rule itself lives in the daemon,
+    // because the stdin console calls the same verb.
+    const auto result = f.api->start(id);
+    EXPECT_FALSE(result.ok());
+    EXPECT_NE(result.error.find("start its feed first"), std::string::npos);
+    EXPECT_EQ(f.api->snapshot().strategies.front().state, cpm::strategy::RunState::Stopped);
+}
+
+TEST(ControlApi, StartingTheFeedAgainSubscribesAndLetsItStart) {
+    Fixture f;
+    const auto id = f.api->create(f.spec()).id;
+    ASSERT_TRUE(f.api->stop_feed(id).ok());
+    ASSERT_TRUE(f.api->start_feed(id).ok());
+
+    EXPECT_EQ(f.subscribed, (std::vector<std::string>{kSym, kSym}));
+    EXPECT_TRUE(f.api->snapshot().strategies.front().feed);
+    EXPECT_TRUE(f.api->start(id).ok()) << "with a book to read it may quote again";
+}
+
+TEST(ControlApi, AFeedIsNotStoppedWhileTheStrategyIsStillRunning) {
+    Fixture f;
+    const auto id = f.api->create(f.spec()).id;
+    ASSERT_TRUE(f.api->start(id).ok());
+
+    // The cancels have to be confirmed before the book they were quoting is
+    // dropped, which is the same rule destroy follows.
+    const auto result = f.api->stop_feed(id);
+    EXPECT_FALSE(result.ok());
+    EXPECT_NE(result.error.find("stop it first"), std::string::npos);
+    EXPECT_TRUE(f.unsubscribed.empty());
+    EXPECT_TRUE(f.api->snapshot().strategies.front().feed);
+}
+
+TEST(ControlApi, TheFeedIsNeitherStoppedTwiceNorStartedWhenItIsUp) {
+    Fixture f;
+    const auto id = f.api->create(f.spec()).id;
+    EXPECT_FALSE(f.api->start_feed(id).ok()) << "it already has one";
+    ASSERT_TRUE(f.api->stop_feed(id).ok());
+    const auto again = f.api->stop_feed(id);
+    EXPECT_FALSE(again.ok());
+    EXPECT_NE(again.error.find("no feed to stop"), std::string::npos);
+    EXPECT_EQ(f.unsubscribed.size(), 1u) << "and the second attempt dropped nothing";
+}
+
+TEST(ControlApi, RemovingARowWhoseFeedIsAlreadyStoppedDropsNothingMore) {
+    Fixture f;
+    const auto id = f.api->create(f.spec()).id;
+    ASSERT_TRUE(f.api->stop_feed(id).ok());
+    ASSERT_TRUE(f.api->destroy(id).ok());
+    // Unsubscribing is not ref-counted, and by now the symbol may belong to
+    // another row: a second unsubscribe would take its book away.
+    EXPECT_EQ(f.unsubscribed, std::vector<std::string>{kSym});
+    EXPECT_TRUE(f.api->snapshot().strategies.empty());
+}
+
+TEST(ControlApi, ARowWithNoFeedStillHoldsItsInstrument) {
+    Fixture f;
+    const auto first = f.api->create(f.spec()).id;
+    ASSERT_TRUE(f.api->stop_feed(first).ok());
+
+    // Unsubscribing is not ref-counted, so two rows on one instrument would
+    // make a stopped feed able to take a live row's book. They cannot
+    // happen: a stopped row goes on holding its instrument, and the second
+    // create is refused the way it was before it was stopped. The operator
+    // throws the row away (x) or starts its feed again.
+    const auto second = f.api->create(f.spec());
+    EXPECT_FALSE(second.ok());
+    EXPECT_NE(second.error.find("already"), std::string::npos) << second.error;
+    EXPECT_EQ(f.api->snapshot().strategies.size(), 1u);
+    EXPECT_EQ(f.unsubscribed, std::vector<std::string>{kSym}) << "and nothing was dropped twice";
 }
 
 // --- the lifecycle an operator drives -------------------------------------
@@ -449,6 +546,29 @@ TEST(ControlApi, RetunesAStrategyThatIsNotArmedAndMovesNoSubscription) {
     EXPECT_TRUE(f.unsubscribed.empty());
 }
 
+// The daemon's P&L line (GUI-Q15). Realized always adds up; unrealized stops
+// adding up the moment one open position has no mark, because a sum missing a
+// term reads as a smaller number rather than an unknown one.
+TEST(ControlApi, TotalsThePnlAndRefusesToTotalAnUnmarkedOne) {
+    Fixture f;
+    f.pnl.push_back(cpm::trader::PnlView{"A", 550, 30000, 20000, 50000});
+    f.pnl.push_back(cpm::trader::PnlView{"B", 400, 10000, -5000, 5000});
+
+    auto snapshot = f.api->snapshot();
+    EXPECT_EQ(snapshot.pnl.size(), 2u);
+    EXPECT_EQ(snapshot.pnl_total.realized, 40000);
+    EXPECT_EQ(snapshot.pnl_total.unrealized, 15000);
+    EXPECT_EQ(snapshot.pnl_total.total, 55000);
+
+    // One unmarked position, and the two halves part company: realized is
+    // still exact, the rest is not known.
+    f.pnl.push_back(cpm::trader::PnlView{"C", std::nullopt, 7000, std::nullopt, std::nullopt});
+    snapshot = f.api->snapshot();
+    EXPECT_EQ(snapshot.pnl_total.realized, 47000);
+    EXPECT_FALSE(snapshot.pnl_total.unrealized.has_value());
+    EXPECT_FALSE(snapshot.pnl_total.total.has_value());
+}
+
 TEST(ControlApi, RetuningAnArmedStrategyIsRefusedAsAValue) {
     Fixture f;
     const auto created = f.api->create(f.spec());
@@ -458,7 +578,7 @@ TEST(ControlApi, RetuningAnArmedStrategyIsRefusedAsAValue) {
     const auto result = f.api->update(created.id, {{"width-ticks", "3"}});
     EXPECT_FALSE(result.ok());
     EXPECT_NE(result.error.find("disarm it"), std::string::npos) << result.error;
-    EXPECT_EQ(f.api->snapshot().strategies.at(0).params.at("width-ticks"), "2")
+    EXPECT_EQ(f.api->snapshot().strategies.at(0).params.at("width-ticks"), "4")
         << "the schema's default, unchanged";
 }
 
