@@ -20,6 +20,12 @@ CMakeUserPresets.json
 log/
 store/
 
+# The daemon's own output: a directory per UTC day under --log-dir, holding
+# the narrative, the wire traffic and the record CSVs. A trading day's
+# record, not source - and the fills, orders and P&L in it are nobody's
+# business but the operator's.
+logs/
+
 # Client runtime state: the last ExecID / ClOrdID counter each app resumes
 # from (--bookmark), and the sidecar the daemon flocks to keep a second
 # daemon off that state. The lock file is runtime, not configuration: it
