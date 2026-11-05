@@ -156,6 +156,12 @@ void write_position(JsonWriter& out, const PositionView& position) {
     out.field_scaled("fees", position.fees, kAmtScale);
     out.field("fills", position.fills);
     out.field_scaled("settlement_payout", position.settlement_payout, kAmtScale);
+    // Exiting it (G13). `exit_refusal` is the empty string exactly when the
+    // button may be pressed, so the page never has to decide for itself.
+    out.field("status", position.status);
+    out.field_percent("exit_price", position.exit_price);
+    out.field_qty("exit_available", position.exit_available);
+    out.field("exit_refusal", position.exit_refusal);
     out.object_end();
 }
 

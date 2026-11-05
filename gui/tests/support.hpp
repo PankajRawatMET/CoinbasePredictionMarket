@@ -102,7 +102,7 @@ struct Daemon {
             view.best_no_bid_qty = 500;
             view.mid = 550;
             view.spread = 100;
-            view.status = "open";
+            view.status = "Open";  // as cpm::md::to_string spells it
             // The same book as a ladder: YES bids as they are, NO bids turned
             // into the YES asks they imply (Q9), both best first.
             view.bids = {{500, 500, 500}, {490, 700, 490}, {480, 900, 480}};
@@ -118,6 +118,13 @@ struct Daemon {
         };
         env.subscribe = [](const std::string&) { return std::string(); };
         env.unsubscribe = [](const std::string&) {};
+        // The operator's own order path (G13).
+        env.can_submit = [this] { return gate_open; };
+        env.next_cl_ord_id = [this] { return "ex-" + std::to_string(++counter); };
+        env.send_order = [this](const cpm::oms::NewOrder& order) {
+            exits.push_back(order);
+            return send_error;
+        };
 
         api = std::make_unique<ControlApi>(*host, registry, std::move(env), true);
     }
@@ -130,6 +137,11 @@ struct Daemon {
     std::vector<PositionView> positions;
     std::vector<cpm::trader::PnlView> pnl;
     std::uint64_t counter = 0;
+    // The operator's exits: what was sent, whether the gate is open, and the
+    // refusal the order path hands back (G13).
+    std::vector<cpm::oms::NewOrder> exits;
+    bool gate_open = true;
+    std::string send_error;
 };
 
 // The smallest HTTP client that can hold a stream open: blocking, with a

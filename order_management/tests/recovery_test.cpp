@@ -403,6 +403,78 @@ TEST(Recovery, ReconcilesBeforeAllowingAnyOrder) {
 }
 
 // OE-Q6: a reject flattens, reconciles and halts, and never resumes.
+// A quote the close caught in flight. OrdRejReason 44 on an instrument whose
+// window has ended is a race we lost, not a loss of track: the order never
+// existed, and the venue has already cancelled whatever rested on the window
+// it closed. The daemon already forgives the late CANCEL for the same order
+// in the same quarter second (2026-11-04); this makes the two agree.
+TEST(Recovery, ARejectAfterTheWindowHasEndedDoesNotHalt) {
+    Reconciler::Options options;
+    options.window_has_ended = [](const std::string&) { return true; };
+    Rig rig("cpm-rec-late-", options);
+    ASSERT_TRUE(rig.client->wait_logged_on(5s)) << rig.client_log.str();
+    ASSERT_TRUE(eventually([&] { return rig.reconciler->state() == RecoveryState::Live; }, 5s));
+
+    cpm::oms::ExecutionReport report;
+    report.cl_ord_id = "o1";
+    report.symbol = kSym;
+    report.exec_type = cpm::oms::ExecType::Rejected;
+    report.status = cpm::oms::OrdStatus::Rejected;
+    report.reject_reason = 44;
+    report.text = "INSTRUMENT_NOT_ACTIVE - instrument status=CLOSED, must be OPEN";
+    rig.reconciler->callbacks().report(report);
+
+    EXPECT_EQ(rig.halt_count(), 0u) << "a late order halted the run";
+    EXPECT_TRUE(rig.reconciler->submission_allowed());
+    EXPECT_NE(rig.client_log.str().find("late, not wrong"), std::string::npos)
+        << rig.client_log.str();
+}
+
+// Narrow on purpose: the same reject on a window that is still trading means
+// the daemon is wrong about what is live, and that still stops everything.
+TEST(Recovery, ARejectOnALiveWindowStillHaltsWhateverTheReason) {
+    Reconciler::Options options;
+    options.window_has_ended = [](const std::string&) { return false; };
+    Rig rig("cpm-rec-live-", options);
+    ASSERT_TRUE(rig.client->wait_logged_on(5s)) << rig.client_log.str();
+    ASSERT_TRUE(eventually([&] { return rig.reconciler->state() == RecoveryState::Live; }, 5s));
+
+    cpm::oms::ExecutionReport report;
+    report.cl_ord_id = "o1";
+    report.symbol = kSym;
+    report.exec_type = cpm::oms::ExecType::Rejected;
+    report.status = cpm::oms::OrdStatus::Rejected;
+    report.reject_reason = 44;
+    report.text = "INSTRUMENT_NOT_ACTIVE";
+    rig.reconciler->callbacks().report(report);
+
+    EXPECT_GT(rig.halt_count(), 0u);
+    EXPECT_EQ(rig.halt()->reason, Halt::Reason::Reject);
+    EXPECT_FALSE(rig.reconciler->submission_allowed());
+}
+
+// And a reject with any other reason halts even after the window has gone:
+// only 44 is the close, and everything else is still unexplained.
+TEST(Recovery, AnotherReasonAfterTheWindowEndsStillHalts) {
+    Reconciler::Options options;
+    options.window_has_ended = [](const std::string&) { return true; };
+    Rig rig("cpm-rec-other-", options);
+    ASSERT_TRUE(rig.client->wait_logged_on(5s)) << rig.client_log.str();
+    ASSERT_TRUE(eventually([&] { return rig.reconciler->state() == RecoveryState::Live; }, 5s));
+
+    cpm::oms::ExecutionReport report;
+    report.cl_ord_id = "o1";
+    report.symbol = kSym;
+    report.exec_type = cpm::oms::ExecType::Rejected;
+    report.status = cpm::oms::OrdStatus::Rejected;
+    report.reject_reason = 25;
+    report.text = "INSUFFICIENT_BALANCE";
+    rig.reconciler->callbacks().report(report);
+
+    EXPECT_GT(rig.halt_count(), 0u);
+    EXPECT_NE(rig.halt()->detail.find("INSUFFICIENT_BALANCE"), std::string::npos);
+}
+
 TEST(Recovery, ARejectFlattensAndHalts) {
     Rig rig("cpm-rec-reject-");
     ASSERT_TRUE(rig.client->wait_logged_on(5s)) << rig.client_log.str();

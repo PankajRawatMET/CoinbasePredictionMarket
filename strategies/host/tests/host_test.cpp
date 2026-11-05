@@ -2,6 +2,8 @@
 // and the report queue that keeps a strategy single-threaded.
 #include "cpm/strategy/host.hpp"
 
+#include "cpm/md/ticker.hpp"
+
 #include <gtest/gtest.h>
 
 #include <map>
@@ -48,7 +50,19 @@ public:
     void withdraw(const std::string& why) override { withdrawals.push_back(why); }
     void abandon(const std::string& why) override { abandonments.push_back(why); }
     bool quiescent() const override { return !resting; }
-    std::vector<std::string> symbols() const override { return {symbol_}; }
+    // A comma splits one parameter into two legs, which is how a test asks
+    // for a strategy on more than one symbol.
+    std::vector<std::string> symbols() const override {
+        std::vector<std::string> out;
+        std::size_t at = 0;
+        while (at <= symbol_.size()) {
+            const auto comma = symbol_.find(',', at);
+            out.push_back(symbol_.substr(at, comma == std::string::npos ? comma : comma - at));
+            if (comma == std::string::npos) break;
+            at = comma + 1;
+        }
+        return out;
+    }
     StrategyStatus status() const override {
         StrategyStatus status;
         status.passes = passes;
@@ -63,6 +77,11 @@ public:
         cpm::oms::NewOrder order;
         order.cl_ord_id = cl_ord_id;
         return hooks_.send ? hooks_.send(order) : std::string();
+    }
+    // Commentary, through the hook the host handed it: the strategy says
+    // what it decided and nothing about itself.
+    void say(const std::string& line) {
+        if (hooks_.log) hooks_.log(line);
     }
     bool pull(const std::string& cl_ord_id) {
         cpm::oms::CancelOrder request;
@@ -116,7 +135,7 @@ struct Fixture {
         venue.attribute = [this](const std::string& cl_ord_id, const std::string& strategy_id) {
             attributed[cl_ord_id] = strategy_id;
         };
-        venue.log = [](const std::string&) {};
+        venue.log = [this](const std::string& line) { logs.push_back(line); };
 
         StrategyHost::Feeds feeds;
         feeds.book = [this](const std::string& symbol) -> std::optional<InstrumentView> {
@@ -178,6 +197,8 @@ struct Fixture {
     std::uint64_t counter = 0;
     // ClOrdID -> the strategy the host said it came from.
     std::map<std::string, std::string> attributed;
+    // Every line a strategy logged, as the daemon would have received it.
+    std::vector<std::string> logs;
 };
 
 // --- attribution ----------------------------------------------------------
@@ -218,6 +239,52 @@ TEST(Attribution, StillSendsWhenNobodyIsAttributing) {
     ASSERT_EQ(f.fakes.size(), 1u);
     EXPECT_EQ(f.fakes[0]->place("mm-1"), "sent");
     EXPECT_TRUE(f.attributed.empty());
+}
+
+// --- the tag on a strategy's own commentary --------------------------------
+
+TEST(StrategyLog, SaysWhichStrategyAndInstrumentALineIsAbout) {
+    Fixture f;
+    const auto id = f.live();
+    ASSERT_EQ(f.fakes.size(), 1u);
+
+    // The strategy writes what it decided; the host says whose decision it
+    // was. One file holds every series, so without this a line about
+    // ...-HOM and a line about ...-AWY are indistinguishable.
+    f.fakes[0]->say("market 0.51 / 0.52, mid 0.515 -> quoting 0.51 / 0.53");
+    ASSERT_EQ(f.logs.size(), 1u);
+    EXPECT_EQ(f.logs[0], "[" + id + " " + kSym +
+                             "] market 0.51 / 0.52, mid 0.515 -> quoting 0.51 / 0.53");
+}
+
+TEST(StrategyLog, TheTagFollowsARoll) {
+    Fixture f;
+    std::string id;
+    ASSERT_EQ(f.host->create(StrategySpec{"Fake", {{"symbol", kSym}}}, id, "26NOV01HOMAWY"), "");
+    ASSERT_EQ(f.fakes.size(), 1u);
+    f.fakes[0]->say("quoting 0.51 / 0.53");
+
+    // A new window is a new instance on the same row, so the tag cannot be
+    // decided once and kept: it is read when the line is written.
+    ASSERT_EQ(f.host->roll(id, kOther), "");
+    ASSERT_EQ(f.fakes.size(), 2u);
+    f.fakes[1]->say("quoting 0.47 / 0.49");
+
+    ASSERT_EQ(f.logs.size(), 2u);
+    EXPECT_EQ(f.logs[0], "[" + id + " " + kSym + "] quoting 0.51 / 0.53");
+    EXPECT_EQ(f.logs[1], "[" + id + " " + kOther + "] quoting 0.47 / 0.49");
+}
+
+TEST(StrategyLog, NamesOnlyTheStrategyWhenItQuotesMoreThanOneSymbol) {
+    Fixture f;
+    // Two legs: the hook carries a line and not what it was about, so a
+    // symbol here would be a guess. The strategy says which leg itself.
+    const auto id = f.live(kSym + "," + kOther);
+    ASSERT_EQ(f.fakes.size(), 1u);
+
+    f.fakes[0]->say("withdrawing both quotes: reference is stale");
+    ASSERT_EQ(f.logs.size(), 1u);
+    EXPECT_EQ(f.logs[0], "[" + id + "] withdrawing both quotes: reference is stale");
 }
 
 // --- a strategy that stops itself -----------------------------------------
@@ -681,6 +748,45 @@ TEST(Host, NoBookMeansNoPassAndAnExplanation) {
 
     f.host->tick(start + f.options.book_warn_after);
     EXPECT_NE(f.host->info(id)->note.find("no book for " + kSym), std::string::npos);
+}
+
+// The instrument's own name says when it stops trading, and that is the one
+// fact about the close that needs nothing to arrive. On 2026-11-04 a strategy
+// quoted for 475 ms past the bell: the lifecycle feed had not delivered
+// Closed, the book still read 0.51/0.52, and the third order sent in that gap
+// came back INSTRUMENT_NOT_ACTIVE and halted the daemon.
+TEST(Host, AStrategyIsNotDrivenPastItsWindowsEndWhateverTheFeedSays) {
+    Fixture f;
+    // A dated window, so its end can be read out of its name.
+    const std::string window = "BTCD15M-BTC26NOV040800-0";
+    const auto id = f.live(window);
+    // Everything the daemon could otherwise go on still says "trade me".
+    f.status = LifecycleStatus::Open;
+
+    const auto ends = *cpm::md::parse_ticker(window);
+    f.host->tick(ends.window_end - std::chrono::seconds(1));
+    EXPECT_EQ(f.fakes.at(0)->passes, 1u) << "a second before the close it still quotes";
+
+    f.host->tick(ends.window_end);
+    f.host->tick(ends.window_end + std::chrono::milliseconds(500));
+    EXPECT_EQ(f.fakes.at(0)->passes, 1u) << "it was driven past the end of its window";
+    // Abandoned, not withdrawn: the venue has already cancelled what rested
+    // on the window it closed, and a cancel racing that one halts.
+    EXPECT_EQ(f.fakes.at(0)->abandonments.size(), 1u);
+    EXPECT_TRUE(f.fakes.at(0)->withdrawals.empty());
+    EXPECT_NE(f.host->info(id)->note.find("window has ended"), std::string::npos)
+        << f.host->info(id)->note;
+}
+
+// A name with no scheduled end - a sports market, a simulator instrument -
+// has nothing to read, and is left to the lifecycle status alone.
+TEST(Host, AnInstrumentWithNoScheduledEndIsUnaffectedByTheClock) {
+    Fixture f;
+    f.live();  // kSym: SIMOE-26NOV01HOMAWY-HOM, which parse_ticker cannot take apart
+    f.host->tick(Clock::now());
+    f.host->tick(Clock::now() + std::chrono::hours(24));
+    EXPECT_EQ(f.fakes.at(0)->passes, 2u);
+    EXPECT_TRUE(f.fakes.at(0)->abandonments.empty());
 }
 
 TEST(Host, AnInstrumentThatHasStoppedTradingIsAbandonedOnceAndNeverCancelled) {

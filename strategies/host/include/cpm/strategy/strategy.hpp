@@ -83,6 +83,13 @@ struct StrategyHooks {
     // Unset means the strategy has no owner to ask, which is the one-shot
     // crypto_mm binary; it withdraws instead and keeps running.
     std::function<void(const std::string& why)> stop_me;
+    // This strategy's own commentary: what the market looked like and what
+    // it decided, which is strategy.log and not the operator's panel. Write
+    // the line and nothing about who is writing it - the host prefixes
+    // `[<id> <symbol>]` on the way past, so a file holding two series can
+    // be read a strategy at a time (docs/design-logs.md section 3). Unset
+    // discards, which is the one-shot crypto_mm binary and every test that
+    // does not care.
     std::function<void(const std::string&)> log;
 };
 

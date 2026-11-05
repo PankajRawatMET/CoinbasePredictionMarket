@@ -9,6 +9,8 @@
 
 #include <gtest/gtest.h>
 
+#include <tuple>
+
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -61,7 +63,11 @@ bool eventually(Trader& trader, const std::function<bool()>& ready,
 
 // Both simulators and a daemon wired to them.
 struct Rig {
-    explicit Rig(bool allow_orders = true, std::optional<int> drop_seq = std::nullopt) {
+    // `quiet_after` is the simulator's own fault flag: it keeps the session
+    // up and stops sending, which is staleness rather than a disconnect.
+    explicit Rig(bool allow_orders = true, std::optional<int> drop_seq = std::nullopt,
+                 std::vector<std::string> watch = {},
+                 std::optional<int> quiet_after = std::nullopt) {
         cpm::strategy::register_crypto_mm(registry);
 
         const cpm::Credentials md_creds{"md-key", "md-pass", "bWQtc2ltLXNlY3JldA=="};
@@ -74,6 +80,7 @@ struct Rig {
         md_options.port = md_port;
         md_options.dict_dir = CPM_DICT_DIR;
         md_options.drop_seq = drop_seq;
+        md_options.stale_after_secs = quiet_after;
         md_sim = std::make_unique<cpm::md::sim::Simulator>(std::move(md_options), sim_logger);
         md_sim->start();
 
@@ -100,6 +107,7 @@ struct Rig {
         options.limits.max_notional = 10'000'000;
         options.limits.max_orders_per_sec = 20;
         options.stale_after = 2s;
+        options.watch = std::move(watch);
         trader = std::make_unique<Trader>(std::move(options), registry, logger);
     }
 
@@ -157,6 +165,154 @@ TEST(Trader, CreatingAStrategySubscribesItsBook) {
     EXPECT_EQ(book.symbol, kSym);
     EXPECT_TRUE(book.implied_yes_ask.has_value());
     EXPECT_TRUE(book.mid.has_value());
+}
+
+// The book belongs to the subscription that built it. Stopping a feed and
+// starting it again resubscribes with a fresh MDReqID, and the daemon used to
+// leave the book bound to the old one: the new snapshot was then ignored as a
+// second subscriber's (O7), and so was every update after it, so the book
+// froze at the instant the feed was dropped while still reading as live. A
+// strategy quoting around that mid is the best price in a market it cannot
+// see, and an exit crossing to it never fills (2026-11-04, from the log).
+TEST(Trader, AFeedStoppedAndStartedRebuildsTheBookInsteadOfFreezingIt) {
+    Rig rig;
+    ASSERT_EQ(rig.trader->start(), "") << rig.logs();
+    const auto created = rig.trader->api().create(rig.spec());
+    ASSERT_TRUE(created.ok()) << created.error;
+    ASSERT_TRUE(eventually(*rig.trader, [&] {
+        const auto books = rig.trader->api().snapshot().books;
+        return !books.empty() && books.front().valid && books.front().mid.has_value();
+    })) << rig.logs();
+
+    ASSERT_TRUE(rig.trader->api().stop_feed(created.id).ok());
+    // Unbound with the subscription, so nothing of the old book is left to
+    // read as a price.
+    {
+        const auto books = rig.trader->api().snapshot().books;
+        ASSERT_FALSE(books.empty()) << "the row keeps its symbol when the feed stops";
+        EXPECT_FALSE(books.front().valid);
+        EXPECT_FALSE(books.front().mid.has_value());
+    }
+
+    ASSERT_TRUE(rig.trader->api().start_feed(created.id).ok());
+    // Live again, from the new subscription's own snapshot.
+    ASSERT_TRUE(eventually(*rig.trader, [&] {
+        const auto books = rig.trader->api().snapshot().books;
+        return !books.empty() && books.front().valid && books.front().mid.has_value();
+    })) << rig.logs();
+
+    // And still moving: the simulator's book changes several times a second,
+    // so a book that never changes again is the frozen one.
+    const auto top = [&] {
+        const auto book = rig.trader->api().snapshot().books.front();
+        return std::make_tuple(book.best_yes_bid, book.best_yes_bid_qty, book.implied_yes_ask,
+                               book.best_no_bid_qty, book.bids.size(), book.asks.size());
+    };
+    const auto first = top();
+    EXPECT_TRUE(eventually(*rig.trader, [&] { return top() != first; }))
+        << "the book stopped moving after the resubscribe: " << rig.logs();
+}
+
+// --- the watch list (G15) -------------------------------------------------
+// What the daemon holds for its own sake: the book is up from startup, with
+// no strategy and no Start Feed, so the page shows a market before anything
+// is quoted and a position can be priced whatever happens to the row that
+// opened it.
+TEST(Trader, WatchedInstrumentsAreSubscribedBeforeAnyStrategyExists) {
+    Rig rig(true, std::nullopt, {kSym});
+    ASSERT_EQ(rig.trader->start(), "") << rig.logs();
+
+    ASSERT_TRUE(eventually(*rig.trader, [&] {
+        const auto book = rig.trader->api().snapshot().books;
+        return !book.empty() && book.front().valid && book.front().mid.has_value();
+    })) << rig.logs();
+    EXPECT_TRUE(rig.trader->api().snapshot().strategies.empty())
+        << "the book is the daemon's, not a strategy's";
+}
+
+// Stopping a strategy's feed must not take a watched book with it: the
+// daemon holds that subscription for its own sake, and an exit priced from
+// it is the reason it is there.
+TEST(Trader, StoppingAStrategysFeedKeepsAWatchedBook) {
+    Rig rig(true, std::nullopt, {kSym});
+    ASSERT_EQ(rig.trader->start(), "") << rig.logs();
+    const auto created = rig.trader->api().create(rig.spec());
+    ASSERT_TRUE(created.ok()) << created.error;
+    ASSERT_TRUE(eventually(*rig.trader, [&] {
+        const auto book = rig.trader->api().snapshot().books;
+        return !book.empty() && book.front().valid && book.front().mid.has_value();
+    })) << rig.logs();
+
+    ASSERT_TRUE(rig.trader->api().stop_feed(created.id).ok());
+    const auto book = rig.trader->api().snapshot().books;
+    ASSERT_FALSE(book.empty());
+    EXPECT_TRUE(book.front().valid) << "a watched book outlives the row that was reading it";
+    EXPECT_TRUE(book.front().mid.has_value());
+
+    // And it is still being rebuilt, not frozen at the moment the row let go.
+    const auto top = [&] {
+        const auto view = rig.trader->api().snapshot().books.front();
+        return std::make_tuple(view.best_yes_bid, view.best_yes_bid_qty, view.implied_yes_ask);
+    };
+    const auto first = top();
+    EXPECT_TRUE(eventually(*rig.trader, [&] { return top() != first; })) << rig.logs();
+}
+
+// Staleness is fail-stop for the whole daemon, so a quiet market nobody is
+// trading must not be able to stop one that is being traded. A watched book
+// is handed to FeedMonitor only when a strategy starts on it.
+TEST(Trader, AQuietWatchedBookDoesNotHaltTheDaemon) {
+    // The simulator goes quiet two seconds in, with the session still up:
+    // staleness, which is what FeedMonitor judges, and not a disconnect,
+    // which halts whatever is subscribed.
+    Rig rig(true, std::nullopt, {kSym}, 2);
+    ASSERT_EQ(rig.trader->start(), "") << rig.logs();
+    ASSERT_TRUE(eventually(*rig.trader, [&] {
+        const auto book = rig.trader->api().snapshot().books;
+        return !book.empty() && book.front().valid;
+    })) << rig.logs();
+
+    // Well past stale_after (2 s) with nothing quoting it.
+    const auto deadline = std::chrono::steady_clock::now() + 6s;
+    while (std::chrono::steady_clock::now() < deadline) {
+        rig.trader->tick(cpm::oms::Clock::now());
+        std::this_thread::sleep_for(25ms);
+    }
+    EXPECT_NE(rig.trader->api().snapshot().state, cpm::trader::DaemonState::Halted)
+        << "a book nobody is quoting stopped a daemon that was not quoting it: " << rig.logs();
+}
+
+// The same book, once a strategy is running on it, is monitored again: now
+// something is trading it, and a dead feed under it must stop the run.
+TEST(Trader, AWatchedBookIsMonitoredOnceAStrategyIsOnIt) {
+    Rig rig(true, std::nullopt, {kSym}, 2);
+    ASSERT_EQ(rig.trader->start(), "") << rig.logs();
+    const auto created = rig.trader->api().create(rig.spec());
+    ASSERT_TRUE(created.ok()) << created.error;
+    ASSERT_TRUE(rig.trader->api().start(created.id).ok());
+    ASSERT_TRUE(eventually(*rig.trader, [&] {
+        const auto book = rig.trader->api().snapshot().books;
+        return !book.empty() && book.front().valid;
+    })) << rig.logs();
+
+    // The same silence, now under a running strategy.
+    EXPECT_TRUE(eventually(*rig.trader,
+                           [&] {
+                               return rig.trader->api().snapshot().state ==
+                                      cpm::trader::DaemonState::Halted;
+                           },
+                           10s))
+        << "a strategy's own feed went quiet and the daemon carried on: " << rig.logs();
+}
+
+// A series nobody can resolve is a warning, not a failure to start: the
+// lifecycle feed may simply not have seen it roll yet, and the next roll
+// picks it up.
+TEST(Trader, AnUnresolvableWatchedSeriesDoesNotStopTheDaemon) {
+    Rig rig(true, std::nullopt, {"BTCD15M"});
+    EXPECT_EQ(rig.trader->start(), "") << rig.logs();
+    EXPECT_NE(rig.logs().find("not watching BTCD15M"), std::string::npos) << rig.logs();
+    EXPECT_TRUE(rig.trader->api().snapshot().books.empty());
 }
 
 TEST(Trader, RefusesAStrategyWhoseFeedCouldNotBeOpened) {

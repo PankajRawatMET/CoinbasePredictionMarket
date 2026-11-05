@@ -13,6 +13,7 @@
 // these calls; the tests drive them directly.
 namespace cpm::trader {
 
+using cpm::oms::NewOrder;
 using cpm::strategy::ParamSchema;
 using cpm::strategy::ParamValues;
 using cpm::strategy::StrategyHost;
@@ -83,6 +84,16 @@ struct PositionView {
     Amount fees = 0;
     std::size_t fills = 0;
     std::optional<Amount> settlement_payout;
+
+    // Exiting it, as this daemon would do it right now (G13). The page
+    // enables its Exit button from `exit_refusal` and prices the dialog from
+    // the rest, rather than joining books, strategies and limits in
+    // JavaScript: what the button offers and what exit_position() would
+    // actually send have to be one answer, not two that can disagree.
+    std::string status{"Unknown"};    // the instrument's lifecycle status
+    std::optional<Price> exit_price;  // the touch an exit would cross to
+    Qty exit_available = 0;           // what rests at that price, as deep as one rung
+    std::string exit_refusal;         // empty exactly while an exit can be sent
 };
 
 // One symbol's P&L (GUI-Q15), from cpm::oms::pnl_of. The mark is carried with
@@ -204,6 +215,31 @@ public:
         // on a symbol whose book will never arrive.
         std::function<std::string(const std::string& symbol)> subscribe;
         std::function<void(const std::string& symbol)> unsubscribe;
+        // The instruments the daemon watches for its own sake, whether or
+        // not a strategy is on them. Their books are in every snapshot, so
+        // the page shows a market before anything is quoted.
+        std::function<std::vector<std::string>()> watched;
+
+        // --- the operator's own order (G13) ---------------------------
+        // May an order go out *right now*? The same answer the strategies
+        // get: false while reconciling and after a halt. Unset is
+        // permitted, as everywhere else here.
+        std::function<bool()> can_submit;
+        // The next ClOrdID for an order that belongs to no strategy. It
+        // comes from the daemon's one counter, because that counter is what
+        // the bookmark persists (OE-Q7).
+        std::function<std::string()> next_cl_ord_id;
+        // Sends one order outside every strategy. Returns the reason it
+        // could not be sent, or empty. It returns rather than throws
+        // because the answer has to cross an HTTP boundary intact, and it
+        // is the daemon's job to record and attribute it.
+        std::function<std::string(const NewOrder& order)> send_order;
+        // Everything of ours still resting on one instrument, as the order
+        // manager holds it. An exit must not cross our own order: the venue
+        // answers a self-match by cancelling one of the two, so the exit
+        // could simply vanish.
+        std::function<std::vector<cpm::strategy::LiveLeg>(const std::string& symbol)>
+            resting_orders;
     };
 
     ControlApi(StrategyHost& host, const StrategyRegistry& registry, Env env, bool allow_orders);
@@ -239,6 +275,20 @@ public:
     Result destroy(const std::string& id);
     // The kill switch: stops and disarms everything.
     Result stop_all();
+    // Flattens part or all of one position (G13): one IOC limit order
+    // crossing to the touch, sent outside every strategy, so a position
+    // outlives the row that opened it and can still be closed.
+    //
+    // `qty` is in contracts at kQtyScale; 0 means the whole position. More
+    // than is held is refused rather than clamped - the operator typed a
+    // number, and a different one reaching the venue is a surprise.
+    //
+    // IOC rather than GTC because a resting exit would have to be cancelled
+    // later and a cancel reject halts the run (OE-Q6); a limit at the touch
+    // rather than a market order because a market order is forced to the
+    // worst admissible price, which on a 0-1 grid is the whole position.
+    // What it does not fill is cancelled, and the operator presses again.
+    Result exit_position(const std::string& symbol, Qty qty);
     // Move a strategy to the next window of its series: the subscriptions
     // follow, then the strategy. Driven by the daemon's own tick rather than
     // by an operator, so it bumps the revision like anything else that
@@ -252,6 +302,18 @@ public:
     std::uint64_t revision() const;
 
 private:
+    // What flattening one position would do, decided in one place so that
+    // the button's state and the order that goes out cannot disagree. The
+    // order carries no ClOrdID: the plan is computed for every snapshot, and
+    // allocating an id twice a second would burn the counter the bookmark
+    // persists. exit_position() stamps it just before sending.
+    struct ExitPlan {
+        NewOrder order;
+        Qty available = 0;    // resting at the price it would cross
+        std::string refusal;  // empty exactly when `order` may be sent
+    };
+    ExitPlan plan_exit(const std::string& symbol, Qty qty) const;
+
     void bump();
     // Unsubscribes those of `symbols` that no other row is still reading.
     // Unsubscribing is not ref-counted, and a stopped row and a live one can

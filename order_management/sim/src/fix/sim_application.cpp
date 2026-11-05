@@ -517,6 +517,48 @@ void SimApplication::settle(const std::string& symbol, SettlementReport::Outcome
     send(std::move(report), true);
 }
 
+Qty SimApplication::trade(const std::string& symbol, Side side, Qty quantity, Price price) {
+    // Another participant, taking what is resting. The seeded book gives a
+    // client's taker something to trade against; this is the other half, so
+    // a client's own maker quote can actually fill - without it nothing in
+    // this simulator ever takes ours, and a position is unreachable.
+    NewOrder order;
+    order.cl_ord_id = "take-" + std::to_string(++takes_);
+    order.symbol = symbol;
+    order.side = side;
+    order.quantity = quantity;
+    order.price = price;
+    order.time_in_force = TimeInForce::Ioc;
+
+    std::lock_guard lock(mutex_);
+    const auto events = engine_.submit(order, "taker-account", Clock::now(), "taker");
+    // The taker's own reports are filtered out by publish(), which only ever
+    // speaks to the session's owner; the maker side of the trade is ours and
+    // goes out as the ExecutionReport the client has been waiting for.
+    publish(events);
+    Qty filled = 0;
+    for (const auto& event : events) {
+        if (event.owner == "taker" && event.kind == Event::Kind::Fill) filled += event.last_quantity;
+    }
+    return filled;
+}
+
+void SimApplication::rest(const std::string& symbol, Side side, Qty quantity, Price price) {
+    // Another participant's resting order, on top of the seeded book. It is
+    // how a test puts liquidity exactly where it wants it - the seeded book
+    // is fixed at 0.45/0.55, and a client crossing to a price it read from
+    // somewhere else needs something to cross to.
+    NewOrder order;
+    order.cl_ord_id = "rest-" + std::to_string(++takes_);
+    order.symbol = symbol;
+    order.side = side;
+    order.quantity = quantity;
+    order.price = price;
+
+    std::lock_guard lock(mutex_);
+    publish(engine_.submit(order, "other-account", Clock::now(), "other"));
+}
+
 void SimApplication::tick(Clock::time_point now) {
     std::lock_guard lock(mutex_);
     publish(engine_.release_speed_bumped(now));

@@ -59,6 +59,20 @@ public:
         std::chrono::milliseconds reconcile_timeout{std::chrono::seconds(10)};
         // Any anomaly in the order flow is treated as a halt condition.
         bool halt_on_anomaly = true;
+        // Has this instrument's trading window already ended? Asked only
+        // about an order rejected with OrdRejReason 44 (not allowed by
+        // market state): a quote the close caught in flight is a race we
+        // lost rather than anything we have lost track of, and halting the
+        // daemon for it protects nothing - the order never existed and the
+        // venue has already cancelled whatever was resting on the window it
+        // closed. Every other reject, and a 44 on a window that is still
+        // trading, still halts.
+        //
+        // A hook rather than a check here because order management does not
+        // know what a ticker looks like - that is market data's, and the
+        // two containers do not depend on each other. Unset means "never",
+        // which is the behaviour this had before (OE-Q6).
+        std::function<bool(const std::string& symbol)> window_has_ended;
     };
 
     // Called once, from whichever thread noticed. It must not stop the client:

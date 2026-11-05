@@ -13,6 +13,11 @@ namespace {
 
 using namespace std::chrono_literals;
 
+// What the record files call an order that belongs to no strategy: the
+// operator's own exit (G13). The column has to say something, and a blank
+// one would read as "attribution lost" rather than "nobody's but yours".
+constexpr const char* kOperatorId = "operator";
+
 cpm::md::MdClientOptions md_options(const TraderOptions& options) {
     cpm::md::MdClientOptions out;
     out.config = options.md;
@@ -57,23 +62,7 @@ Trader::Trader(TraderOptions options, const cpm::strategy::StrategyRegistry& reg
                     return record && record->terminal;
                 };
                 hooks.resting_orders = [this](const std::string& symbol) {
-                    // From the order manager rather than the strategy's own
-                    // two slots: anything of ours left on this instrument
-                    // counts, including what an earlier state left behind.
-                    std::vector<cpm::strategy::LiveLeg> out;
-                    for (const auto& order : orders_.open_orders()) {
-                        if (order.symbol != symbol || order.leaves_quantity <= 0) continue;
-                        cpm::strategy::LiveLeg leg;
-                        leg.side = order.side;
-                        leg.cl_ord_id = order.cl_ord_id;
-                        // Where it actually rests, which a post-only slide
-                        // moves away from what we asked for.
-                        leg.price = order.price;
-                        leg.quantity = order.leaves_quantity;
-                        leg.cancel_pending = order.cancel_pending;
-                        out.push_back(std::move(leg));
-                    }
-                    return out;
+                    return resting_on(symbol);
                 };
                 // Who sent what, for the record files. Called by the host
                 // just before the send it wraps.
@@ -137,8 +126,15 @@ Trader::Trader(TraderOptions options, const cpm::strategy::StrategyRegistry& reg
     md_.on_session_event(feed_->session_callback());
 
     // --- order entry --------------------------------------------------
+    cpm::oms::Reconciler::Options reconcile;
+    // The one reject the daemon forgives, and only because the instrument's
+    // own name says the window had ended before the order reached it.
+    reconcile.window_has_ended = [](const std::string& symbol) {
+        const auto parsed = cpm::md::parse_ticker(symbol);
+        return parsed && Clock::now() >= parsed->window_end;
+    };
     reconciler_ = std::make_unique<cpm::oms::Reconciler>(
-        cpm::oms::Reconciler::Options{}, oe_, orders_, cpm::oms::BookmarkFile(options_.bookmark),
+        reconcile, oe_, orders_, cpm::oms::BookmarkFile(options_.bookmark),
         logger, [this](const cpm::oms::Halt& halt) {
             request_halt(std::string("order entry: ") + to_string(halt.reason) + " - " + halt.detail);
         });
@@ -216,40 +212,7 @@ Trader::Trader(TraderOptions options, const cpm::strategy::StrategyRegistry& reg
     env.book = [this](const std::string& symbol) -> std::optional<BookView> {
         return view_of(symbol);
     };
-    env.resolve = [this](const std::string& series) {
-        ControlApi::Env::Resolved out;
-        // The feed first: if this daemon has already seen the series roll, it
-        // knows the answer without asking anyone.
-        if (const auto known = series_.current(series, Clock::now())) {
-            out.symbol = known->symbol;
-            return out;
-        }
-        if (!options_.rest.configured()) {
-            out.error = series +
-                        " cannot be resolved: REST is not configured (the CPM_REST_* set in "
-                        "config/creds.env), and the "
-                        "lifecycle feed has not seen this series roll yet - it announces the "
-                        "next window, not the present one. Source config/creds.env and restart "
-                        "the daemon, or name a full ticker";
-            return out;
-        }
-        const auto found = cpm::md::open_instruments(options_.rest, series);
-        if (!found.ok()) {
-            out.error = found.error;
-            return out;
-        }
-        if (found.instruments.empty()) {
-            out.error = "no window of " + series +
-                        " is open right now; the next one opens within a second of the last one "
-                        "closing";
-            return out;
-        }
-        const auto& instrument = found.instruments.front();
-        logger_.info("resolved " + series + " to " + instrument.ticker + " (ends " +
-                     cpm::md::to_utc_string(instrument.expected_close) + ")");
-        out.symbol = instrument.ticker;
-        return out;
-    };
+    env.resolve = [this](const std::string& series) { return resolve_series(series); };
     env.current_window = [this](const std::string& series) -> std::optional<std::string> {
         if (const auto window = series_.current(series, Clock::now())) return window->symbol;
         return std::nullopt;
@@ -271,6 +234,49 @@ Trader::Trader(TraderOptions options, const cpm::strategy::StrategyRegistry& reg
     };
     env.subscribe = [this](const std::string& symbol) { return subscribe(symbol); };
     env.unsubscribe = [this](const std::string& symbol) { unsubscribe(symbol); };
+    env.watched = [this] {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<std::string> out;
+        out.reserve(watching_.size());
+        for (const auto& [series, symbol] : watching_) out.push_back(symbol);
+        return out;
+    };
+    // The operator's own order path (G13). It is the strategies' path with
+    // the strategies taken out: the same gate, the same counter, the same
+    // record of what was sent, and no arming, because arming is a standing
+    // permission to quote and this is one order the operator asked for.
+    env.can_submit = [this] {
+        return options_.allow_orders && reconciler_ && reconciler_->submission_allowed();
+    };
+    env.resting_orders = [this](const std::string& symbol) { return resting_on(symbol); };
+    env.next_cl_ord_id = [this] {
+        const auto next = ++cl_ord_counter_;
+        if (reconciler_) reconciler_->note_cl_ord_counter(next);
+        // "ex-" rather than "mm-": the log, the CSVs and the wire should all
+        // say that this one was not a quote.
+        return cpm::oms::make_cl_ord_id("ex-", next);
+    };
+    env.send_order = [this](const cpm::oms::NewOrder& order) -> std::string {
+        // Attributed and recorded before it goes, because the ack can reach
+        // a QuickFIX thread before send() has returned here.
+        if (records_) {
+            std::lock_guard lock(attribution_mutex_);
+            attribution_[order.cl_ord_id] = kOperatorId;
+        }
+        orders_.record_sent(order);
+        try {
+            oe_.send(order);
+        } catch (const std::exception& e) {
+            // The client refused it - a limit, or a rule the gateway would
+            // enforce on receipt. Nothing went to the wire, so this is a
+            // refusal to show the operator and not a halt.
+            return e.what();
+        }
+        logger_.warn(std::string("exit ") + order.symbol + ": " + to_string(order.side) + " " +
+                     cpm::format_qty(order.quantity) + " @" + cpm::format_price(order.price) +
+                     " IOC as " + order.cl_ord_id);
+        return {};
+    };
     api_ = std::make_unique<ControlApi>(host_, registry, std::move(env), options_.allow_orders);
 }
 
@@ -304,6 +310,14 @@ void Trader::follow_reference_demand() {
     // each pass, so there is no reference count to get wrong and a
     // strategy that vanishes however it vanishes takes its stream with it.
     std::vector<std::string> wanted;
+    // The watched series first: their streams are up for the life of the
+    // daemon, so the guard has a price the instant a strategy is armed
+    // rather than one pass later.
+    for (const auto& [series, symbol] : watching_) {
+        if (const auto mapped = reference_symbol_for(symbol); !mapped.empty()) {
+            wanted.push_back(mapped);
+        }
+    }
     for (const auto& strategy : host_.list()) {
         if (strategy.state != cpm::strategy::RunState::Running) continue;
         for (const auto& symbol : strategy.symbols) {
@@ -337,6 +351,26 @@ cpm::binance::ReferenceView Trader::reference_for(const std::string& symbol) con
     const auto mapped = reference_symbol_for(symbol);
     if (mapped.empty()) return {};
     return reference_->latest(mapped, cpm::binance::Clock::now());
+}
+
+std::vector<cpm::strategy::LiveLeg> Trader::resting_on(const std::string& symbol) const {
+    // From the order manager rather than any strategy's own two slots:
+    // anything of ours left on this instrument counts, including what an
+    // earlier state left behind.
+    std::vector<cpm::strategy::LiveLeg> out;
+    for (const auto& order : orders_.open_orders()) {
+        if (order.symbol != symbol || order.leaves_quantity <= 0) continue;
+        cpm::strategy::LiveLeg leg;
+        leg.side = order.side;
+        leg.cl_ord_id = order.cl_ord_id;
+        // Where it actually rests, which a post-only slide moves away from
+        // what we asked for.
+        leg.price = order.price;
+        leg.quantity = order.leaves_quantity;
+        leg.cancel_pending = order.cancel_pending;
+        out.push_back(std::move(leg));
+    }
+    return out;
 }
 
 BookView Trader::view_of(const std::string& symbol) const {
@@ -379,9 +413,27 @@ BookView Trader::view_of(const std::string& symbol) const {
     return view;
 }
 
-std::string Trader::subscribe(const std::string& symbol) {
+std::string Trader::subscribe(const std::string& symbol) { return subscribe(symbol, true); }
+
+std::string Trader::subscribe(const std::string& symbol, bool monitored) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (subscriptions_.count(symbol)) return {};  // already open
+    const auto channels = [this](const std::string& name) {
+        return std::pair<cpm::md::ChannelRequest, cpm::md::ChannelRequest>{
+            {cpm::md::Channel::Book, {name}, options_.book_depth},
+            {cpm::md::Channel::Lifecycle, {name}, 0}};
+    };
+    if (const auto open = subscriptions_.find(symbol); open != subscriptions_.end()) {
+        // Already open. A strategy arriving on a book this daemon was only
+        // watching upgrades it: from here on a dead feed on this instrument
+        // stops the run, because something is trading it.
+        if (monitored && !open->second.monitored && feed_ && open->second.ids.size() == 2) {
+            const auto [book, lifecycle] = channels(symbol);
+            feed_->track(open->second.ids[0], book);
+            feed_->track(open->second.ids[1], lifecycle);
+            open->second.monitored = true;
+        }
+        return {};
+    }
     if (!md_.logged_on()) {
         return "the market data session is not logged on, so " + symbol +
                " would never get a book";
@@ -389,13 +441,12 @@ std::string Trader::subscribe(const std::string& symbol) {
     std::vector<std::string> ids;
     try {
         // The book, and the lifecycle so a closed window withdraws the quotes.
-        const cpm::md::ChannelRequest book{cpm::md::Channel::Book, {symbol}, options_.book_depth};
+        const auto [book, lifecycle] = channels(symbol);
         ids.push_back(md_.subscribe(book));
-        if (feed_) feed_->track(ids.back(), book);
+        if (feed_ && monitored) feed_->track(ids.back(), book);
 
-        const cpm::md::ChannelRequest lifecycle{cpm::md::Channel::Lifecycle, {symbol}, 0};
         ids.push_back(md_.subscribe(lifecycle));
-        if (feed_) feed_->track(ids.back(), lifecycle);
+        if (feed_ && monitored) feed_->track(ids.back(), lifecycle);
     } catch (const std::exception& e) {
         for (const auto& id : ids) {
             if (feed_) feed_->forget(id);
@@ -403,7 +454,8 @@ std::string Trader::subscribe(const std::string& symbol) {
         }
         return std::string("could not subscribe to ") + symbol + ": " + e.what();
     }
-    subscriptions_[symbol] = std::move(ids);
+    subscriptions_[symbol] = Subscription{std::move(ids), monitored};
+
     return {};
 }
 
@@ -411,11 +463,35 @@ void Trader::unsubscribe(const std::string& symbol) {
     std::lock_guard<std::mutex> lock(mutex_);
     const auto it = subscriptions_.find(symbol);
     if (it == subscriptions_.end()) return;
-    for (const auto& id : it->second) {
+    // A watched symbol keeps its book: the daemon holds this subscription for
+    // its own sake, and dropping it because a strategy let go would put the
+    // page and every position's price back at the mercy of a row. It only
+    // leaves the monitor, so a quiet market nobody trades cannot halt a
+    // daemon that is trading something else.
+    const bool watched = std::any_of(watching_.begin(), watching_.end(),
+                                     [&](const auto& entry) { return entry.second == symbol; });
+    if (watched) {
+        if (it->second.monitored) {
+            for (const auto& id : it->second.ids) {
+                if (feed_) feed_->forget(id);
+            }
+            it->second.monitored = false;
+        }
+        return;
+    }
+    for (const auto& id : it->second.ids) {
         if (feed_) feed_->forget(id);
         md_.unsubscribe(id);
     }
     subscriptions_.erase(it);
+    // The book goes with the subscription that built it. Leaving it bound to
+    // an MDReqID nobody is subscribed with means the next subscription's
+    // snapshot is ignored as a second subscriber's (O7) and so is every
+    // update after it: the book then stays frozen at this instant while
+    // looking live, and everything that reads it - the page, the mark, a
+    // strategy's quoting, an exit's price - is reading a market that has
+    // stopped existing (GUI-N5).
+    book_.invalidate_book(symbol);
 }
 
 std::string Trader::strategy_of(const std::string& cl_ord_id) const {
@@ -521,7 +597,8 @@ std::string Trader::start(std::chrono::milliseconds timeout) {
     // Before the sessions: a report that arrives in the first millisecond
     // belongs in the records like any other.
     if (!options_.log_dir.empty()) {
-        records_ = std::make_unique<cpm::oms::RecordLog>(options_.log_dir, options_.quote_records);
+        records_ = std::make_unique<cpm::oms::RecordLog>(options_.log_dir, options_.quote_records,
+                                                         options_.log_run);
         if (const auto failed = records_->open_now(cpm::utc_stamp()); !failed.empty()) {
             logger_.warn("no record files: " + failed);
             records_.reset();
@@ -598,6 +675,30 @@ std::string Trader::start(std::chrono::milliseconds timeout) {
                      e.what());
     }
 
+    // The watched series, before anything is created: the page has a market
+    // to show the moment it opens, and a position has a price whatever
+    // happens to the row that opened it. Not fatal - a series that cannot be
+    // resolved yet is picked up by follow_watch_list() at the next roll.
+    for (const auto& wanted : options_.watch) {
+        // A ticker is watched as it is; a series is resolved to the window
+        // trading now, the same choice create() offers an operator.
+        std::string symbol = wanted;
+        if (!cpm::md::looks_like_instrument(wanted)) {
+            const auto found = resolve_series(wanted);
+            if (!found.error.empty()) {
+                logger_.warn("not watching " + wanted + ": " + found.error);
+                continue;
+            }
+            symbol = found.symbol;
+        }
+        if (const auto error = subscribe(symbol, false); !error.empty()) {
+            logger_.warn("not watching " + wanted + ": " + error);
+            continue;
+        }
+        watching_[wanted] = symbol;
+        logger_.info("watching " + wanted + (symbol == wanted ? "" : " on " + symbol));
+    }
+
     cl_ord_counter_.store(reconciler_->cl_ord_counter());
     last_evict_ = Clock::now();
     return {};
@@ -651,7 +752,9 @@ void Trader::tick(Clock::time_point now) {
         return;
     }
 
+    follow_watch_list(now);
     roll_series(now);
+    watch_for_an_orphaned_book();
     // After the strategies have run and before the evictions: what is
     // written is what this pass left behind.
     record_quotes();
@@ -667,6 +770,91 @@ void Trader::tick(Clock::time_point now) {
             logger_.debug("forgot " + std::to_string(forgotten) + " finished window(s)");
         }
     }
+}
+
+ControlApi::Env::Resolved Trader::resolve_series(const std::string& series) {
+        ControlApi::Env::Resolved out;
+        // The feed first: if this daemon has already seen the series roll, it
+        // knows the answer without asking anyone.
+        if (const auto known = series_.current(series, Clock::now())) {
+            out.symbol = known->symbol;
+            return out;
+        }
+        if (!options_.rest.configured()) {
+            out.error = series +
+                        " cannot be resolved: REST is not configured (the CPM_REST_* set in "
+                        "config/creds.env), and the "
+                        "lifecycle feed has not seen this series roll yet - it announces the "
+                        "next window, not the present one. Source config/creds.env and restart "
+                        "the daemon, or name a full ticker";
+            return out;
+        }
+        const auto found = cpm::md::open_instruments(options_.rest, series);
+        if (!found.ok()) {
+            out.error = found.error;
+            return out;
+        }
+        if (found.instruments.empty()) {
+            out.error = "no window of " + series +
+                        " is open right now; the next one opens within a second of the last one "
+                        "closing";
+            return out;
+        }
+        const auto& instrument = found.instruments.front();
+        logger_.info("resolved " + series + " to " + instrument.ticker + " (ends " +
+                     cpm::md::to_utc_string(instrument.expected_close) + ")");
+        out.symbol = instrument.ticker;
+        return out;
+}
+
+void Trader::follow_watch_list(Clock::time_point now) {
+    if (options_.watch.empty()) return;
+    for (const auto& series : options_.watch) {
+        if (cpm::md::looks_like_instrument(series)) continue;  // a ticker never rolls
+        const auto window = series_.current(series, now);
+        if (!window) continue;  // between windows, or the feed has not said yet
+        const auto held = watching_.find(series);
+        if (held != watching_.end() && held->second == window->symbol) continue;
+
+        // The new window before the old one goes, so there is no instant
+        // with nothing watched, and never monitored: nothing is quoting it.
+        if (const auto error = subscribe(window->symbol, false); !error.empty()) {
+            logger_.warn("could not watch " + window->symbol + ": " + error);
+            continue;
+        }
+        const std::string previous = held == watching_.end() ? std::string() : held->second;
+        watching_[series] = window->symbol;
+        logger_.info("watching " + series + " on " + window->symbol +
+                     (previous.empty() ? "" : " (was " + previous + ")"));
+        if (previous.empty() || previous == window->symbol) continue;
+        // The window that just closed: let it go unless a strategy is still
+        // on it, in which case it is that strategy's to drop.
+        const bool claimed = std::any_of(
+            host_.list().begin(), host_.list().end(), [&](const cpm::strategy::StrategyInfo& row) {
+                return std::find(row.symbols.begin(), row.symbols.end(), previous) !=
+                       row.symbols.end();
+            });
+        if (!claimed) unsubscribe(previous);
+    }
+}
+
+void Trader::watch_for_an_orphaned_book() {
+    // MarketState ignores a snapshot or an update whose MDReqID is not the
+    // one that bound the book, because two deliberate subscriptions on one
+    // instrument duplicate every message (O7). This daemon never makes that
+    // overlap - subscribe() is a no-op for a symbol it already holds - so
+    // anything counted here means a book is bound to a subscription that no
+    // longer exists. Such a book is frozen at the moment its feed went and
+    // still reads as live, which is worth saying out loud exactly once: it
+    // silently cost a live run its prices on 2026-11-04.
+    const auto ignored = book_.ignored_foreign_snapshots() + book_.ignored_foreign_updates();
+    if (ignored <= orphan_warned_at_) return;
+    orphan_warned_at_ = ignored;
+    if (orphan_warned_) return;
+    orphan_warned_ = true;
+    logger_.error("a book is bound to a subscription this daemon no longer holds, so it has "
+                  "stopped being rebuilt and is showing a market that has moved on. Nothing it "
+                  "prices can be trusted: restart the daemon");
 }
 
 void Trader::roll_series(Clock::time_point now) {
@@ -705,9 +893,9 @@ void Trader::stop() {
     reconciler_->save_bookmark();
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        for (const auto& [symbol, ids] : subscriptions_) {
+        for (const auto& [symbol, subscription] : subscriptions_) {
             (void)symbol;
-            for (const auto& id : ids) md_.unsubscribe(id);
+            for (const auto& id : subscription.ids) md_.unsubscribe(id);
         }
         subscriptions_.clear();
     }

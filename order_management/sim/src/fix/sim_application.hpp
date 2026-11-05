@@ -30,6 +30,8 @@ public:
     void tick(Clock::time_point now);
     void settle(const std::string& symbol, SettlementReport::Outcome outcome, Price price,
                 Qty long_quantity, Qty short_quantity);
+    Qty trade(const std::string& symbol, Side side, Qty quantity, Price price);
+    void rest(const std::string& symbol, Side side, Qty quantity, Price price);
 
     void onCreate(const FIX::SessionID&) override {}
     void onLogon(const FIX::SessionID&) override;
@@ -61,6 +63,7 @@ private:
     bool client_logout_ = false;
     std::optional<FIX::SessionID> session_id_;
     std::uint64_t next_exec_ = 480837776594436096ULL;
+    std::uint64_t takes_ = 0;  // ClOrdIDs for the taker in trade()
     // Everything replayable, newest last, as (ExecID, message).
     std::vector<std::pair<std::uint64_t, FIX::Message>> history_;
 };

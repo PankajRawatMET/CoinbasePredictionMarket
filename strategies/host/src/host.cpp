@@ -1,5 +1,7 @@
 #include "cpm/strategy/host.hpp"
 
+#include "cpm/md/ticker.hpp"
+
 #include <algorithm>
 #include <utility>
 
@@ -12,6 +14,20 @@ namespace {
 bool default_tradable(const InstrumentView& view) {
     return view.status == cpm::md::LifecycleStatus::Open ||
            view.status == cpm::md::LifecycleStatus::Unknown;
+}
+
+// The instrument's own name says when it stops trading, and that is the only
+// thing about the close that needs nothing to arrive: the lifecycle feed is
+// changes-only and the book goes on showing a market that has ended. On
+// 2026-11-04 a strategy quoted for 475 ms past the bell on a book that still
+// read 0.51/0.52, and the third of those orders came back
+// INSTRUMENT_NOT_ACTIVE, which halted the daemon.
+//
+// A name with no scheduled end - a sports market, a simulator instrument -
+// has nothing to check and is left to the lifecycle status alone.
+bool window_has_ended(const std::string& symbol, Clock::time_point now) {
+    const auto parsed = cpm::md::parse_ticker(symbol);
+    return parsed && now >= parsed->window_end;
 }
 
 std::string id_prefix(const std::string& kind) {
@@ -83,6 +99,25 @@ StrategyHooks StrategyHost::hooks_for(Entry& entry) const {
             target->stop_requested = why.empty() ? "the strategy stopped itself" : why;
         }
     };
+    // Which instrument a strategy's commentary was about. The tag is put on
+    // here and not in the strategies, so no kind can forget it and none has
+    // to be told its own id; it is read at log time rather than frozen,
+    // because a roll gives this entry a new window and the tag has to follow
+    // it. A line is only ever logged from inside the pass, under the host's
+    // lock, which is also the only place the symbols are written.
+    //
+    // One symbol is the shape there is: one kind, and a symbol is claimed by
+    // one strategy (GUI-Q6), so [id symbol] identifies the line completely.
+    // A kind that quotes two legs would make the symbol a guess - the hook
+    // carries a line and not what it was about - so it gets [id] alone and
+    // says the leg itself.
+    if (const auto log = venue_.log) {
+        hooks.log = [log, target](const std::string& line) {
+            std::string tag = "[" + target->id;
+            if (target->symbols.size() == 1) tag += " " + target->symbols.front();
+            log(tag + "] " + line);
+        };
+    }
     if (venue_.attribute) {
         const std::string id = entry.id;
         const auto attribute = venue_.attribute;
@@ -455,13 +490,16 @@ void StrategyHost::drive(Entry& entry, Clock::time_point now) {
             }
             continue;
         }
-        const bool tradable = feeds_.tradable ? feeds_.tradable(*view) : default_tradable(*view);
+        const bool ended = window_has_ended(symbol, now);
+        const bool tradable =
+            !ended && (feeds_.tradable ? feeds_.tradable(*view) : default_tradable(*view));
         if (!tradable) {
             // These are 15-minute windows (O2/O6) and they close without
             // warning, so this is expected rather than an error.
             if (!entry.withdrawn_for_lifecycle) {
                 entry.withdrawn_for_lifecycle = true;
-                entry.note = std::string("instrument is ") + to_string(view->status);
+                entry.note = ended ? symbol + "'s window has ended"
+                                   : std::string("instrument is ") + to_string(view->status);
                 // Abandoned, not withdrawn: the venue cancels what is resting
                 // on an instrument it closes, and a cancel of ours racing
                 // that one is an OrderCancelReject, which halts.

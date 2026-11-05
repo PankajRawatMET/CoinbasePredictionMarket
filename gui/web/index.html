@@ -99,7 +99,7 @@
   .tag.stopping { border-color: #6b5010; color: var(--warn); }
   .tag.halted { border-color: #6e2320; color: var(--bad); }
   .tag.armed { border-color: #2f6b3a; color: var(--good); }
-  /* One row: Start Feed, Start, Stop, then the parameters in the order they
+  /* One row: Start, Stop, then the parameters in the order they
      are worked through (GUI-Q25). The per-field help that used to sit under
      each input is the input's tooltip now - it is what cost the row its
      second and third lines. It wraps on a narrow window; it never scrolls
@@ -229,6 +229,10 @@
   .modal .row { display: flex; gap: 12px; }
   .modal .row span:first-child { color: var(--dim); min-width: 104px; }
   .modal .says { color: var(--warn); padding-top: 4px; }
+  .modal .row input { width: 90px; background: #11161c; color: var(--ink);
+                      border: 1px solid var(--line); padding: 3px 6px; font: inherit; }
+  .modal .row input.bad { border-color: #7d2c2c; }
+  .modal .row .of { color: var(--dim); }
   .modal .buttons { display: flex; gap: 10px; justify-content: flex-end; padding: 0 14px 14px; }
   #reconnect { display: none; }
   #reconnect.needed { display: inline-block; }
@@ -316,6 +320,7 @@
             <th class="num">settlement</th>
             <th class="num">mark</th><th class="num">realized</th>
             <th class="num">unrealized</th><th class="num">P&amp;L</th>
+            <th>exit</th>
           </tr>
         </thead>
         <tbody></tbody>
@@ -323,6 +328,7 @@
           <tr id="pnl-total">
             <th colspan="8">total</th>
             <th class="num"></th><th class="num"></th><th class="num"></th><th class="num"></th>
+            <th></th>
           </tr>
         </tfoot>
       </table>
@@ -488,6 +494,21 @@
         line.appendChild(el('span', null, show(row[1])));
         content.appendChild(line);
       });
+      // One editable field, for the dialog that asks how much as well as
+      // whether (G13). It is typed rather than stepped because the number
+      // that matters is usually "all of it", which is what it opens on.
+      var field = null;
+      if (options.input) {
+        var line = el('div', 'row');
+        line.appendChild(el('span', null, options.input.label));
+        field = el('input');
+        field.type = 'text';
+        field.id = 'ask-input';
+        field.value = options.input.value;
+        line.appendChild(field);
+        if (options.input.of) line.appendChild(el('span', 'of', options.input.of));
+        content.appendChild(line);
+      }
       if (options.says) content.appendChild(el('div', 'says', options.says));
       panel.appendChild(content);
 
@@ -511,11 +532,23 @@
         if (event.key === 'Escape') finish(false);
       }
       cancel.addEventListener('click', function () { finish(false); });
-      go.addEventListener('click', function () { finish(true); });
+      go.addEventListener('click', function () { finish(field ? field.value.trim() : true); });
       overlay.addEventListener('click', function (event) {
         if (event.target === overlay) finish(false);
       });
       document.addEventListener('keydown', onKey);
+      if (field) {
+        // Nothing is sent while the box does not hold a quantity this
+        // position can actually give: the daemon would refuse it, and a
+        // refusal the page could have shown is a round trip wasted.
+        var check = function () {
+          var ok = options.input.valid(field.value.trim());
+          field.className = ok ? '' : 'bad';
+          go.disabled = !ok;
+        };
+        field.addEventListener('input', check);
+        check();
+      }
       // Cancel takes the focus, so a stray Return cancels rather than arms.
       cancel.focus();
     });
@@ -630,94 +663,51 @@
 
   function dirty(strategy) { return Object.keys(changedParams(strategy)).length > 0; }
 
-  // Strategies that have been stopped and whose feed is still to go,
-  // id -> true. A stop is not instant: the host holds a strategy in
-  // `stopping` until its cancels come back, and the daemon refuses to drop
-  // the book they were quoting before then.
-  var closing = {};
-
-  // Drops the feed of each of those that has now stopped. Called as each
-  // snapshot lands. If this page is closed in between, the strategy is left
-  // stopped with its feed up, which is a state its own row can finish from.
-  function closeStopped() {
-    Object.keys(closing).forEach(function (id) {
-      var strategy = (snapshot.strategies || []).filter(function (row) {
-        return row.id === id;
-      })[0];
-      if (!strategy) { delete closing[id]; return; }   // already gone
-      // Halted counts: a halted strategy never reaches stopped, and its
-      // book should not be left subscribed because of that.
-      if (strategy.state !== 'stopped' && strategy.state !== 'halted') return;
-      // Dropped before the call, so the next snapshot does not send a second.
-      delete closing[id];
-      act('POST', '/api/strategies/' + encodeURIComponent(id) + '/stop-feed', undefined, true);
-    });
-  }
-
-  // Three buttons, the same three a blank row has (GUI-Q26). Arm is still not
-  // one of them: Start arms. Stop takes the feed with it, and the row stays
-  // where it is with its parameters: a stopped row is one Start Feed away
-  // from being watched again, and the x is what throws it away.
+  // Three buttons, the same three a blank row has (GUI-Q26). Arm is still
+  // not one of them: Start arms. Stop stops the quoting and leaves the row
+  // where it is with its parameters, and the x is what throws it away.
   //
-  //   feed up, stopped    Start Feed off  |  Start on   |  Stop on
-  //   feed up, running    Start Feed off  |  Start off  |  Stop on
-  //   feed down           Start Feed on   |  Start off  |  Stop off  | x on
+  // The feed is not on this page any more (GUI-Q34). The daemon subscribes
+  // what it watches and keeps it subscribed; a row created on anything else
+  // gets its book from create() and gives it back on destroy. An operator
+  // who really wants one instrument's feed down has start-feed/stop-feed on
+  // the console, which is where an override belongs.
+  //
+  //   stopped    Start on   |  Stop off  |  x on
+  //   running    Start off  |  Stop on   |  x off
   function strategyActions(strategy) {
     var box = el('div', 'controls');
     var halted = snapshot.state === 'halted';
     var base = '/api/strategies/' + encodeURIComponent(strategy.id) + '/';
     var stopped = strategy.state === 'stopped';
-    // Nothing of ours is live on it, so its feed can go at once. A halted
-    // strategy never reaches stopped and must not be stuck holding a book.
-    var quiet = stopped || strategy.state === 'halted';
-    // Older daemons did not send it; a row with no answer has its feed.
-    var feedUp = strategy.feed !== false;
 
-    var feed = actionButton('Start Feed', '', !feedUp && !halted, function () {
-      act('POST', base + 'start-feed');
-    });
-    feed.title = feedUp
-      ? strategy.id + ' already has its feed.'
-      : 'Subscribes the book for ' + strategy.id + ' again. It quotes nothing until Start.';
-    box.appendChild(feed);
-
-    var start = actionButton('Start', '', feedUp && stopped && !halted, function () {
+    var start = actionButton('Start', '', stopped && !halted, function () {
       startQuoting(strategy.kind, strategy.series || strategy.symbols.join(', '),
                    strategy.params, strategy, null);
     });
-    if (!feedUp) start.title = strategy.id + ' has no feed: start its feed first.';
-    else if (!stopped) start.title = strategy.id + ' is already running.';
+    if (!stopped) start.title = strategy.id + ' is already running.';
     box.appendChild(start);
 
-    // Stop means stop: the quotes come off and the feed goes with them. The
-    // daemon will not drop the book a strategy was quoting until its cancels
-    // are confirmed, so a running one is stopped here and its feed dropped by
-    // closeStopped() once it has gone quiet. A row that is already stopped
-    // has nothing to withdraw and loses its feed at once.
-    var stop = actionButton('Stop', '', feedUp && !closing[strategy.id], function () {
-      if (quiet) {
-        act('POST', base + 'stop-feed');
-        return;
-      }
-      closing[strategy.id] = true;
+    // Stop means the quotes come off. The book stays: it belongs to the
+    // daemon when the instrument is watched, and to the row until it is
+    // thrown away when it is not - either way a position on it can still
+    // be priced, which is why Stop used to take the feed and no longer does.
+    var stop = actionButton('Stop', '', !stopped && !halted, function () {
       act('POST', base + 'stop');
     });
-    stop.title = !feedUp
-      ? strategy.id + ' is stopped and has no feed.'
-      : (quiet
-          ? 'Stops the feed for ' + strategy.id + '. The row stays.'
-          : 'Withdraws the quotes, then stops the feed once the cancels are confirmed.');
+    stop.title = stopped
+      ? strategy.id + ' is already stopped.'
+      : 'Withdraws the quotes for ' + strategy.id + '. The row stays.';
     box.appendChild(stop);
 
-    // Only on a row with nothing live behind it: no quotes, no feed. It is
-    // the same button a blank row has, and here it is the one call that
-    // removes a strategy.
-    var drop = actionButton('\u00d7', 'drop', !feedUp, function () {
+    // Only on a row with nothing live behind it. The daemon refuses it
+    // otherwise, and drops the row's own feed with it if it had one.
+    var drop = actionButton('\u00d7', 'drop', stopped, function () {
       act('POST', base + 'destroy');
     });
-    drop.title = feedUp
-      ? 'Stop ' + strategy.id + ' first; a row with a feed is not thrown away.'
-      : 'Removes ' + strategy.id + ' and this row.';
+    drop.title = stopped
+      ? 'Removes ' + strategy.id + ' and this row.'
+      : 'Stop ' + strategy.id + ' first; a running row is not thrown away.';
     box.appendChild(drop);
     return box;
   }
@@ -1163,6 +1153,46 @@
     });
   }
 
+  // Exiting a position (G13): how much, and then the order. The side, the
+  // price and what is resting there all come from the snapshot, so this asks
+  // about the one thing the daemon cannot decide - how much of it to give up.
+  function askExit(position) {
+    var size = Math.abs(Number(position.net));
+    var selling = Number(position.net) > 0;
+    var side = selling ? 'sell' : 'buy';
+    ask({
+      title: 'Exit ' + position.symbol + '?',
+      rows: [
+        ['position', (selling ? 'long ' : 'short ') + size],
+        ['order', side + ' at ' + show(position.exit_price) + '%, IOC'],
+        ['resting there', show(position.exit_available) + ' at that price'],
+        ['per order', snapshot.limits.max_quantity + ' contracts, ' +
+                      snapshot.limits.max_notional + ' notional'],
+        ['recovery', snapshot.recovery]
+      ],
+      input: {
+        label: 'quantity',
+        value: String(size),
+        of: 'of ' + size,
+        valid: function (text) {
+          if (!/^\d+(\.\d{1,2})?$/.test(text)) return false;
+          var value = Number(text);
+          return value > 0 && value <= size;
+        }
+      },
+      says: Number(position.exit_available) < size
+        ? 'Only ' + show(position.exit_available) + ' is resting at that price. An IOC fills ' +
+          'what it can and the rest is cancelled, so this may close only part of the position.'
+        : 'It crosses the spread now. What does not fill is cancelled, not left resting.',
+      confirm: selling ? 'Sell to exit' : 'Buy to exit',
+      danger: true
+    }).then(function (qty) {
+      if (!qty) return;
+      act('POST', '/api/positions/' + encodeURIComponent(position.symbol) + '/exit',
+          { qty: qty });
+    });
+  }
+
   function renderPositions() {
     var body = document.querySelector('#positions tbody');
     clear(body);
@@ -1189,6 +1219,23 @@
       cell(row, pnl.realized, 'num');
       cell(row, pnl.unrealized, 'num');
       cell(row, pnl.total, 'num');
+
+      // Exiting it (G13). Whether it can be exited at all is the daemon's
+      // answer, not this page's: `exit_refusal` is empty exactly when the
+      // order would go out, and it doubles as the tooltip when it is not.
+      var action = el('td');
+      var refusal = position.exit_refusal;
+      var exitable = refusal === '' && Number(position.net) !== 0;
+      var button = actionButton('Exit', 'danger', exitable, function () {
+        askExit(position);
+      });
+      button.id = 'exit-' + position.symbol;
+      button.title = exitable
+        ? 'Cross to ' + show(position.exit_price) + ' for up to ' +
+          show(position.exit_available) + ', IOC.'
+        : show(refusal);
+      action.appendChild(button);
+      row.appendChild(action);
       body.appendChild(row);
     });
 
@@ -1209,16 +1256,16 @@
   // after this file was written renders its own row (design §4).
   //
   // A blank row is never conjured up: the operator presses Add row for one
-  // (GUI-Q26), fills it in, and presses Start Feed or Start. On Start it
-  // becomes a live strategy and the blank row goes, because the strategy's
-  // own row is now there in its place.
+  // (GUI-Q26), fills it in, and presses Start. It then becomes a live
+  // strategy and the blank row goes, because the strategy's own row is now
+  // there in its place.
   //
-  // Each row's buttons are the daemon's verbs: Start Feed is create on a
-  // blank row and start-feed on a row that has been stopped, and either way
-  // it subscribes the book and quotes nothing; Start is create (if needed)
-  // then start then arm - it puts live orders in the market, which is why it
-  // asks first; Stop is stop and then stop-feed, which leaves the row where
-  // it is with no feed; and the x on such a row is destroy.
+  // Start and Stop are the whole of it (GUI-Q35). Start is create (if
+  // needed) then start then arm - it puts live orders in the market, which
+  // is why it asks first; Stop withdraws the quotes and leaves the row; and
+  // the x on a stopped row is destroy. There is no button that creates a
+  // strategy without arming it: `create` on the HTTP API and the console
+  // still do, for an operator who wants one computing and sending nothing.
   var drafts = [];
   var nextDraft = 1;
 
@@ -1333,12 +1380,6 @@
     var mine = strategyOn(draft.kind, symbol);
     // A strategy is controlled from its own row, never from two places.
     var taken = mine ? mine.id + ' is already on ' + symbol + ' - use its row above.' : '';
-
-    var feed = actionButton('Start Feed', '', !mine && !halted, function () {
-      createFromDraft(draft);
-    });
-    if (taken) feed.title = taken;
-    box.appendChild(feed);
 
     var start = actionButton('Start', '', !mine && !halted, function () {
       startQuoting(draft.kind, symbol, draftParams(draft), null, draft);
@@ -1484,7 +1525,7 @@
       draft.status.textContent = snapshot && snapshot.state === 'halted'
         ? 'The daemon has halted. Nothing starts again in this process.'
         : mine ? mine.id + ' is already on that symbol - use its row above.'
-               : 'Start Feed subscribes the book and quotes nothing. Start quotes.';
+               : 'Start creates it, starts it and arms it. It asks first.';
     });
   }
 
@@ -1628,7 +1669,7 @@
     // fixed for the life of the run, set on the command line, and the
     // daemon logs them at startup; the Start dialog still names them, which
     // is where an operator is actually deciding to send an order. They are
-    // still in the snapshot for anything scripted (GET /api/snapshot).
+    // still in the snapshot endpoint for anything scripted.
   }
 
   // A page nobody is looking at still has news: the counts sit in the nav so
@@ -1678,7 +1719,6 @@
 
     stream.addEventListener('snapshot', function (event) {
       snapshot = JSON.parse(event.data);
-      closeStopped();
       lastEventAt = Date.now();
       failedConnects = 0;
       document.body.className = '';

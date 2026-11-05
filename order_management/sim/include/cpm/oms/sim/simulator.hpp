@@ -62,6 +62,17 @@ public:
     void settle(const std::string& symbol, SettlementReport::Outcome outcome, Price price,
                 Qty long_quantity, Qty short_quantity);
 
+    // Trades against what is resting, as another participant would, and
+    // returns the quantity that traded. The seeded book lets a client's taker
+    // fill; this is the other half, so a client's own maker quote can fill
+    // too - which is the only way a position exists in this simulator at
+    // all. IOC: it takes what it can and leaves nothing behind.
+    Qty trade(const std::string& symbol, Side side, Qty quantity, Price price);
+
+    // Another participant's resting order, for a test that needs liquidity
+    // at a price the seeded book does not hold.
+    void rest(const std::string& symbol, Side side, Qty quantity, Price price);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

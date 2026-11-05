@@ -31,7 +31,9 @@ public:
     // `quotes` opens the quotes file as well. It is off by default because a
     // market maker changes its quotes about once a second per strategy,
     // while a fill or a P&L row is worth keeping from every run.
-    explicit RecordLog(const std::string& dir, bool quotes = false);
+    // `run` names this run's directory inside the day's, so a run's records
+    // sit beside its logs rather than appended to the day's (see DailyFile).
+    explicit RecordLog(const std::string& dir, bool quotes = false, const std::string& run = {});
 
     // One strategy's quoting decision, as the daemon sees it from outside:
     // what is resting, what the book and the reference venue said at the

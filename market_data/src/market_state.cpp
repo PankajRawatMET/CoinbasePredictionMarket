@@ -42,11 +42,16 @@ void MarketState::apply(const BookSnapshot& snapshot) {
         // book over, and an L1 one would shrink an L2 book to its top level.
         // invalidate_books() unbinds, so a Stage 5 resubscribe takes over.
         if (instrument.book.valid() && instrument.book.md_req_id() != snapshot.md_req_id) {
+            // Counted, not flagged: two deliberate subscriptions on one
+            // instrument duplicate every message there is, which is normal
+            // (O7). An owner that unsubscribed WITHOUT unbinding lands here
+            // too and is a defect, but only the owner can tell the two
+            // apart - Trader::tick watches these counters for exactly that.
             ++ignored_foreign_snapshots_;
-            return;
+        } else {
+            instrument.book.apply(snapshot);
+            anomalies.swap(instrument.pending);
         }
-        instrument.book.apply(snapshot);
-        anomalies.swap(instrument.pending);
     }
     dispatch(std::move(anomalies));
 }
@@ -70,10 +75,10 @@ void MarketState::apply(const BookUpdate& update) {
         // delivered the binding snapshot may update the book.
         if (instrument.book.md_req_id() != update.md_req_id) {
             ++ignored_foreign_updates_;
-            return;
+        } else {
+            instrument.book.apply(update);
+            anomalies.swap(instrument.pending);
         }
-        instrument.book.apply(update);
-        anomalies.swap(instrument.pending);
     }
     dispatch(std::move(anomalies));
 }
@@ -147,7 +152,17 @@ void MarketState::apply(const InstrumentLifecycle& lifecycle) {
 
 void MarketState::invalidate_books() {
     std::lock_guard lock(mutex_);
-    for (auto& [symbol, instrument] : instruments_) instrument.book.invalidate();
+    for (auto& [symbol, instrument] : instruments_) {
+        instrument.book.invalidate();
+    }
+}
+
+bool MarketState::invalidate_book(const std::string& symbol) {
+    std::lock_guard lock(mutex_);
+    const auto it = instruments_.find(symbol);
+    if (it == instruments_.end()) return false;
+    it->second.book.invalidate();
+    return true;
 }
 
 std::size_t MarketState::evict_finished(std::chrono::seconds older_than, Clock::time_point now) {

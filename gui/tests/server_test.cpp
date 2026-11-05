@@ -318,6 +318,55 @@ TEST_F(ServerTest, TheKillSwitchIsOnePost) {
     EXPECT_NE(strategy.find("state")->text, "running");
 }
 
+// --- exiting a position over HTTP (G13) -----------------------------------
+
+TEST_F(ServerTest, ExitsAPositionWithOnePost) {
+    cpm::trader::PositionView position;
+    position.symbol = kSym;
+    position.net = 500;  // long 5
+    position.fills = 2;
+    daemon.positions.push_back(position);
+
+    // The quantity is in contracts, written as the page shows it.
+    EXPECT_EQ(status_of(authed("POST", "/api/positions/" + kSym + "/exit", R"({"qty":2})")), 200);
+    ASSERT_EQ(daemon.exits.size(), 1u);
+    EXPECT_EQ(daemon.exits.front().symbol, kSym);
+    EXPECT_EQ(daemon.exits.front().side, cpm::oms::Side::Sell);
+    EXPECT_EQ(daemon.exits.front().quantity, 200);
+
+    // No body, or no quantity in it, is the whole position.
+    EXPECT_EQ(status_of(authed("POST", "/api/positions/" + kSym + "/exit")), 200);
+    ASSERT_EQ(daemon.exits.size(), 2u);
+    EXPECT_EQ(daemon.exits.back().quantity, 500);
+}
+
+TEST_F(ServerTest, AnExitRefusalCrossesTheWireAsOne) {
+    // Nothing is held, so there is nothing to exit: an operator error, which
+    // is a 409 like every other refusal, with the daemon's own words in it.
+    const auto response = authed("POST", "/api/positions/" + kSym + "/exit", R"({"qty":1})");
+    EXPECT_EQ(status_of(response), 409);
+    EXPECT_NE(body_of(response).find("holds no position"), std::string::npos)
+        << body_of(response);
+    EXPECT_TRUE(daemon.exits.empty());
+}
+
+TEST_F(ServerTest, RefusesAnExitBodyThatIsNotAQuantity) {
+    cpm::trader::PositionView position;
+    position.symbol = kSym;
+    position.net = 500;
+    daemon.positions.push_back(position);
+
+    EXPECT_EQ(status_of(authed("POST", "/api/positions/" + kSym + "/exit", "{not json")), 400);
+    EXPECT_EQ(status_of(authed("POST", "/api/positions/" + kSym + "/exit", R"({"qty":"two"})")),
+              400);
+    EXPECT_EQ(status_of(authed("POST", "/api/positions/" + kSym + "/exit", R"({"qty":-1})")), 400);
+    EXPECT_EQ(status_of(authed("POST", "/api/positions/" + kSym + "/exit", R"({"qty":[]})")), 400);
+    // An exit is a POST, and the path needs the action on the end.
+    EXPECT_EQ(status_of(authed("GET", "/api/positions/" + kSym + "/exit")), 405);
+    EXPECT_EQ(status_of(authed("POST", "/api/positions/" + kSym)), 404);
+    EXPECT_TRUE(daemon.exits.empty()) << "nothing may reach the venue from a bad request";
+}
+
 TEST_F(ServerTest, SendsTheLogTailOnTheStreamAndThenOnlyWhatIsNew) {
     // A line written before the page arrived: the panel at the bottom must
     // show it, or a reload would lose the halt that explains the screen.

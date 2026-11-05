@@ -233,8 +233,29 @@ OeCallbacks Reconciler::callbacks() {
                                         event.text);
     };
     callbacks.report = [this](const ExecutionReport& report) {
-        // A rejected order is a reject like any other.
+        // A rejected order is a reject like any other, with one exception.
         if (report.exec_type == ExecType::Rejected) {
+            // A quote caught by the bell. OrdRejReason 44 is "not allowed by
+            // market state", and when the instrument's own name says its
+            // window has already ended, that is a race we lost rather than
+            // anything we have lost track of: the order never existed, the
+            // venue cancels what was resting on a window it closes, and the
+            // position is untouched. It is the same judgement the cancel
+            // reject below already makes - on 2026-11-04 the daemon forgave
+            // the late cancel and halted on the late order, in the same
+            // quarter of a second, for the same reason.
+            //
+            // Narrow on purpose: only reason 44, and only on a name that
+            // parses and whose end has passed. A 44 on a live window means
+            // the daemon is wrong about what is trading, and still halts.
+            const bool after_the_bell =
+                options_.window_has_ended && options_.window_has_ended(report.symbol);
+            if (report.reject_reason && *report.reject_reason == 44 && after_the_bell) {
+                logger_.warn("order " + report.cl_ord_id + " rejected: " + report.text +
+                             " - " + report.symbol + "'s window had already ended, so this "
+                             "order was late, not wrong; carrying on");
+                return;
+            }
             raise(Halt::Reason::Reject, "order " + report.cl_ord_id + " rejected: " + report.text);
             return;
         }

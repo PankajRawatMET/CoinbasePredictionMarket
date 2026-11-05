@@ -87,4 +87,12 @@ void Simulator::settle(const std::string& symbol, SettlementReport::Outcome outc
     impl_->app.settle(symbol, outcome, price, long_quantity, short_quantity);
 }
 
+Qty Simulator::trade(const std::string& symbol, Side side, Qty quantity, Price price) {
+    return impl_->app.trade(symbol, side, quantity, price);
+}
+
+void Simulator::rest(const std::string& symbol, Side side, Qty quantity, Price price) {
+    impl_->app.rest(symbol, side, quantity, price);
+}
+
 }  // namespace cpm::oms::sim

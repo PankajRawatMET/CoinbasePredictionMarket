@@ -124,6 +124,53 @@ TEST(MarketStateTest, InvalidatingUnbindsSoAResubscribeTakesOver) {
     EXPECT_EQ(state.ignored_foreign_snapshots(), 0u);
 }
 
+// One symbol's book, for an owner that has just unsubscribed it. Without this
+// the daemon leaves a book bound to a subscription that no longer exists, and
+// then ignores the next one's snapshot and every update after it - a book
+// frozen at the moment the feed was dropped, still reading as live.
+TEST(MarketStateTest, InvalidatingOneSymbolLetsTheNextSubscriptionRebuildIt) {
+    MarketState state;
+    state.apply(snapshot("book-1", {{510, 500}}, {{480, 300}}));
+    EXPECT_TRUE(state.invalidate_book(kSym));
+    EXPECT_FALSE(state.invalidate_book("NOBODY-26NOV01-YES")) << "an unknown symbol is not an error";
+
+    state.apply(snapshot("book-2", {{470, 100}}, {{450, 100}}));
+    state.apply(update("book-2", {{BookSide::Yes, BookAction::Set, 470, 400, 1, false}}));
+
+    const auto view = state.instrument(kSym);
+    ASSERT_TRUE(view.has_value());
+    EXPECT_TRUE(view->book_valid);
+    EXPECT_EQ(view->book_md_req_id, "book-2");
+    EXPECT_EQ(view->yes, (std::vector<BookLevel>{{470, 400}}))
+        << "the stale 0.51 bid must not survive the resubscribe";
+    EXPECT_EQ(state.ignored_foreign_snapshots(), 0u);
+    EXPECT_EQ(state.ignored_foreign_updates(), 0u);
+}
+
+// Two deliberate subscriptions on one instrument are not a fault: the
+// gateway sends every message once per subscription (O7), the first binding
+// keeps the book, and the duplicates are counted rather than flagged. An
+// owner that unsubscribed without unbinding lands in the same counters, and
+// only the owner can tell the two apart - Trader::watch_for_an_orphaned_book
+// does, because that daemon never subscribes one symbol twice.
+TEST(MarketStateTest, ASecondSubscriptionIsCountedAndTheBookStopsMoving) {
+    MarketState state;
+    std::vector<BookAnomaly> seen;
+    state.on_anomaly([&](const BookAnomaly& anomaly) { seen.push_back(anomaly); });
+
+    state.apply(snapshot("book-1", {{510, 500}}, {{480, 300}}));
+    state.apply(snapshot("book-2", {{470, 100}}, {{450, 100}}));
+    state.apply(update("book-2", {{BookSide::Yes, BookAction::Set, 470, 400, 1, false}}));
+    state.apply(update("book-2", {{BookSide::Yes, BookAction::Set, 460, 400, 2, false}}));
+
+    EXPECT_TRUE(seen.empty()) << "a duplicate subscription is normal, not an anomaly";
+    EXPECT_EQ(state.ignored_foreign_snapshots(), 1u);
+    EXPECT_EQ(state.ignored_foreign_updates(), 2u);
+    // The counters are the only signal, which is why they are watched: the
+    // book is frozen on the first subscription's last word.
+    EXPECT_EQ(state.instrument(kSym)->yes, (std::vector<BookLevel>{{510, 500}}));
+}
+
 TEST(MarketStateTest, AnomaliesReachTheHandlerWithoutTheStateLocked) {
     MarketState state;
     std::vector<BookAnomaly> seen;

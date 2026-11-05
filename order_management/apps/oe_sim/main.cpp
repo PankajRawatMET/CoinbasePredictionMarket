@@ -9,6 +9,7 @@
 #include "cpm/common/logging.hpp"
 #include "cpm/oms/sim/simulator.hpp"
 
+#include <algorithm>
 #include <csignal>
 #include <cstdlib>
 #include <iostream>
@@ -21,11 +22,18 @@ struct Args {
     cpm::oms::sim::SimOptions sim;
     bool verbose = false;
     bool replaced_instruments = false;
+    // Seconds between takes, 0 for none. The seeded book gives a client's
+    // taker something to cross; this is the other half, so a client that
+    // only ever quotes can still be filled - and without a fill there is no
+    // position, which is most of what an operator's page shows.
+    int take_every = 0;
+    cpm::Qty take_quantity = 100;  // one contract
 };
 
 void usage() {
     std::cerr << "usage: oe_sim [--port N] [--dict-dir DIR] [--taker-bps N] [--maker-bps N]\n"
                  "              [--instrument SYMBOL]... [--no-seed-book] [--verbose]\n"
+                 "              [--take-every SECS] [--take-qty CONTRACTS]\n"
                  "env: CPM_OE_API_KEY CPM_OE_PASSPHRASE CPM_OE_SECRET\n"
                  "     [CPM_OE_PORT] [CPM_OE_TARGET_COMP_ID=CPMOE]\n";
 }
@@ -61,6 +69,12 @@ Args parse_args(int argc, char** argv) {
                 a.replaced_instruments = true;
             }
             a.sim.instruments.push_back({value(), true, std::chrono::milliseconds{0}});
+        }
+        else if (flag == "--take-every") a.take_every = to_int(flag, value());
+        else if (flag == "--take-qty") {
+            const auto parsed = cpm::parse_qty(value());
+            if (!parsed || *parsed <= 0) throw std::invalid_argument("--take-qty needs a quantity");
+            a.take_quantity = *parsed;
         }
         else if (flag == "--verbose") a.verbose = true;
         else if (flag == "--help" || flag == "-h") { usage(); std::exit(0); }
@@ -99,10 +113,41 @@ int main(int argc, char** argv) {
             args.sim.target_comp_id = *id;
         }
 
+        const auto instruments = args.sim.instruments;
+        const int take_every = args.take_every;
+        const auto take_quantity = args.take_quantity;
         cpm::oms::sim::Simulator sim(std::move(args.sim), logger);
         sim.start();
         int sig = 0;
-        while (sig != SIGINT && sig != SIGTERM) sig = sigwaitinfo(&signals, nullptr);
+        if (take_every <= 0) {
+            while (sig != SIGINT && sig != SIGTERM) sig = sigwaitinfo(&signals, nullptr);
+        } else {
+            logger.info("taking " + cpm::format_qty(take_quantity) + " from the client's best bid "
+                        "every " + std::to_string(take_every) + "s");
+            // Hits the client's own best bid, which is the only resting order
+            // of theirs a seller can reach. The seeded liquidity is left
+            // alone: taking that would tell the client nothing.
+            timespec wait{take_every, 0};
+            while (sig != SIGINT && sig != SIGTERM) {
+                sig = sigtimedwait(&signals, nullptr, &wait);
+                if (sig > 0) break;
+                for (const auto& instrument : instruments) {
+                    cpm::Price best = 0;
+                    for (const auto& order :
+                         sim.book(instrument.symbol, cpm::oms::Side::Buy)) {
+                        if (order.owner != "client") continue;
+                        best = std::max(best, order.price);
+                    }
+                    if (best == 0) continue;
+                    const auto filled =
+                        sim.trade(instrument.symbol, cpm::oms::Side::Sell, take_quantity, best);
+                    if (filled > 0) {
+                        logger.info("took " + cpm::format_qty(filled) + " of " +
+                                    instrument.symbol + " at " + cpm::format_price(best));
+                    }
+                }
+            }
+        }
         logger.info("oe_sim: stopping");
         sim.stop();
         return 0;

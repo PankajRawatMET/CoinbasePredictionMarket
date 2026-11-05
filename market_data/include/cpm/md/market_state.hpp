@@ -90,6 +90,13 @@ public:
     // Stage 5: every book must be rebuilt from a fresh snapshot. Trades,
     // volume, open interest and lifecycle are kept: they have no snapshot.
     void invalidate_books();
+    // One symbol's book, for an owner that has just unsubscribed it. Without
+    // this the book stays bound to the subscription that is now gone, and
+    // the next subscription's snapshot is ignored as a second subscriber's
+    // (O7) - leaving a frozen book that still looks live. Returns false if
+    // the symbol is unknown, which is not an error: a feed may be dropped
+    // before any snapshot bound it.
+    bool invalidate_book(const std::string& symbol);
 
     // Drops instruments that have finished trading and have been quiet for
     // `older_than`. Without this a long run accumulates every instrument it

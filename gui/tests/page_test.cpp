@@ -110,7 +110,8 @@ TEST(Page, EveryFieldThePageReadsIsInTheSnapshot) {
     ASSERT_FALSE(positions->items.empty());
     expect_fields(positions->items[0],
                   {"symbol", "net", "bought", "sold", "cash", "bought_value", "sold_value",
-                   "fees", "fills", "settlement_payout"},
+                   "fees", "fills", "settlement_payout", "status", "exit_price",
+                   "exit_available", "exit_refusal"},
                   "a position");
 
     const auto* pnl = parsed.value.find("pnl");
@@ -327,9 +328,10 @@ TEST(Page, PutsEveryRowUnderOneHeaderOfColumns) {
 
 TEST(Page, GivesEveryRowTheSameButtons) {
     const auto page = the_page();
-    // GUI-Q26: Start Feed, Start, Stop, and those three only. Arm and Remove
-    // are not buttons - Start arms, and the x is how a row goes.
-    EXPECT_TRUE(contains(page, "actionButton('Start Feed'"));
+    // GUI-Q26, as GUI-Q34 and GUI-Q35 left it: Start and Stop, and those
+    // two only, on a blank row and on a live one alike. Arm and Remove are
+    // not buttons - Start arms, and the x is how a row goes.
+    EXPECT_FALSE(contains(page, "actionButton('Create'"));
     EXPECT_TRUE(contains(page, "actionButton('Start'"));
     EXPECT_TRUE(contains(page, "actionButton('Stop'"));
     EXPECT_FALSE(contains(page, "actionButton('Apply'"));
@@ -337,18 +339,16 @@ TEST(Page, GivesEveryRowTheSameButtons) {
     EXPECT_FALSE(contains(page, "actionButton('Arm'"));
     EXPECT_FALSE(contains(page, "actionButton('Disarm'"));
     EXPECT_FALSE(contains(page, "actionButton('Remove'"));
-    // Stop takes the feed with it but leaves the row: the quotes come off,
-    // then the feed goes once the strategy has actually stopped, which is
-    // what closeStopped() waits for. The row is then one Start Feed from
-    // being watched again, and the x is the only thing that removes it.
-    EXPECT_TRUE(contains(page, "base + 'stop-feed'"));
-    EXPECT_TRUE(contains(page, "base + 'start-feed'"));
+    // Stop withdraws the quotes and leaves the row, and the book stays:
+    // the daemon owns what it watches, and a row's own book lives until the
+    // x throws the row away (GUI-Q34). The feed verbs are not on the page
+    // at all any more - they are an override, and they live on the console.
+    EXPECT_FALSE(contains(page, "base + 'stop-feed'"));
+    EXPECT_FALSE(contains(page, "base + 'start-feed'"));
+    EXPECT_FALSE(contains(page, "actionButton('Start Feed'"));
     EXPECT_TRUE(contains(page, "'destroy'"));
-    EXPECT_TRUE(contains(page, "function closeStopped()"));
-    EXPECT_TRUE(contains(page, "strategy.state !== 'stopped'"));
-    // The buttons follow the feed, so a row has to be redrawn when it
-    // changes - the whole point of the signature (GUI-Q28).
-    EXPECT_TRUE(contains(page, "strategy.feed"));
+    // The x needs a stopped row, not a feed that has gone.
+    EXPECT_TRUE(contains(page, "actionButton('\\u00d7', 'drop', stopped"));
     // Start still asks before it sends an order (GUI-Q8), and it is the only
     // thing on the page that arms.
     EXPECT_TRUE(contains(page, "Start quoting"));
@@ -491,11 +491,14 @@ TEST_F(PagePaths, EveryButtonOnThePageReachesSomething) {
     // Start arms, so arm is among them; Stop stops and then drops the feed;
     // Start Feed brings it back; and the x on a row with no feed destroys.
     // Disarm is not on the page at all.
-    for (const std::string action : {"start", "arm", "stop", "stop-feed", "start-feed",
-                                     "destroy"}) {
+    for (const std::string action : {"start", "arm", "stop", "destroy"}) {
         EXPECT_TRUE(contains(page, "'" + action + "'")) << action << " is not on the page";
     }
     EXPECT_FALSE(contains(page, "'disarm'")) << "nothing on the page disarms";
+    // The feed verbs left the page with GUI-Q34: the daemon owns what it
+    // watches, so there is no feed for a row to start or stop.
+    EXPECT_FALSE(contains(page, "'start-feed'")) << "the page still drives the feed";
+    EXPECT_FALSE(contains(page, "'stop-feed'")) << "the page still drives the feed";
 
     // Every one of them still answers: the page is not the only operator,
     // and the stdin console still has all of them.
@@ -517,6 +520,49 @@ TEST_F(PagePaths, EveryButtonOnThePageReachesSomething) {
     EXPECT_EQ(status_of(send("GET", "/api/snapshot")), 200);
     EXPECT_TRUE(contains(page, "/api/stop-all"));
     EXPECT_EQ(status_of(send("POST", "/api/stop-all")), 200);
+
+    // The Exit button on a position row (G13). The path it builds is answered
+    // even with nothing held - a refusal, not a 404 or the wrong method.
+    EXPECT_TRUE(contains(page, "'/api/positions/' + encodeURIComponent(position.symbol) + '/exit'"))
+        << "the page does not post an exit anywhere";
+    const auto exit_response = send("POST", "/api/positions/" + kSym + "/exit", R"({"qty":1})");
+    EXPECT_NE(status_of(exit_response), 404) << "the exit path reached nothing";
+    EXPECT_NE(status_of(exit_response), 405) << "the exit is the wrong method";
+}
+
+// The page decides nothing about whether a position may be exited: the daemon
+// answers that in `exit_refusal`, and the button follows it. Two sources for
+// one question is how a page comes to offer an order the daemon refuses - and
+// on a closed window, that order is a reject, and a reject halts the run.
+TEST(Page, TheExitButtonFollowsTheDaemonsRefusalAndNotItsOwnReading) {
+    const auto page = the_page();
+    EXPECT_TRUE(contains(page, "position.exit_refusal"));
+    EXPECT_TRUE(contains(page, "actionButton('Exit'"));
+    // It never reads a status to make up its own mind about tradability.
+    EXPECT_FALSE(contains(page, "position.status === 'Open'"));
+
+    Daemon daemon;
+    PositionView position;
+    position.symbol = kSym;
+    position.net = 500;
+    daemon.positions.push_back(position);
+
+    auto parsed = cpm::gui::json_parse(cpm::gui::snapshot_json(daemon.api->snapshot()));
+    ASSERT_TRUE(parsed.ok()) << parsed.error;
+    const auto* open = &parsed.value.find("positions")->items[0];
+    EXPECT_EQ(open->find("exit_refusal")->text, "");
+    EXPECT_EQ(open->find("exit_price")->text, "50");       // percent, as the page shows prices
+    EXPECT_EQ(open->find("exit_available")->text, "5");    // contracts resting at that price
+    EXPECT_EQ(open->find("status")->text, "Open");
+
+    // Halted, the same position carries the reason instead, which is what the
+    // disabled button's tooltip shows.
+    daemon.host->halt("market data: Gap on " + kSym);
+    parsed = cpm::gui::json_parse(cpm::gui::snapshot_json(daemon.api->snapshot()));
+    const auto* halted = &parsed.value.find("positions")->items[0];
+    EXPECT_NE(halted->find("exit_refusal")->text.find("halted"), std::string::npos)
+        << halted->find("exit_refusal")->text;
+    EXPECT_EQ(halted->find("exit_price")->type, JsonValue::Type::Null);
 }
 
 TEST_F(PagePaths, TheServedPageIsTheFileInTheTree) {

@@ -501,6 +501,33 @@ HttpResponse Server::route(const HttpRequest& request) {
         return json_response(result.ok() ? 200 : 409, result_json(result, api_.revision()));
     }
 
+    // POST /api/positions/{symbol}/exit, body {"qty": N} (G13). The quantity
+    // is in contracts, written as the page shows it, and 0 or absent is the
+    // whole position.
+    if (parts.size() == 4 && parts[0] == "api" && parts[1] == "positions" && parts[3] == "exit") {
+        if (request.method != "POST") return refusal(405, "an exit is a POST");
+        Qty qty = 0;
+        if (!request.body.empty()) {
+            const auto parsed = json_parse(request.body);
+            if (!parsed.ok()) return refusal(400, "the request body is not JSON: " + parsed.error);
+            if (const auto* value = parsed.value.find("qty"); value != nullptr) {
+                // A number or the same text the page renders: both arrive as
+                // the digits that were sent, so neither goes through a double.
+                if (value->type != JsonValue::Type::Number &&
+                    value->type != JsonValue::Type::String) {
+                    return refusal(400, "\"qty\" must be a number or a string");
+                }
+                const auto contracts = cpm::parse_qty(value->text);
+                if (!contracts) {
+                    return refusal(400, "\"qty\" is not a quantity: " + value->text);
+                }
+                qty = *contracts;
+            }
+        }
+        const auto result = api_.exit_position(parts[2], qty);
+        return json_response(result.ok() ? 200 : 409, result_json(result, api_.revision()));
+    }
+
     // POST /api/strategies            create
     // POST /api/strategies/{id}/{action}, where params carries a body
     if (!parts.empty() && parts[0] == "api" && parts.size() >= 2 && parts[1] == "strategies") {

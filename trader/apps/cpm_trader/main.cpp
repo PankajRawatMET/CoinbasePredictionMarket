@@ -53,6 +53,53 @@
 
 namespace {
 
+// "2026-11-04T08:00:00.000Z" -> "080000": this run's directory inside the
+// day's. The time it started is the one name that is unique per run, sorts
+// in order, and means something to the operator who started it.
+std::string run_directory_name(std::string_view stamp) {
+    std::string name;
+    const auto time = stamp.find('T');
+    if (time == std::string_view::npos) return name;
+    for (std::size_t i = time + 1; i < stamp.size() && name.size() < 6; ++i) {
+        if (stamp[i] >= '0' && stamp[i] <= '9') name.push_back(stamp[i]);
+    }
+    return name;
+}
+
+// The one line the operator is looking for at startup is also the one that
+// scrolls away fastest: the feed starts talking within seconds of it. So the
+// link is shown once more, last of all, between two rules and in colour,
+// where an eye can find it in the scrollback without reading timestamps.
+//
+// Only on a terminal, and never through the Logger. Escape codes belong in
+// neither the log files nor the page's log panel, and both already hold the
+// plain `open:` banner line - `grep -m1 open: logs/latest/cpm-trader.log`
+// is what a script or a second window should read. A redirected or piped run
+// therefore prints exactly what it printed before. NO_COLOR and TERM=dumb
+// drop the colour and keep the rules.
+void print_open_link(std::ostream& out, const std::string& url) {
+    if (::isatty(STDOUT_FILENO) != 1) return;
+
+    const char* term = std::getenv("TERM");
+    const bool colour = std::getenv("NO_COLOR") == nullptr &&
+                        (term == nullptr || std::string_view(term) != "dumb");
+    const char* bright = colour ? "\033[1;96m" : "";  // bold bright cyan: the link
+    const char* frame = colour ? "\033[36m" : "";    // cyan: the rules
+    const char* faint = colour ? "\033[2m" : "";     // the label above it
+    const char* off = colour ? "\033[0m" : "";
+
+    // ASCII, not box drawing: this is read in PowerShell over SSH as often
+    // as in a Linux terminal, and a legacy console renders U+2500 as noise.
+    const std::string rule(url.size() + 4, '-');
+
+    out << '\n'
+        << frame << rule << off << '\n'
+        << "  " << faint << "open the operator page:" << off << '\n'
+        << "  " << bright << url << off << '\n'
+        << frame << rule << off << "\n\n"
+        << std::flush;
+}
+
 using namespace std::chrono_literals;
 using cpm::trader::ControlApi;
 using cpm::trader::Snapshot;
@@ -94,6 +141,10 @@ struct Args {
     // Where the venue and the mappings come from. Empty means
     // <dict-dir>/binance.conf if it is there.
     std::string binance_config;
+    // Series the daemon watches for its own sake. Empty means the series
+    // named in binance.conf, which is what an operator has already said they
+    // trade; --watch none watches nothing.
+    std::vector<std::string> watch;
     int binance_stale_ms = 5000;
     bool binance_stale_set = false;
 };
@@ -109,6 +160,7 @@ void usage() {
                  "                  [--duration SECS] [--verbose]\n"
                  "                  [--binance-on] [--binance SYMBOL]... [--binance-url URL]\n"
                  "                  [--binance-config PATH] [--binance-stale-after MS]\n"
+                 "                  [--watch SERIES]... (default: the series in binance.conf)\n"
                  "env: the market data set (CPM_*), the order entry set (CPM_OE_*), and\n"
                  "     the REST set (CPM_REST_*) to target a series rather than a ticker\n"
                  "Without --allow-orders no strategy can be armed: it is an observer.\n"
@@ -143,6 +195,7 @@ Args parse_args(int argc, char** argv) {
         else if (flag == "--binance-on") a.binance_on = true;
         else if (flag == "--binance") a.binance_symbols.push_back(value());
         else if (flag == "--binance-config") a.binance_config = value();
+        else if (flag == "--watch") a.watch.push_back(value());
         else if (flag == "--binance-url") a.binance_url = value();
         else if (flag == "--binance-stale-after") { a.binance_stale_ms = to_int(flag, value()); a.binance_stale_set = true; }
         else if (flag == "--verbose") a.verbose = true;
@@ -235,6 +288,7 @@ void print_help(const ControlApi& api) {
                  "  set ID name=value ...        retune one that is not armed\n"
                  "  start|stop|arm|disarm|rm ID  act on one\n"
                  "  start-feed|stop-feed ID      its book, without its quotes\n"
+                 "  flatten SYMBOL [QTY]         exit a position, all of it by default\n"
                  "  stop-all                     the kill switch\n"
                  "  quit                         shut down cleanly\n";
     for (const auto& kind : api.kinds()) {
@@ -348,6 +402,28 @@ bool handle(const std::string& line, ControlApi& api) {
         return true;
     }
 
+    // Before the generic path below, because what follows it is a symbol and
+    // not a strategy id. "flatten" and not "exit": exit already quits.
+    if (command == "flatten") {
+        std::string symbol;
+        if (!(input >> symbol)) {
+            std::cout << "refused: flatten needs a symbol\n";
+            return true;
+        }
+        cpm::Qty qty = 0;  // all of it
+        std::string requested;
+        if (input >> requested) {
+            const auto parsed = cpm::parse_qty(requested);
+            if (!parsed) {
+                std::cout << "refused: " << requested << " is not a quantity\n";
+                return true;
+            }
+            qty = *parsed;
+        }
+        report(api.exit_position(symbol, qty));
+        return true;
+    }
+
     std::string id;
     if (!(input >> id)) { std::cout << "refused: " << command << " needs a strategy id\n"; return true; }
 
@@ -409,17 +485,29 @@ int main(int argc, char** argv) {
     // is a configuration failure is exactly the run whose log is wanted
     // afterwards. stdout keeps everything either way - these files are a
     // copy of it, and a daemon that cannot write them still trades.
+    // This run's own directory, named for the moment it started: one
+    // daemon's whole account in one place. Appending six starts into one
+    // file made every question about 2026-11-04 begin by working out which
+    // process was speaking.
+    const auto started = cpm::utc_stamp();
+    const std::string run_id = run_directory_name(started);
     std::optional<cpm::LogFiles> log_files;
     if (!args.log_dir.empty()) {
-        log_files.emplace(args.log_dir);
-        if (const auto failed = log_files->open_now(cpm::utc_stamp()); !failed.empty()) {
+        log_files.emplace(args.log_dir, run_id);
+        if (const auto failed = log_files->open_now(started); !failed.empty()) {
             logger.warn("logging to stdout only: " + failed);
             log_files.reset();
         } else {
             logger.also_to(log_files->sink());
-            logger.info("log " + log_files->narrative_path() + ", wire traffic in " +
-                        log_files->wire_path() +
-                        " (a new directory under " + args.log_dir + " at midnight UTC)");
+            logger.info("log " + log_files->narrative_path() + ", a strategy's own quoting in " +
+                        log_files->strategy_path() + ", wire traffic in " +
+                        log_files->wire_path());
+            // A fixed name for "the run going on now", so an operator and a
+            // script can both find it without reading the banner.
+            if (const auto failed_link = cpm::point_latest_at(args.log_dir, started, run_id);
+                !failed_link.empty()) {
+                logger.debug("no latest link: " + failed_link);
+            }
         }
     }
 
@@ -458,6 +546,7 @@ int main(int argc, char** argv) {
         // The record files live beside the .log files, in the same directory
         // and under the same flag.
         options.log_dir = args.log_dir;
+        options.log_run = run_id;
         options.quote_records = args.quote_records;
         options.allow_orders = args.allow_orders;
         options.stale_after = std::chrono::seconds(args.stale_after_secs);
@@ -499,6 +588,26 @@ int main(int argc, char** argv) {
         }
         options.reference = reference.feed;
         options.reference_symbols = reference.symbols;
+
+        // What the daemon watches on its own: the series named with --watch,
+        // or, when none were, the ones binance.conf already maps - an
+        // operator who has said which series they price has said which ones
+        // they trade. "none" is how to ask for the old behaviour, where a
+        // book existed only because a strategy claimed it.
+        options.watch = args.watch;
+        if (options.watch.size() == 1 && options.watch.front() == "none") {
+            options.watch.clear();
+        } else if (options.watch.empty()) {
+            // Whatever the file declares. A key is matched against both a
+            // ticker's series and its asset when pricing (BTCD15M and BTC
+            // would both reach BTCUSDT), but only what is written in the
+            // file is here, and a key that names no series this venue lists
+            // is reported as "not watching <key>" and left alone.
+            for (const auto& [key, mapping] : reference.symbols) {
+                (void)mapping;
+                options.watch.push_back(key);
+            }
+        }
 
         for (const auto& symbol : args.binance_symbols) options.reference.symbols.push_back(symbol);
         if (!args.binance_url.empty()) {
@@ -582,6 +691,7 @@ int main(int argc, char** argv) {
         }
         for (const auto& line : server.banner(args.allow_orders)) logger.info(line);
         logger.info("ready: the page has the controls, and stdin takes the same ones (help)");
+        print_open_link(std::cout, server.url());
 
         LineReader console;
         bool stdin_open = true;

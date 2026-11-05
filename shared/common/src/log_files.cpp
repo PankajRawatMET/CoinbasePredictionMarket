@@ -2,11 +2,14 @@
 
 namespace cpm {
 
-LogFiles::LogFiles(std::string dir)
-    : narrative_(dir, "cpm-trader", "log"), wire_(std::move(dir), "wire", "log") {}
+LogFiles::LogFiles(std::string dir, std::string run)
+    : narrative_(dir, "cpm-trader", "log", run),
+      strategy_(dir, "strategy", "log", run),
+      wire_(std::move(dir), "wire", "log", std::move(run)) {}
 
 std::string LogFiles::open_now(const std::string& stamp) {
     if (narrative_.for_stamp(stamp).out == nullptr) return narrative_.error();
+    if (strategy_.for_stamp(stamp).out == nullptr) return strategy_.error();
     if (wire_.for_stamp(stamp).out == nullptr) return wire_.error();
     return {};
 }
@@ -25,6 +28,9 @@ Logger::Sink LogFiles::sink() {
                   std::string_view message) {
         if (source == LogSource::Wire) {
             write(wire_, level, stamp, message);
+            if (level < LogLevel::Warn) return;
+        } else if (source == LogSource::Strategy) {
+            write(strategy_, level, stamp, message);
             if (level < LogLevel::Warn) return;
         }
         write(narrative_, level, stamp, message);

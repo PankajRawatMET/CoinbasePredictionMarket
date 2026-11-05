@@ -22,6 +22,7 @@ using cpm::trader::BookView;
 using cpm::trader::ControlApi;
 using cpm::trader::DaemonState;
 using cpm::trader::LimitsView;
+using cpm::Qty;
 using cpm::trader::PositionView;
 using cpm::trader::SessionView;
 using Clock = cpm::trader::Clock;
@@ -34,7 +35,9 @@ const std::string kWindow = "BTCD15M-BTC26OCT260630-0";
 // A host with CryptoMM registered and fakes for everything a session would
 // otherwise provide, so the API can be driven with no venue at all.
 struct Fixture {
-    Fixture() {
+    // `orders` is the daemon-wide --allow-orders key, which is fixed for the
+    // life of a run and so for the life of a ControlApi.
+    explicit Fixture(bool orders = true) : allow_orders(orders) {
         cpm::strategy::register_crypto_mm(registry);
 
         StrategyHooks venue;
@@ -86,11 +89,13 @@ struct Fixture {
         env.book = [this](const std::string& symbol) -> std::optional<BookView> {
             BookView view;
             view.symbol = symbol;
-            view.valid = true;
+            view.valid = book_valid;
             view.best_yes_bid = 500;
             view.implied_yes_ask = 600;
+            view.best_yes_bid_qty = 500;
+            view.best_no_bid_qty = 400;
             view.mid = 550;
-            view.status = "open";
+            view.status = book_status;  // as cpm::md::to_string spells it
             return view;
         };
         env.resolve = [this](const std::string& series) {
@@ -109,8 +114,26 @@ struct Fixture {
             return "";
         };
         env.unsubscribe = [this](const std::string& symbol) { unsubscribed.push_back(symbol); };
+        // The operator's own order path (G13): the same gate the strategies
+        // get, the daemon's one counter, and a send that answers with the
+        // reason rather than throwing.
+        env.can_submit = [this] { return gate_open; };
+        env.resting_orders = [this](const std::string&) { return resting; };
+        env.watched = [this] { return watched; };
+        env.axis = [](const std::string& symbol) {
+            cpm::trader::AxisView axis;
+            axis.symbol = symbol;
+            axis.structure = "tapered";
+            axis.prices = {100, 500, 900};
+            return axis;
+        };
+        env.next_cl_ord_id = [this] { return "ex-" + std::to_string(++counter); };
+        env.send_order = [this](const cpm::oms::NewOrder& order) {
+            exits.push_back(order);
+            return send_error;
+        };
 
-        api = std::make_unique<ControlApi>(*host, registry, std::move(env), true);
+        api = std::make_unique<ControlApi>(*host, registry, std::move(env), allow_orders);
     }
 
     StrategySpec spec(const std::string& symbol = kSym) {
@@ -129,11 +152,36 @@ struct Fixture {
     bool oe_up = true;
     bool have_book = true;
     bool subscribe_ok = true;
+    // The instrument's lifecycle status, as the daemon spells it. Only Open
+    // may be quoted or exited ([MD] O6).
+    std::string book_status{"Open"};
+    // False is a book no live subscription is building any more.
+    bool book_valid = true;
     std::vector<std::string> subscribed, unsubscribed, sent, cancelled, resolved;
     std::string resolve_error;
     std::vector<PositionView> positions;
     std::vector<cpm::trader::PnlView> pnl;
     std::uint64_t counter = 0;
+    // The operator's exits (G13): what reached the order path, and the
+    // refusal it answers with.
+    std::vector<cpm::oms::NewOrder> exits;
+    std::string send_error;
+    // What of ours is still resting on the instrument, which an exit must
+    // not cross.
+    std::vector<cpm::strategy::LiveLeg> resting;
+    // What the daemon watches for its own sake, with or without a strategy.
+    std::vector<std::string> watched;
+
+    // A position to exit, in contracts at kQtyScale.
+    void hold(Qty net, const std::string& symbol = kSym) {
+        PositionView position;
+        position.symbol = symbol;
+        position.net = net;
+        position.bought = net > 0 ? net : 0;
+        position.sold = net < 0 ? -net : 0;
+        position.fills = 1;
+        positions.push_back(position);
+    }
 };
 
 // --- the kinds and their schemas ------------------------------------------
@@ -646,6 +694,286 @@ TEST(ControlApi, AHaltShowsItsReasonAndRefusesEverythingAfterwards) {
     EXPECT_FALSE(f.api->start(id).ok());
     EXPECT_FALSE(f.api->arm(id).ok());
     EXPECT_FALSE(f.api->create(f.spec(kOther)).ok());
+}
+
+// --- the window's own clock (G16) -----------------------------------------
+
+// Arming into the last seconds of a window is a bell, not a trade: it quotes
+// for a moment, has to come straight back off, and anything still in flight
+// at the close is INSTRUMENT_NOT_ACTIVE, which used to halt the daemon.
+TEST(ControlApi, RefusesToArmIntoAWindowThatIsAboutToEnd) {
+    Fixture f;
+    // A real dated window, dated so that it has long since ended.
+    const std::string gone = "BTCD15M-BTC26NOV040800-0";
+    const auto created = f.api->create(StrategySpec{"CryptoMM", {{"symbol", gone}, {"qty", "1"}}});
+    ASSERT_TRUE(created.ok()) << created.error;
+    ASSERT_TRUE(f.api->start(created.id).ok());
+
+    const auto armed = f.api->arm(created.id);
+    EXPECT_FALSE(armed.ok());
+    EXPECT_NE(armed.error.find("window has already ended"), std::string::npos) << armed.error;
+    // It can still be created and started - looking at a closed window is
+    // harmless, and only arming puts an order near the bell.
+    EXPECT_EQ(f.api->snapshot().strategies.size(), 1u);
+}
+
+// A name with no scheduled end has no bell to be near, so nothing changes
+// for a sports market or a simulator instrument.
+TEST(ControlApi, ArmingAnInstrumentWithNoScheduledEndIsUnaffected) {
+    Fixture f;
+    const auto id = f.api->create(f.spec()).id;
+    ASSERT_TRUE(f.api->start(id).ok());
+    EXPECT_TRUE(f.api->arm(id).ok());
+}
+
+TEST(ControlApi, RefusesAnExitOnAWindowThatHasEnded) {
+    Fixture f;
+    const std::string gone = "BTCD15M-BTC26NOV040800-0";
+    f.hold(500, gone);
+
+    const auto result = f.api->exit_position(gone, 0);
+    EXPECT_FALSE(result.ok());
+    EXPECT_NE(result.error.find("window has ended"), std::string::npos) << result.error;
+    EXPECT_TRUE(f.exits.empty());
+    // The page is told the same thing, so the button is never offered.
+    const auto snapshot = f.api->snapshot();
+    EXPECT_NE(snapshot.positions.front().exit_refusal.find("window has ended"),
+              std::string::npos);
+}
+
+// --- the ladder's price grid ----------------------------------------------
+
+// A watched instrument has a book on the page from startup, so it must have
+// a ladder too: the grid is what the ladder is drawn on, and without it the
+// page asks once, gets nothing, and shows an empty panel (GUI-Q35).
+TEST(ControlApi, AWatchedInstrumentHasALadderWithNoStrategyOnIt) {
+    Fixture f;
+    EXPECT_TRUE(f.api->axis(kSym).prices.empty()) << "nothing watches it yet";
+
+    f.watched.push_back(kSym);
+    EXPECT_FALSE(f.api->axis(kSym).prices.empty());
+    EXPECT_TRUE(f.api->axis(kOther).prices.empty()) << "only what is watched";
+
+    // And a strategy's own instrument still has one, watched or not.
+    f.watched.clear();
+    ASSERT_TRUE(f.api->create(f.spec()).ok());
+    EXPECT_FALSE(f.api->axis(kSym).prices.empty());
+}
+
+// --- exiting a position (G13) ---------------------------------------------
+// The position is per symbol and outlives the row that opened it, so exiting
+// one is an action on the position and not on any strategy.
+
+TEST(ControlApi, ExitsALongBySellingIntoTheBidForIoc) {
+    Fixture f;
+    f.hold(500);  // long 5
+
+    const auto result = f.api->exit_position(kSym, 0);  // 0 is all of it
+    ASSERT_TRUE(result.ok()) << result.error;
+    ASSERT_EQ(f.exits.size(), 1u);
+    const auto& order = f.exits.front();
+    EXPECT_EQ(order.symbol, kSym);
+    EXPECT_EQ(order.side, cpm::oms::Side::Sell);
+    EXPECT_EQ(order.quantity, 500);
+    // The bid, because that is what a long crosses into; never a market
+    // order, which this venue forces to the worst admissible price.
+    EXPECT_EQ(order.type, cpm::oms::OrderType::Limit);
+    EXPECT_EQ(order.price, 500);
+    // IOC and not post-only: it is meant to cross, and what it cannot fill
+    // must not be left resting for a cancel to halt on later (OE-Q6).
+    EXPECT_EQ(order.time_in_force, cpm::oms::TimeInForce::Ioc);
+    EXPECT_EQ(order.post_only, cpm::oms::PostOnly::None);
+    // The ClOrdID says it was not a quote, and it comes from the daemon's
+    // one counter, which is what the bookmark persists.
+    EXPECT_EQ(order.cl_ord_id, result.id);
+    EXPECT_EQ(order.cl_ord_id.rfind("ex-", 0), 0u);
+}
+
+TEST(ControlApi, ExitsAShortByBuyingTheImpliedAsk) {
+    Fixture f;
+    f.hold(-300);  // short 3
+
+    ASSERT_TRUE(f.api->exit_position(kSym, 0).ok());
+    ASSERT_EQ(f.exits.size(), 1u);
+    EXPECT_EQ(f.exits.front().side, cpm::oms::Side::Buy);
+    EXPECT_EQ(f.exits.front().quantity, 300);
+    // The YES ask this venue implies from the best NO bid (Q9).
+    EXPECT_EQ(f.exits.front().price, 600);
+}
+
+TEST(ControlApi, ExitsOnlyTheQuantityAsked) {
+    Fixture f;
+    f.hold(500);
+
+    ASSERT_TRUE(f.api->exit_position(kSym, 200).ok());
+    ASSERT_EQ(f.exits.size(), 1u);
+    EXPECT_EQ(f.exits.front().quantity, 200);
+}
+
+TEST(ControlApi, RefusesMoreThanIsHeldRatherThanClampingIt) {
+    Fixture f;
+    f.hold(300);
+
+    const auto result = f.api->exit_position(kSym, 500);
+    EXPECT_FALSE(result.ok());
+    // The number the operator typed, and the number they hold, both named.
+    EXPECT_NE(result.error.find("more than the 3 held"), std::string::npos) << result.error;
+    EXPECT_TRUE(f.exits.empty()) << "nothing may reach the venue after a refusal";
+}
+
+TEST(ControlApi, RefusesAnExitWithNoPositionAndOneThatIsFlat) {
+    Fixture f;
+    EXPECT_FALSE(f.api->exit_position(kSym, 0).ok());
+
+    f.hold(0);
+    const auto flat = f.api->exit_position(kSym, 0);
+    EXPECT_FALSE(flat.ok());
+    EXPECT_NE(flat.error.find("flat"), std::string::npos) << flat.error;
+    EXPECT_TRUE(f.exits.empty());
+}
+
+// The one that matters most: an order on a window that has stopped trading
+// is answered INSTRUMENT_NOT_ACTIVE, and that reject halts the whole run
+// (OE-Q6). So a closed position is refused here rather than at the gateway.
+TEST(ControlApi, RefusesAnExitOnAnythingButAnOpenInstrument) {
+    Fixture f;
+    f.hold(500);
+    f.book_status = "Closed";
+
+    const auto result = f.api->exit_position(kSym, 0);
+    EXPECT_FALSE(result.ok());
+    EXPECT_NE(result.error.find("Closed"), std::string::npos) << result.error;
+    EXPECT_NE(result.error.find("halts"), std::string::npos) << result.error;
+    EXPECT_TRUE(f.exits.empty());
+}
+
+// A book nobody is building is not a price. The daemon unbinds a book when it
+// unsubscribes, so this is what a position whose feed was stopped looks like,
+// and crossing to the last touch it happened to remember is how an exit ends
+// up quoting into a market that has moved on.
+TEST(ControlApi, RefusesAnExitWhenTheBookIsNoLongerLive) {
+    Fixture f;
+    f.hold(500);
+    f.book_valid = false;
+
+    const auto result = f.api->exit_position(kSym, 0);
+    EXPECT_FALSE(result.ok());
+    EXPECT_NE(result.error.find("not live"), std::string::npos) << result.error;
+    EXPECT_TRUE(f.exits.empty());
+    // And the page is told, so the button is not offered in the first place.
+    const auto snapshot = f.api->snapshot();
+    EXPECT_NE(snapshot.positions.front().exit_refusal.find("not live"), std::string::npos);
+}
+
+TEST(ControlApi, RefusesAnExitWhileAStrategyIsArmedOnTheSymbol) {
+    Fixture f;
+    f.hold(500);
+    const auto id = f.api->create(f.spec()).id;
+    ASSERT_TRUE(f.api->start(id).ok());
+    ASSERT_TRUE(f.api->arm(id).ok());
+
+    const auto result = f.api->exit_position(kSym, 0);
+    EXPECT_FALSE(result.ok());
+    EXPECT_NE(result.error.find("disarm it first"), std::string::npos) << result.error;
+    EXPECT_TRUE(f.exits.empty());
+
+    // Disarmed, the same press goes through: nothing is quoting over it now.
+    ASSERT_TRUE(f.api->disarm(id).ok());
+    EXPECT_TRUE(f.api->exit_position(kSym, 0).ok());
+    EXPECT_EQ(f.exits.size(), 1u);
+}
+
+// Disarming stops new quotes; the last ones are still in the market until
+// their cancels come back, and that is exactly the moment an operator reaches
+// for Exit. Crossing one of our own orders is a self-match, which the venue
+// answers by cancelling a side - so the exit could vanish instead of exiting.
+TEST(ControlApi, RefusesAnExitThatWouldTradeWithOurOwnRestingOrder) {
+    Fixture f;
+    f.hold(500);  // long 5, so the exit sells into the bid at 500
+    f.resting.push_back({cpm::oms::Side::Buy, "mm-7", 500, 100, false});
+
+    const auto result = f.api->exit_position(kSym, 0);
+    EXPECT_FALSE(result.ok());
+    EXPECT_NE(result.error.find("mm-7"), std::string::npos) << result.error;
+    EXPECT_NE(result.error.find("trade with itself"), std::string::npos) << result.error;
+    EXPECT_TRUE(f.exits.empty());
+
+    // Our order on the other side of the book is not in the way: an exit
+    // that sells into the bid cannot cross an offer above it.
+    f.resting.clear();
+    f.resting.push_back({cpm::oms::Side::Sell, "mm-8", 600, 100, false});
+    EXPECT_TRUE(f.api->exit_position(kSym, 0).ok());
+}
+
+TEST(ControlApi, RefusesAnExitWhileNothingMayBeSubmitted) {
+    Fixture f;
+    f.hold(500);
+    f.gate_open = false;  // reconciling
+
+    EXPECT_FALSE(f.api->exit_position(kSym, 0).ok());
+    f.gate_open = true;
+    EXPECT_TRUE(f.api->exit_position(kSym, 0).ok());
+}
+
+TEST(ControlApi, RefusesAnExitAfterAHaltAndInAnObserverRun) {
+    Fixture observer(false);  // started without --allow-orders
+    observer.hold(500);
+    const auto refused = observer.api->exit_position(kSym, 0);
+    EXPECT_FALSE(refused.ok());
+    EXPECT_NE(refused.error.find("--allow-orders"), std::string::npos) << refused.error;
+
+    Fixture f;
+    f.hold(500);
+    f.host->halt("market data: Gap on " + kSym);
+    EXPECT_FALSE(f.api->exit_position(kSym, 0).ok());
+    EXPECT_TRUE(f.exits.empty());
+}
+
+TEST(ControlApi, AnExitRefusedByTheOrderPathIsAValueNotAnException) {
+    Fixture f;
+    f.hold(500);
+    f.send_error = "OrderQty 5 exceeds the limit of 1";
+
+    const auto result = f.api->exit_position(kSym, 0);
+    EXPECT_FALSE(result.ok());
+    EXPECT_EQ(result.error, "OrderQty 5 exceeds the limit of 1");
+}
+
+TEST(ControlApi, TheSnapshotSaysWhetherEachPositionCanBeExitedAndAtWhat) {
+    Fixture f;
+    f.hold(500);
+
+    auto snapshot = f.api->snapshot();
+    ASSERT_EQ(snapshot.positions.size(), 1u);
+    const auto& open = snapshot.positions.front();
+    EXPECT_EQ(open.exit_refusal, "") << "an exitable position carries no refusal";
+    ASSERT_TRUE(open.exit_price.has_value());
+    EXPECT_EQ(*open.exit_price, 500);
+    EXPECT_EQ(open.exit_available, 500);
+    EXPECT_EQ(open.status, "Open");
+
+    // And when it cannot: the page reads the reason from here rather than
+    // deciding for itself, so the button it offers and the order the daemon
+    // would send cannot disagree.
+    f.book_status = "Settled";
+    snapshot = f.api->snapshot();
+    const auto& closed = snapshot.positions.front();
+    EXPECT_FALSE(closed.exit_refusal.empty());
+    EXPECT_FALSE(closed.exit_price.has_value());
+    EXPECT_EQ(closed.status, "Settled");
+}
+
+TEST(ControlApi, AnExitAdvancesTheRevisionSoThePageSeesTheOrder) {
+    Fixture f;
+    f.hold(500);
+    const auto before = f.api->revision();
+    ASSERT_TRUE(f.api->exit_position(kSym, 0).ok());
+    EXPECT_GT(f.api->revision(), before);
+
+    // A refusal changes nothing, so it moves nothing.
+    const auto after = f.api->revision();
+    EXPECT_FALSE(f.api->exit_position(kOther, 0).ok());
+    EXPECT_EQ(f.api->revision(), after);
 }
 
 }  // namespace

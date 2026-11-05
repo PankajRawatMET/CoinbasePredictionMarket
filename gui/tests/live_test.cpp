@@ -307,6 +307,106 @@ TEST(Live, TheKillSwitchLeavesNothingResting) {
     EXPECT_FALSE(first_strategy(live.snapshot())->find("armed")->boolean);
 }
 
+// The operator's exit, end to end (G13): a real fill makes a real position,
+// one POST crosses the real book at the order entry simulator, and the page's
+// own snapshot shows the position flat again. The only aggressive order this
+// daemon ever sends is this one.
+TEST(Live, OnePostExitsAPositionAtTheVenue) {
+    Live live;
+    ASSERT_EQ(live.start(), "") << live.logs();
+    const auto id = id_of(live.request("POST", "/api/strategies", kCreate));
+    ASSERT_FALSE(id.empty());
+    ASSERT_EQ(status_of(live.request("POST", "/api/strategies/" + id + "/start")), 200);
+    ASSERT_EQ(status_of(live.request("POST", "/api/strategies/" + id + "/arm")), 200);
+    ASSERT_TRUE(live.eventually([](const cpm::gui::JsonValue& snapshot) {
+        const auto* strategy = first_strategy(snapshot);
+        return strategy != nullptr && !strategy->find("legs")->items.empty();
+    })) << live.logs();
+
+    // Somebody sells into our bid: our maker quote fills, and that fill is
+    // what a position is made of. Nothing else in this stack can cause one.
+    const auto quoted = first_strategy(live.snapshot())->find("legs")->items;
+    ASSERT_FALSE(quoted.empty());
+    ASSERT_EQ(live.oe_sim->trade(kSym, cpm::oms::Side::Sell, 100, 1), 100)
+        << "the taker did not trade with our quote: " << live.logs();
+
+    // The page sees the position, and sees that it can be exited.
+    ASSERT_TRUE(live.eventually([](const cpm::gui::JsonValue& snapshot) {
+        const auto* positions = snapshot.find("positions");
+        return positions != nullptr && !positions->items.empty() &&
+               positions->items[0].find("net")->text == "1";
+    })) << live.logs();
+    const auto held = live.snapshot().find("positions")->items[0];
+    // Unknown, not Open: neither simulator sends a SecurityStatus for this
+    // symbol, and the status stays Unknown until one arrives ([MD] Q13).
+    // Quoting treats that as tradable, and so does exiting.
+    EXPECT_EQ(held.find("status")->text, "Unknown");
+    // While the strategy is armed the exit is refused, because the strategy
+    // would quote straight back over it.
+    EXPECT_NE(held.find("exit_refusal")->text.find("disarm"), std::string::npos)
+        << held.find("exit_refusal")->text;
+    const auto refused = live.request("POST", "/api/positions/" + kSym + "/exit", R"({"qty":1})");
+    EXPECT_EQ(status_of(refused), 409);
+    EXPECT_NE(body_of(refused).find("disarm"), std::string::npos) << body_of(refused);
+
+    // Stop, not disarm: disarming leaves the last quotes in the market, and
+    // an exit that crossed one of those would trade with itself. Stopped
+    // means the cancels have been confirmed and the book is clear of us.
+    ASSERT_EQ(status_of(live.request("POST", "/api/strategies/" + id + "/stop")), 200);
+    ASSERT_TRUE(live.eventually([](const cpm::gui::JsonValue& snapshot) {
+        const auto* strategy = first_strategy(snapshot);
+        return strategy != nullptr && strategy->find("legs")->items.empty();
+    })) << live.logs();
+    ASSERT_TRUE(live.eventually([](const cpm::gui::JsonValue& snapshot) {
+        const auto* positions = snapshot.find("positions");
+        return positions != nullptr && !positions->items.empty() &&
+               positions->items[0].find("exit_refusal")->text.empty();
+    })) << "a stopped strategy leaves the position exitable: " << live.logs();
+
+    // The two simulators keep their own books - the price comes from the
+    // market data one and the fill happens at the order entry one, which in
+    // production is one venue and here is not. So the liquidity has to be put
+    // where the exit will price itself, and the market data book moves while
+    // that is being arranged: read the price the daemon would cross to, put a
+    // bid there, press, and try again if it moved in between.
+    std::string cl_ord_id;
+    for (int attempt = 0; attempt < 12 && cl_ord_id.empty(); ++attempt) {
+        const auto held_now = live.snapshot().find("positions")->items[0];
+        const auto* price = held_now.find("exit_price");
+        if (price != nullptr && price->type == cpm::gui::JsonValue::Type::String) {
+            const auto at = cpm::parse_percent(price->text);
+            ASSERT_TRUE(at.has_value()) << price->text;
+            live.oe_sim->rest(kSym, cpm::oms::Side::Buy, 500, *at);
+        }
+        const auto exited = live.request("POST", "/api/positions/" + kSym + "/exit", R"({"qty":1})");
+        ASSERT_EQ(status_of(exited), 200) << body_of(exited);
+        // The order that went out belongs to no strategy, and says so.
+        const auto* id_sent = cpm::gui::json_parse(body_of(exited)).value.find("id");
+        ASSERT_NE(id_sent, nullptr);
+        EXPECT_EQ(id_sent->text.rfind("ex-", 0), 0u) << id_sent->text;
+
+        // An IOC that found nothing expires rather than resting, and the
+        // position is untouched: nothing to undo, so press again.
+        if (live.eventually(
+                [](const cpm::gui::JsonValue& snapshot) {
+                    const auto* positions = snapshot.find("positions");
+                    return positions != nullptr && !positions->items.empty() &&
+                           positions->items[0].find("net")->text == "0";
+                },
+                1s)) {
+            cl_ord_id = id_sent->text;
+        }
+    }
+    ASSERT_FALSE(cl_ord_id.empty()) << "the exit never crossed: " << live.logs();
+
+    // Flat, because one of those IOCs crossed a real book at the venue.
+    const auto flat = live.snapshot().find("positions")->items[0];
+    EXPECT_EQ(flat.find("sold")->text, "1");
+    // And once it is flat there is nothing left to exit.
+    EXPECT_NE(flat.find("exit_refusal")->text.find("flat"), std::string::npos)
+        << flat.find("exit_refusal")->text;
+}
+
 TEST(Live, TheStreamCarriesWhatTheDaemonDoesWhileNobodyAsks) {
     Live live;
     ASSERT_EQ(live.start(), "") << live.logs();

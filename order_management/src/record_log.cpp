@@ -38,11 +38,11 @@ constexpr const char* kOrdersHeader =
 
 }  // namespace
 
-RecordLog::RecordLog(const std::string& dir, bool quotes)
-    : fills_file_(dir, "fills", "csv"),
-      orders_file_(dir, "orders", "csv"),
-      pnl_file_(dir, "pnl", "csv"),
-      quotes_file_(dir, "quotes", "csv"),
+RecordLog::RecordLog(const std::string& dir, bool quotes, const std::string& run)
+    : fills_file_(dir, "fills", "csv", run),
+      orders_file_(dir, "orders", "csv", run),
+      pnl_file_(dir, "pnl", "csv", run),
+      quotes_file_(dir, "quotes", "csv", run),
       fills_(fills_file_, kFillsHeader),
       orders_(orders_file_, kOrdersHeader),
       pnl_(pnl_file_, kPnlHeader) {
