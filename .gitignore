@@ -68,3 +68,9 @@ perf.data.old
 callgrind.out.*
 massif.out.*
 vgcore.*
+
+# Helper scripts, written into the install directory by deploy.sh.
+/start.sh
+/stop.sh
+/status.sh
+/url.sh
