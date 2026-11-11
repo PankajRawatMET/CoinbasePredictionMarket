@@ -317,6 +317,11 @@ std::string StrategyHost::roll(const std::string& id, const std::string& symbol)
 
     auto params = entry->params;
     params["symbol"] = symbol;
+    if (const auto* kind = registry_.find(entry->kind)) {
+        for (const auto& param : kind->schema) {
+            if (param.reset_on_roll) params.erase(param.name);
+        }
+    }
     auto built = registry_.create(StrategySpec{entry->kind, params}, hooks_for(*entry));
     if (!built.ok()) {
         // The old instance is kept: a strategy with no instance at all would
@@ -566,6 +571,7 @@ StrategyInfo StrategyHost::describe(const Entry& entry) const {
     info.feed = entry.feed;
     info.note = entry.note;
     info.status = entry.strategy->status();
+    info.requires_book_updates = entry.strategy->requires_book_updates();
     // What this window has done, plus what the ones before it did.
     info.status.passes += entry.carried.passes;
     info.status.passes_without_target += entry.carried.passes_without_target;

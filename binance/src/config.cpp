@@ -170,6 +170,8 @@ std::string parse_config(std::string_view text, Config& into) {
             }
         } else if (key == "ca_file") {
             feed.ca_file = std::string(value);
+        } else if (key == "history_file") {
+            feed.history_file = std::string(unquote(value));
         } else if (key == "stale_after_ms" || key == "reconnect_after_ms" ||
                    key == "max_reconnect_after_ms" || key == "control_per_sec") {
             int amount = 0;

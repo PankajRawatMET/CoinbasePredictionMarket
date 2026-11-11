@@ -36,11 +36,12 @@ if(CPM_BUILD_TESTS)
     tests/http_test.cpp
     tests/server_test.cpp
     tests/page_test.cpp
+    tests/model_view_test.cpp
     tests/live_test.cpp
   )
   # The simulators, so the GUI can be driven against real FIX sessions rather
   # than only against fakes.
-  target_link_libraries(cpm_gui_tests PRIVATE cpm_gui cpm_crypto_mm cpm_md_sim cpm_oe_sim
+  target_link_libraries(cpm_gui_tests PRIVATE cpm_gui cpm_crypto_mm cpm_quoting_mm cpm_md_sim cpm_oe_sim
                                               GTest::gtest_main)
   target_compile_definitions(cpm_gui_tests PRIVATE CPM_DICT_DIR="${CPM_DICT_DIR}")
   cpm_set_warnings(cpm_gui_tests)

@@ -37,6 +37,8 @@ struct ParamSpec {
     std::string max;
     int scale = 0;                     // Decimal only
     std::vector<std::string> choices;  // Enum only
+    // A window-specific override must not follow a series into the next window.
+    bool reset_on_roll = false;
 
     bool required() const { return default_value.empty(); }
 };

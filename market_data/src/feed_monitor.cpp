@@ -109,6 +109,11 @@ void FeedMonitor::start() {
     thread_ = std::thread([this] { run(); });
 }
 
+void FeedMonitor::allow_quiet_books(std::vector<std::string> symbols) {
+    std::lock_guard lock(mutex_);
+    quiet_books_ = std::move(symbols);
+}
+
 void FeedMonitor::stop() {
     if (!running_.exchange(false)) return;
     phase_.store(Phase::Stopped);
@@ -144,6 +149,10 @@ void FeedMonitor::tick(Clock::time_point now) {
             const auto silence = now - subscription.last_message;
             if (silence < options_.stale_after) continue;
             if (all_instruments_finished(subscription)) continue;
+            if (!subscription.symbols.empty() &&
+                std::all_of(subscription.symbols.begin(), subscription.symbols.end(), [this](const auto& symbol) {
+                    return std::find(quiet_books_.begin(), quiet_books_.end(), symbol) != quiet_books_.end();
+                })) continue;
             stale_id = id;
             stale_symbol = subscription.symbols.empty() ? std::string() : subscription.symbols.front();
             detail = "no book update for " +

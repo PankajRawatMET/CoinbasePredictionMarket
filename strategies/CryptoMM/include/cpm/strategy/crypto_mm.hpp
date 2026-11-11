@@ -3,6 +3,7 @@
 #include "cpm/md/ticker.hpp"
 #include "cpm/md/ticks.hpp"
 #include "cpm/strategy/registry.hpp"
+#include "cpm/strategy/quote_reconciler.hpp"
 
 #include <functional>
 #include <map>
@@ -77,29 +78,6 @@ struct Params {
     std::int64_t mid_move_threshold_ticks = 0;
 };
 
-// One side's target, or nothing when that side should not be quoted.
-struct Quote {
-    Price price = 0;
-    Qty quantity = 0;
-};
-
-struct DesiredQuotes {
-    std::optional<Quote> bid;
-    std::optional<Quote> ask;
-    // The inventory limit has been reached, so this strategy is done: both
-    // sides come off and it stops itself, rather than quoting the one side
-    // that would reduce the position. Decided here with everything else, and
-    // acted on by on_market, which is the only thing that may touch a hook.
-    bool stop = false;
-    // Why a side is absent, for the log. Empty when both sides are quoted.
-    std::string reason;
-    // Which way the pair was rounded onto the grid, and what decided it
-    // ("position" or "qty imbalance"), for the log. Both quotes always round
-    // the same way, so this is one answer and not one per side.
-    bool rounded_up = false;
-    std::string round_reason;
-};
-
 // The whole decision, as a pure function of the book, the position and the
 // parameters: no orders, no clock, no state. Everything the strategy decides
 // is decided here, so it can be tested by inspection.
@@ -135,81 +113,15 @@ DesiredQuotes desired_quotes(const InstrumentView& book, const Position& positio
 // Drives the desired quotes onto the venue: places what is missing, cancels
 // what has moved, and leaves alone what is still right. The venue has no
 // amend, so a move is a cancel and a re-submit (OE "Not supported").
-class QuoteManager {
+class QuoteManager : public QuoteReconciler {
 public:
-    // Everything it needs from the outside, so it can be driven by a test.
-    // The host composes these - arming and the halt are folded into
-    // can_submit before they get here - so this is the host's StrategyHooks.
-    using Hooks = StrategyHooks;
-
     QuoteManager(Params params, Hooks hooks);
-
-    // One pass: compare the desired quotes with the live ones and act.
     void on_market(const InstrumentView& book, const Position& position, Clock::time_point now);
-    // The reference venue moved. Called on every update from it, which is
-    // many times a second and not on this market's cadence, so it does as
-    // little as it can: compare, and cancel if the comparison says to.
     void on_reference(const cpm::binance::ReferenceView& reference, Clock::time_point now);
-    // Keeps track of which quotes are live. Must be fed every report for this
-    // instrument, including the unsolicited ones.
-    void on_report(const ExecutionReport& report);
-    // Cancels both quotes and stops quoting until the next on_market().
-    void withdraw(const std::string& why);
-    // Drop the quotes without sending anything: the window has closed and the
-    // venue has already cancelled them (ExecRestatementReason=2).
-    void abandon(const std::string& why);
-
-    std::optional<Quote> live_bid() const;
-    std::optional<Quote> live_ask() const;
-    // Both quotes as the host reports them, with the ids and the pending
-    // cancels that live_bid()/live_ask() leave out.
-    std::vector<LiveLeg> legs() const;
-    // Nothing of ours is left at the venue.
-    bool quiescent() const { return !bid_ && !ask_; }
-    std::size_t quotes_placed() const { return placed_; }
-    std::size_t quotes_cancelled() const { return cancelled_; }
-    std::size_t fills() const { return fills_; }
-
-    // Why it is not quoting, so a run that places nothing explains itself
-    // rather than going quiet. Empty while both sides are quoted.
-    const std::string& last_reason() const { return last_reason_; }
-    std::size_t passes() const { return passes_; }
-    std::size_t passes_without_quotes() const { return passes_without_quotes_; }
 
 private:
-    struct LiveQuote {
-        std::string cl_ord_id;
-        // What was asked for, and where the venue actually rested it. A
-        // post-only slide makes these differ.
-        Price requested = 0;
-        Price price = 0;
-        Qty quantity = 0;
-        bool cancel_pending = false;
-        bool acknowledged = false;  // a New or a fill has been seen for it
-        // True when the venue slid this quote. The target that was slid is
-        // remembered so it is not offered again unchanged, while any other
-        // target still re-quotes: the quotes follow the mid, they just do not
-        // retry the one price the venue refused to rest at.
-        bool slid = false;
-    };
-
-    void reconcile_side(cpm::oms::Side side, const std::optional<Quote>& desired,
-                        std::optional<LiveQuote>& live, const std::string& symbol);
-    bool worth_replacing(const LiveQuote& live, const Quote& desired) const;
-    // Logs what it sees, but only when that changes: on a 250 ms loop a line
-    // per pass would bury everything else.
     void announce(const InstrumentView& book, const DesiredQuotes& desired, bool may_send);
-
     Params params_;
-    Hooks hooks_;
-    std::optional<LiveQuote> bid_;
-    std::optional<LiveQuote> ask_;
-    std::size_t placed_ = 0;
-    std::size_t cancelled_ = 0;
-    std::size_t fills_ = 0;
-    std::size_t passes_ = 0;
-    std::size_t passes_without_quotes_ = 0;
-    std::string last_reason_;
     std::string last_announcement_;
 
     // --- the speed bump ---------------------------------------------------

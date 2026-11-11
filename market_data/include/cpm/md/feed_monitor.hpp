@@ -74,6 +74,9 @@ public:
     // unsubscribed, so staleness is judged per subscription.
     void track(const std::string& md_req_id, const ChannelRequest& request);
     void forget(const std::string& md_req_id);
+    // Model-based strategies tolerate an unchanged book. This exempts only
+    // silence, never session failure, sequence gaps or rejected subscriptions.
+    void allow_quiet_books(std::vector<std::string> symbols);
 
     // Runs the staleness check on a timer thread until stop(). A clean
     // shutdown stops the monitor first, so the logout it causes is not
@@ -117,6 +120,7 @@ private:
     mutable std::mutex mutex_;
     std::map<std::string, Subscription> subscriptions_;
     std::map<std::string, LifecycleStatus> statuses_;
+    std::vector<std::string> quiet_books_;
     std::optional<FeedHalt> halt_;
     bool delivered_ = false;
     bool logged_on_ = false;

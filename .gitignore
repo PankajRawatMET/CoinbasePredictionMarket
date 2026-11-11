@@ -31,6 +31,8 @@ logs/
 # daemon off that state. The lock file is runtime, not configuration: it
 # holds nothing once the process that took it is gone.
 *-bookmark.txt
+*.reference-history
+*.reference-history.tmp
 *.lock
 
 # Editor and OS noise

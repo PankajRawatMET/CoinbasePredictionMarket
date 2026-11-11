@@ -7,6 +7,7 @@ add_library(cpm_strategy_host
   src/host.cpp
   src/params.cpp
   src/registry.cpp
+  src/quote_reconciler.cpp
 )
 target_include_directories(cpm_strategy_host PUBLIC include)
 target_link_libraries(cpm_strategy_host PUBLIC cpm_marketdata cpm_oms cpm_binance)

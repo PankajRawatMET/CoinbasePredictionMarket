@@ -2,6 +2,7 @@
 
 #include "cpm/common/logging.hpp"
 #include "cpm/common/websocket.hpp"
+#include "cpm/binance/history.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -39,6 +40,7 @@ struct ReferenceView {
     Price mid = 0;
     Price tick_size = 0;  // PRICE_FILTER.tickSize; 0 when it is not known
     std::chrono::milliseconds age{0};
+    std::shared_ptr<const HistoryView> history;
 
     // What the guard asks: a number it can compare a move against.
     bool usable() const { return present && !stale && tick_size > 0; }
@@ -91,6 +93,9 @@ public:
         // and from nowhere else: this project makes no REST call to
         // Binance at all (B-Q17).
         std::map<std::string, Price> tick_size;
+        // Optional local cache, read at startup and written after the reader
+        // stops. No disk or HTTP work in the quote/cancel path.
+        std::string history_file;
     };
 
     ReferenceFeed(Options options, Logger& logger);
@@ -135,6 +140,8 @@ private:
     // Returns false when the connection failed under it.
     bool reconcile_streams(cpm::ws::Client& client, Clock::time_point now);
     void handle_control(std::string_view text);
+    void load_history();
+    void save_history();
 
     struct Entry {
         Price mid = 0;
@@ -146,6 +153,7 @@ private:
     Logger& logger_;
     mutable std::mutex mutex_;
     std::map<std::string, Entry> latest_;
+    std::map<std::string, ReferenceHistory> history_;
     // What someone has asked for, and what the connection is carrying. The
     // reader thread moves the second towards the first.
     std::set<std::string> wanted_;

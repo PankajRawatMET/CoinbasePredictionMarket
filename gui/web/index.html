@@ -780,7 +780,7 @@
   // when it stops - and then it must change, because a strategy that halted
   // and did not say so would be the worst thing on this page.
   function strategyStatus(strategy) {
-    var line = el('p', 'status');
+    var line = el('div', 'status');
     // The state and armed tags, the id, the series and the window are not
     // here any more (2026-11-02): the row above says what this strategy is
     // and what may be done to it, and repeating it underneath was a second
@@ -792,6 +792,17 @@
     // this page (GUI-Q28). The line is empty while there is nothing wrong.
     var why = [strategy.reason, strategy.note].filter(Boolean).join(' · ');
     if (why) line.appendChild(el('span', 'muted', why));
+    var diagnostics = strategy.diagnostics || {};
+    var names = Object.keys(diagnostics);
+    if (names.length) {
+      var details = el('details', 'muted');
+      details.appendChild(el('summary', null, 'Pricing model'));
+      var values = el('div');
+      values.id = 'model-' + strategy.id;
+      fillModelDiagnostics(values, diagnostics);
+      details.appendChild(values);
+      line.appendChild(details);
+    }
     return line;
   }
 
@@ -812,8 +823,23 @@
   // is being typed into is still redrawn.
   var drawnEditable = {};
 
+  function fillModelDiagnostics(host, diagnostics) {
+    var signature = JSON.stringify(diagnostics);
+    if (host.getAttribute('data-values') === signature) return;
+    host.setAttribute('data-values', signature);
+    clear(host);
+    Object.keys(diagnostics).forEach(function (name) {
+      host.appendChild(el('div', null, name + ': ' + diagnostics[name]));
+    });
+  }
+
   function renderStrategyRows() {
     var host = document.getElementById('strategy-rows');
+    // Refresh model values without rebuilding controls or closing details.
+    snapshot.strategies.forEach(function (strategy) {
+      var values = document.getElementById('model-' + strategy.id);
+      if (values) fillModelDiagnostics(values, strategy.diagnostics || {});
+    });
     // A row whose lock changed is redrawn whatever is in it: a strategy that
     // has been armed must never look editable, and text that can no longer
     // be applied must not sit in a box as though it could.

@@ -226,4 +226,10 @@ TEST(BinanceConfig, AMissingFileIsNotAnError) {
     EXPECT_EQ(config.feed.host, "fstream.binance.com");
 }
 
+TEST(BinanceConfig, ReferenceHistoryCacheCanUseAnExplicitLocalPath) {
+    Config config;
+    EXPECT_EQ(cpm::binance::parse_config("history_file = '/tmp/reference history'\n", config), "");
+    EXPECT_EQ(config.feed.history_file, "/tmp/reference history");
+}
+
 }  // namespace

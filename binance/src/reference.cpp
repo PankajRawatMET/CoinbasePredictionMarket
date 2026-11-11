@@ -5,6 +5,8 @@
 #include "cpm/common/websocket.hpp"
 
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
 
 namespace cpm::binance {
 namespace {
@@ -185,6 +187,8 @@ std::string ReferenceFeed::start() {
     // endpoint: nothing waits on Binance before the FIX sessions log on.
     want({});
 
+    load_history();
+
     running_.store(true);
     thread_ = std::thread([this] { run(); });
     return {};
@@ -194,6 +198,7 @@ void ReferenceFeed::stop() {
     if (!running_.exchange(false)) return;
     if (thread_.joinable()) thread_.join();
     connected_.store(false);
+    save_history();
 }
 
 void ReferenceFeed::apply(const BookTicker& tick) {
@@ -207,6 +212,7 @@ void ReferenceFeed::apply(const BookTicker& tick) {
         entry.mid = tick.mid();
         entry.at = Clock::now();
         entry.present = true;
+        history_[tick.symbol].observe(tick.mid(), HistoryClock::now());
         waker = waker_;
     }
     // Outside the lock: whoever is woken must never be able to block the
@@ -227,7 +233,67 @@ ReferenceView ReferenceFeed::latest(const std::string& symbol, Clock::time_point
     view.mid = found->second.mid;
     view.age = std::chrono::duration_cast<std::chrono::milliseconds>(now - found->second.at);
     view.stale = view.age > options_.stale_after;
+    if (const auto history = history_.find(symbol); history != history_.end()) {
+        view.history = history->second.view();
+    }
     return view;
+}
+
+void ReferenceFeed::load_history() {
+    if (options_.history_file.empty()) return;
+    std::ifstream file(options_.history_file);
+    if (!file) return;
+    std::string source;
+    std::getline(file, source);
+    const auto identity = std::string("CPM_REFERENCE_1 ") + (options_.tls ? "wss://" : "ws://") + options_.host + ":" +
+                          std::to_string(options_.port) + options_.path;
+    if (source != identity) {
+        logger_.warn("binance: ignoring history from a different reference source");
+        return;
+    }
+    std::lock_guard lock(mutex_);
+    std::string symbol;
+    std::int64_t second = 0, first_at = 0;
+    ReferenceSample sample;
+    std::size_t count = 0;
+    const auto now = HistoryClock::now();
+    const auto now_seconds = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
+    while (count++ < 128 * ReferenceHistory::kMaxSamples &&
+           file >> symbol >> second >> first_at >> sample.first >> sample.close >> sample.low >> sample.high) {
+        if (options_.tick_size.count(symbol) == 0) continue;
+        // Check serialized epoch values before chrono conversion/multiplication.
+        if (second < now_seconds - ReferenceHistory::kRetention.count() || second > now_seconds ||
+            first_at < second * 1000 || first_at >= second * 1000 + 1000) continue;
+        sample.second = HistoryClock::time_point{std::chrono::seconds(second)};
+        sample.first_at = HistoryClock::time_point{std::chrono::milliseconds(first_at)};
+        history_[symbol].restore(sample, now);
+    }
+}
+
+void ReferenceFeed::save_history() {
+    if (options_.history_file.empty()) return;
+    const auto temporary = options_.history_file + ".tmp";
+    std::ofstream file(temporary, std::ios::trunc);
+    if (!file) {
+        logger_.warn("binance: could not write reference history " + temporary);
+        return;
+    }
+    file << "CPM_REFERENCE_1 " << (options_.tls ? "wss://" : "ws://")
+         << options_.host << ':' << options_.port << options_.path << '\n';
+    {
+        std::lock_guard lock(mutex_);
+        for (const auto& [symbol, history] : history_) {
+            for (const auto& s : *history.view()) {
+                file << symbol << ' ' << std::chrono::duration_cast<std::chrono::seconds>(s.second.time_since_epoch()).count()
+                     << ' ' << std::chrono::duration_cast<std::chrono::milliseconds>(s.first_at.time_since_epoch()).count()
+                     << ' ' << s.first << ' ' << s.close << ' ' << s.low << ' ' << s.high << '\n';
+            }
+        }
+    }
+    file.close();
+    std::error_code error;
+    if (file) std::filesystem::rename(temporary, options_.history_file, error);
+    if (!file || error) logger_.warn("binance: could not save reference history " + options_.history_file);
 }
 
 void ReferenceFeed::run() {

@@ -623,7 +623,11 @@ std::string Trader::start(std::chrono::milliseconds timeout) {
         ::fcntl(wake_read_, F_SETFL, O_NONBLOCK);
         ::fcntl(wake_write_, F_SETFL, O_NONBLOCK);
 
-        reference_ = std::make_unique<cpm::binance::ReferenceFeed>(options_.reference, logger_);
+        auto reference_options = options_.reference;
+        if (reference_options.history_file.empty() && !options_.bookmark.empty()) {
+            reference_options.history_file = options_.bookmark + ".reference-history";
+        }
+        reference_ = std::make_unique<cpm::binance::ReferenceFeed>(std::move(reference_options), logger_);
         const int fd = wake_write_;
         reference_->on_update([fd] {
             // Everything this thread is allowed to do to the daemon. One
@@ -730,6 +734,15 @@ void Trader::apply_halt(Clock::time_point now) {
 
 void Trader::tick(Clock::time_point now) {
     apply_halt(now);
+    std::vector<std::string> quiet_books;
+    for (const auto& strategy : host_.list()) {
+        // Quietness is a property of this subscribed instrument's consumer,
+        // including while it warms, is disarmed, or has been stopped.
+        if (strategy.feed && !strategy.requires_book_updates) {
+            quiet_books.insert(quiet_books.end(), strategy.symbols.begin(), strategy.symbols.end());
+        }
+    }
+    feed_->allow_quiet_books(std::move(quiet_books));
     follow_reference_demand();
     host_.tick(now);
 

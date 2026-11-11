@@ -51,6 +51,7 @@ struct StrategyInfo {
     // Why it last stopped, withdrew, or could not act. Operator-facing.
     std::string note;
     StrategyStatus status;
+    bool requires_book_updates = true;
 };
 
 // Owns the strategy instances and drives them. It does not know about FIX: the

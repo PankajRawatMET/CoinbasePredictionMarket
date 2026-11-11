@@ -91,6 +91,37 @@ TEST(FeedMonitorTest, EachUpdateResetsTheClock) {
     EXPECT_TRUE(rig.monitor->halted());
 }
 
+TEST(FeedMonitorTest, ModelMakerCanUseAQuietBookButDisconnectStillHalts) {
+    Rig rig;
+    rig.subscribe_book();
+    rig.monitor->allow_quiet_books({kSym});
+    rig.advance(300s);
+    rig.monitor->tick(rig.now);
+    EXPECT_FALSE(rig.monitor->halted());
+    rig.session({SessionEvent::Kind::LoggedOut, "connection lost"});
+    ASSERT_TRUE(rig.monitor->halted());
+    EXPECT_EQ(rig.halts.front().reason, Reason::Disconnect);
+}
+
+TEST(FeedMonitorTest, QuietBookExemptionDoesNotCoverOtherSymbolsOrSurviveRemoval) {
+    Rig other;
+    other.subscribe_book();
+    other.monitor->allow_quiet_books({"another-symbol"});
+    other.advance(31s);
+    other.monitor->tick(other.now);
+    EXPECT_TRUE(other.monitor->halted());
+
+    Rig removed;
+    removed.subscribe_book();
+    removed.monitor->allow_quiet_books({kSym});
+    removed.advance(31s);
+    removed.monitor->tick(removed.now);
+    EXPECT_FALSE(removed.monitor->halted());
+    removed.monitor->allow_quiet_books({});
+    removed.monitor->tick(removed.now);
+    EXPECT_TRUE(removed.monitor->halted());
+}
+
 // O10: an instrument that has closed is silent by design. Without this the
 // strategy would halt at every 15-minute window roll.
 TEST(FeedMonitorTest, AFinishedInstrumentIsNotAStaleFeed) {

@@ -1,6 +1,7 @@
 add_library(cpm_binance
   src/config.cpp
   src/reference.cpp
+  src/history.cpp
 )
 target_include_directories(cpm_binance PUBLIC include)
 target_link_libraries(cpm_binance PUBLIC cpm_common)
@@ -16,6 +17,7 @@ if(CPM_BUILD_TESTS)
   add_executable(cpm_binance_tests
     tests/config_test.cpp
     tests/reference_test.cpp
+    tests/history_test.cpp
   )
   target_link_libraries(cpm_binance_tests PRIVATE cpm_binance GTest::gtest_main)
   # The config file shipped in config/ is read by a test: a comment in it

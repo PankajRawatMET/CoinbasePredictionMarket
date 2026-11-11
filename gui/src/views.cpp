@@ -69,6 +69,9 @@ void write_strategy(JsonWriter& out, const StrategyInfo& strategy) {
     out.field("feed", strategy.feed);
     out.field("note", strategy.note);
     out.field("reason", strategy.status.reason);
+    out.key("diagnostics").object_begin();
+    for (const auto& [name, value] : strategy.status.diagnostics) out.field(name, value);
+    out.object_end();
 
     out.key("params").object_begin();
     for (const auto& param : strategy.params) out.field(param.first, param.second);

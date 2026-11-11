@@ -14,7 +14,7 @@ add_executable(cpm_trader apps/cpm_trader/main.cpp)
 # The daemon knows the strategy kinds; nothing below it does. cpm_gui is the
 # operator's surface over ControlApi and is defined in gui/, which depends on
 # this directory rather than the other way round.
-target_link_libraries(cpm_trader PRIVATE cpm_trader_lib cpm_crypto_mm cpm_gui)
+target_link_libraries(cpm_trader PRIVATE cpm_trader_lib cpm_crypto_mm cpm_quoting_mm cpm_gui)
 target_compile_definitions(cpm_trader PRIVATE CPM_DEFAULT_DICT_DIR="${CPM_DICT_DIR}")
 cpm_set_warnings(cpm_trader)
 

@@ -33,6 +33,7 @@
 #include "cpm/common/logging.hpp"
 #include "cpm/oms/order_rules.hpp"
 #include "cpm/strategy/crypto_mm.hpp"
+#include "cpm/strategy/quoting_mm.hpp"
 #include "cpm/trader/trader.hpp"
 
 #include <poll.h>
@@ -660,6 +661,7 @@ int main(int argc, char** argv) {
 
         cpm::strategy::StrategyRegistry registry;
         cpm::strategy::register_crypto_mm(registry);
+        cpm::strategy::register_quoting_mm(registry);
 
         cpm::trader::Trader trader(std::move(options), registry, logger);
         if (const auto error = trader.start(); !error.empty()) {

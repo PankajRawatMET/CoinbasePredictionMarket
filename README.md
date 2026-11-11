@@ -7,6 +7,10 @@ operator page served on loopback.
 - `docs/design.md` and the other `docs/design-*.md` files are the design record.
 - `docs/open-questions*.txt` records every decision and why it was made.
 
+Strategy kinds: **CryptoMM** quotes around the prediction book midpoint;
+**[QuotingMM](strategies/QuotingMM/README.md)** quotes a Student t4 model fair
+value and can make an empty market. Both use the same host and operator UI.
+
 ## What you need
 
 A Linux box with **OpenSSL 3.0** and a **C++20** compiler:

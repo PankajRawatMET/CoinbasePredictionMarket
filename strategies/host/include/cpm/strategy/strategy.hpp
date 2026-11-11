@@ -6,6 +6,7 @@
 #include "cpm/oms/orders.hpp"
 
 #include <functional>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -105,6 +106,8 @@ struct StrategyStatus {
     std::size_t placed = 0;
     std::size_t cancelled = 0;
     std::size_t fills = 0;
+    // Optional model diagnostics, rendered generically by the operator UI.
+    std::map<std::string, std::string> diagnostics;
 };
 
 // A strategy is whatever satisfies this. The host owns the clock, the books,
@@ -152,6 +155,9 @@ public:
     // the host refuses an overlap between strategies at create time (GUI-Q6),
     // which it could not do if this changed underneath.
     virtual std::vector<std::string> symbols() const = 0;
+    // Model makers need a valid snapshot, but not a continuously moving book.
+    // Session disconnects, gaps and rejects still halt.
+    virtual bool requires_book_updates() const { return true; }
     virtual StrategyStatus status() const = 0;
 };
 

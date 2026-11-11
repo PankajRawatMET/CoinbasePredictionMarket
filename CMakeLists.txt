@@ -38,6 +38,7 @@ add_subdirectory(binance)
 # strategies/ sits on top of both services: the host first, then each kind.
 add_subdirectory(strategies/host)
 add_subdirectory(strategies/CryptoMM)
+add_subdirectory(strategies/QuotingMM)
 # trader/ is the daemon: it composes both services, the host and every kind.
 add_subdirectory(trader)
 # gui/ is the operator's surface over the daemon, and the only sockets here
