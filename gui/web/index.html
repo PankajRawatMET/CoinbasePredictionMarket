@@ -146,6 +146,8 @@
     min-width: 0; max-width: 100%; height: 34px; box-sizing: border-box;
   }
   .field input:focus-visible, .field select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .field input:required:placeholder-shown { border-color: var(--warn); }
+  .field input[aria-invalid="true"], .field select[aria-invalid="true"] { border-color: var(--bad); }
   /* A box that cannot be typed in says so rather than waiting to be clicked:
      the kind and the symbol on every live row, and every parameter of a
      strategy that is armed (GUI-Q30). */
@@ -1331,6 +1333,33 @@
     return params;
   }
 
+  // These rows are not HTML forms, so required inputs need an explicit check
+  // before opening the trading confirmation or calling the create endpoint.
+  // Parameter parsing and range validation remain the daemon's responsibility.
+  function validateDraft(draft) {
+    var first = null;
+    kindByName(draft.kind).params.forEach(function (spec) {
+      var input = draftInput(draft, spec.name);
+      var missing = spec.required && (!input || !input.value.trim());
+      if (input) {
+        if (missing) input.setAttribute('aria-invalid', 'true');
+        else input.removeAttribute('aria-invalid');
+      }
+      if (missing && !first) first = { spec: spec, input: input };
+    });
+    if (!first) return true;
+    var message = (first.spec.label || titleCase(first.spec.name)) + ' is required. ' + first.spec.help;
+    flash(message);
+    var status = document.getElementById('draft-status-' + draft.n);
+    if (status) status.textContent = message;
+    if (first.input) {
+      first.input.scrollIntoView({ block: 'nearest', inline: 'center', behavior: 'smooth' });
+      first.input.focus({ preventScroll: true });
+      first.input.reportValidity();
+    }
+    return false;
+  }
+
   // The strategy a name belongs to, whether that name is the series it
   // follows or the window it is on. A symbol belongs to one strategy
   // (GUI-Q6), so this is a key and the page keeps no state of its own.
@@ -1365,6 +1394,7 @@
   // that order, and asks first because the last of those three is the one
   // that puts an order in the market (GUI-Q8, GUI-Q26).
   function startQuoting(kind, symbol, params, existing, draft) {
+    if (draft && !validateDraft(draft)) return;
     var base = function (id) { return '/api/strategies/' + encodeURIComponent(id) + '/'; };
     var run = function (id) {
       act('POST', base(id) + 'start').then(function (result) {
@@ -1497,11 +1527,13 @@
       }
       input.id = 'param-' + draft.n + '-' + spec.name;
       input.setAttribute('aria-label', spec.label || titleCase(spec.name));
+      input.required = !!spec.required;
       input.value = remembered(draft, spec);
       // The daemon validates against the same schema whatever this sends, so
       // the row is a convenience and never the rule (design §4).
       input.title = spec.help;
       input.addEventListener('input', function () {
+        input.removeAttribute('aria-invalid');
         remember(draft, spec.name, input.value);
         // The symbol is what the buttons are about, so they follow it as it
         // is typed. Only the controls are redrawn, so the caret stays put.
