@@ -68,6 +68,18 @@ window rolls. It is built from the live stream; there is no new HTTP data
 dependency. Pin the mapped stream in `binance.conf` to warm history before
 starting a strategy. A cold start waits for the required contiguous history.
 
+Warmup is shared across window rolls: a new strategy instance uses the same
+underlying history and does not start another 20-minute collection period.
+The Pricing model section shows `Volatility returns` and the minimum time
+still needed. Gaps in the reference observations can extend that minimum.
+
+For a shorter simulator experiment, set `vol-lookback-seconds` to `60` in
+the strategy form before starting. That uses one minute of returns and
+changes the volatility estimate; it is not a fast way to obtain the same
+20-minute model. Keep the default `1200` to preserve the intended lookback,
+and run the reference feed ahead of the trading window. This version does
+not automatically download historical observations at startup.
+
 The daemon saves a source-tagged history cache on clean shutdown beside
 its bookmark (`<bookmark>.reference-history`). `history_file` in the Binance
 configuration overrides that location. Cache loading never makes the live

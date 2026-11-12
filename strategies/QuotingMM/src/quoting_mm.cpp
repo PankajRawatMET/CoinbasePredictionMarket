@@ -133,6 +133,7 @@ void QuotingMm::on_reference(const cpm::binance::ReferenceView& reference, Clock
     if (!reference.usable() || reference.mid <= 0) {
         fair_.reset();
         sigma_.reset();
+        volatility_returns_ = 0;
         previous_reference_.reset();
         previous_reference_time_ = {};
         stand_aside("waiting for a fresh underlying reference and tick size");
@@ -212,6 +213,9 @@ void QuotingMm::on_market(const InstrumentView& book, const Position& position, 
         stand_aside("opening price unavailable: supply this window's opening-price or wait for a captured window");
         return;
     }
+    volatility_returns_ = reference_.history
+                              ? contiguous_reference_returns(*reference_.history, params_.vol_lookback_seconds, now)
+                              : 0;
     sigma_ = reference_.history
                  ? reference_volatility(*reference_.history, params_.vol_lookback_seconds, now)
                  : std::nullopt;
@@ -269,6 +273,12 @@ StrategyStatus QuotingMm::status() const {
     out.reason = reason_;
     out.diagnostics["Fair YES (%)"] = fair_ ? decimal(*fair_ * 100, 3) : "unavailable";
     out.diagnostics["Sigma / sqrt(second)"] = sigma_ ? decimal(*sigma_, 8) : "warming";
+    out.diagnostics["Volatility returns"] = std::to_string(volatility_returns_) + " / " +
+                                          std::to_string(params_.vol_lookback_seconds);
+    out.diagnostics["Warmup remaining (minimum)"] =
+        volatility_returns_ < params_.vol_lookback_seconds
+            ? std::to_string(params_.vol_lookback_seconds - volatility_returns_) + " seconds of uninterrupted observations"
+            : sigma_ ? "ready" : "waiting for nonzero variance";
     out.diagnostics["Opening price"] = opening_ ? format_scaled(*opening_, cpm::binance::kScale) : "unavailable";
     out.diagnostics["Opening source"] = params_.opening_price > 0 ? "window override" : "mapped reference opening second";
     out.diagnostics["Underlying price"] = reference_.usable() && reference_.mid > 0
@@ -295,7 +305,7 @@ ParamSchema quoting_mm_schema() {
     add("width-ticks", Type::Int, "4", "1", "500", "minimum whole spread around model fair value, in prediction-market ticks");
     add("qty", Type::Decimal, "1", "0.01", "10000", "contracts per side, capped by remaining inventory capacity", cpm::kQtyScale);
     add("max-inventory", Type::Decimal, "5", "0", "1000000", "stop at this absolute net position; 0 disables", cpm::kQtyScale);
-    add("vol-lookback-seconds", Type::Int, "1200", "2", "3600", "contiguous completed one-second returns used for volatility; default 20 minutes");
+    add("vol-lookback-seconds", Type::Int, "1200", "2", "3600", "volatility history length: 1200 is 20 minutes; 60 gives a one-minute simulator warmup but changes the estimate");
     add("correction-factor", Type::Decimal, "", "0.000001", "1000", "required calibrated multiplier of sigma; kept fixed until explicitly edited", 6);
     add("t-scale", Type::Enum, "raw", "", "", "raw matches the PDF formula; unit-variance rescales Student t4 to variance one");
     schema.back().choices = {"raw", "unit-variance"};

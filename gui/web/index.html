@@ -1851,8 +1851,8 @@
     pill('pill-stream', 'stream', 'not connected', 'bad');
     if (snapshot) pill('pill-state', 'last known', snapshot.state, 'warn');
     document.getElementById('reconnect').className = 'needed';
-    flash(why + ' Nothing on this page is current. The daemon is unaffected either way - ' +
-          'press Reconnect, or reopen the link it printed at startup.');
+    flash(why + ' Nothing on this page is current. The daemon may be unreachable or stopped. ' +
+          'Check its process and logs, then press Reconnect or reopen its current startup link.');
   }
 
   // Once a second, whatever the stream is doing: an age beside the state is

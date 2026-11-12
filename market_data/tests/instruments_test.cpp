@@ -177,6 +177,29 @@ TEST(Instruments, SaysWhatWentWrongRatherThanReturningNothing) {
     EXPECT_TRUE(empty.instruments.empty());
 }
 
+TEST(Instruments, RollingSeriesIgnoresFeederExpiredAndUnrelatedInstruments) {
+    const char* body = R"({"data":[
+      {"ticker":"ETHFEEDERTEST","series_ticker":"ETHD15M","status":"OPEN"},
+      {"ticker":"ETHD15M-ETH26OCT281145-0","status":"OPEN"},
+      {"ticker":"BTCD15M-BTC26OCT281230-0","status":"OPEN"},
+      {"ticker":"ETHD15M-ETH26OCT281245-0","status":"LISTED"},
+      {"ticker":"ETHD15M-ETH26OCT281230-0","series_ticker":"ETHD15M","status":"OPEN"}
+    ]})";
+    const auto result = open_instruments(config(), "ETHD15M",
+        [body](const cpm::HttpsRequest&) { return answer(200, body); }, at(1793188800));
+    ASSERT_TRUE(result.ok()) << result.error;
+    ASSERT_EQ(result.instruments.size(), 1u);
+    EXPECT_EQ(result.instruments.front().ticker, "ETHD15M-ETH26OCT281230-0");
+}
+
+TEST(Instruments, AFeederAloneDoesNotResolveATimedSeries) {
+    const auto result = open_instruments(config(), "ETHD15M", [](const cpm::HttpsRequest&) {
+        return answer(200, R"({"data":[{"ticker":"ETHFEEDERTEST","status":"OPEN"}]})");
+    }, at(1793188800));
+    EXPECT_TRUE(result.ok());
+    EXPECT_TRUE(result.instruments.empty());
+}
+
 TEST(Instruments, RefusesToAskWithoutCredentials) {
     RestConfig incomplete;
     incomplete.url = "https://api.cpm-sandbox.fairx.net";

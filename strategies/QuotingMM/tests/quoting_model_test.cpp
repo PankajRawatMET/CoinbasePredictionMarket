@@ -90,4 +90,26 @@ TEST(QuotingModel, MaximumLookbackStillHasItsCompletedBoundaryPrice) {
     }
     EXPECT_TRUE(reference_volatility(*history.view(), 3600, start + 7200s));
 }
+
+TEST(QuotingModel, WarmupProgressCountsReturnsRatherThanPricesAndExcludesThePartialSecond) {
+    cpm::binance::ReferenceHistory history;
+    const auto start = HistoryClock::time_point{} + 2h;
+    EXPECT_EQ(contiguous_reference_returns(*history.view(), 1200, start), 0);
+    for (int i = 0; i <= 61; ++i) {
+        history.observe(i % 2 ? 100000 : 110000, start + std::chrono::seconds(i));
+    }
+    EXPECT_EQ(contiguous_reference_returns(*history.view(), 1200, start + 61s), 60);
+    EXPECT_EQ(contiguous_reference_returns(*history.view(), 10, start + 61s), 10);
+    EXPECT_TRUE(reference_volatility(*history.view(), 60, start + 61s));
+    EXPECT_FALSE(reference_volatility(*history.view(), 1200, start + 61s));
+}
+
+TEST(QuotingModel, WarmupProgressRestartsAtAGapAndRequiresTheLatestCompletedSecond) {
+    cpm::binance::ReferenceHistory history;
+    const auto start = HistoryClock::time_point{} + 2h;
+    for (int i : {0, 1, 4, 5, 6, 7}) history.observe(100000 + i, start + std::chrono::seconds(i));
+    EXPECT_EQ(contiguous_reference_returns(*history.view(), 1200, start + 7s), 2);
+    EXPECT_EQ(contiguous_reference_returns(*history.view(), 1200, start + 8s), 3);
+    EXPECT_EQ(contiguous_reference_returns(*history.view(), 1200, start + 9s), 0);
+}
 }  // namespace

@@ -28,6 +28,24 @@ std::optional<double> quoting_probability(std::int64_t spot, std::int64_t openin
     return student_t4_cdf(z);
 }
 
+int contiguous_reference_returns(const cpm::binance::HistoryView& history,
+                                  int lookback_seconds,
+                                  cpm::binance::HistoryClock::time_point now) {
+    using namespace std::chrono;
+    if (lookback_seconds <= 0) return 0;
+    auto expected = floor<seconds>(now) - seconds(1);
+    auto it = std::upper_bound(history.begin(), history.end(), expected,
+                                [](auto at, const auto& sample) { return at < sample.second; });
+    int prices = 0;
+    while (it != history.begin() && prices <= lookback_seconds) {
+        --it;
+        if (it->second != expected || it->close <= 0) break;
+        ++prices;
+        expected -= seconds(1);
+    }
+    return std::max(0, prices - 1);
+}
+
 std::optional<double> reference_volatility(const cpm::binance::HistoryView& history,
                                            int lookback_seconds,
                                            cpm::binance::HistoryClock::time_point now) {

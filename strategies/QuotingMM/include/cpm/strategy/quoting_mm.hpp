@@ -50,6 +50,7 @@ private:
     cpm::binance::ReferenceView reference_;
     std::optional<cpm::binance::Price> opening_;
     std::optional<double> sigma_;
+    int volatility_returns_ = 0;
     std::optional<double> fair_;
     std::optional<double> target_fair_;
     std::optional<cpm::binance::Price> previous_reference_;

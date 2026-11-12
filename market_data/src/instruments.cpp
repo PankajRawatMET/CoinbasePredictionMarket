@@ -175,6 +175,17 @@ InstrumentQuery open_instruments(const RestConfig& config, const std::string& se
             // when it ends still has its end in its name ([MD] O2).
             info.expected_close = parsed_ticker->window_end;
         }
+        // The sandbox can return feeder/test instruments in a rolling-series
+        // query (ETHFEEDERTEST has no end and used to sort ahead of every
+        // real window at epoch zero). Only dated, live windows of the queried
+        // series are candidates for automatic resolution.
+        if (series.ends_with("D15M") || series.ends_with("D5M")) {
+            const auto window = parse_ticker(info.ticker);
+            if (!window || window->series != series || window->window_end <= now ||
+                info.expected_close <= now ||
+                (!info.series_ticker.empty() && info.series_ticker != series) ||
+                (!info.status.empty() && info.status != "OPEN")) continue;
+        }
         out.instruments.push_back(std::move(info));
     }
 

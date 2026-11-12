@@ -313,7 +313,12 @@ void Trader::follow_reference_demand() {
     // The watched series first: their streams are up for the life of the
     // daemon, so the guard has a price the instant a strategy is armed
     // rather than one pass later.
-    for (const auto& [series, symbol] : watching_) {
+    std::map<std::string, std::string> watched;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        watched = watching_;
+    }
+    for (const auto& [series, symbol] : watched) {
         if (const auto mapped = reference_symbol_for(symbol); !mapped.empty()) {
             wanted.push_back(mapped);
         }
@@ -699,7 +704,10 @@ std::string Trader::start(std::chrono::milliseconds timeout) {
             logger_.warn("not watching " + wanted + ": " + error);
             continue;
         }
-        watching_[wanted] = symbol;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            watching_[wanted] = symbol;
+        }
         logger_.info("watching " + wanted + (symbol == wanted ? "" : " on " + symbol));
     }
 
@@ -826,8 +834,13 @@ void Trader::follow_watch_list(Clock::time_point now) {
         if (cpm::md::looks_like_instrument(series)) continue;  // a ticker never rolls
         const auto window = series_.current(series, now);
         if (!window) continue;  // between windows, or the feed has not said yet
-        const auto held = watching_.find(series);
-        if (held != watching_.end() && held->second == window->symbol) continue;
+        std::string previous;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            const auto held = watching_.find(series);
+            if (held != watching_.end()) previous = held->second;
+        }
+        if (previous == window->symbol) continue;
 
         // The new window before the old one goes, so there is no instant
         // with nothing watched, and never monitored: nothing is quoting it.
@@ -835,15 +848,22 @@ void Trader::follow_watch_list(Clock::time_point now) {
             logger_.warn("could not watch " + window->symbol + ": " + error);
             continue;
         }
-        const std::string previous = held == watching_.end() ? std::string() : held->second;
-        watching_[series] = window->symbol;
+        {
+            // The GUI's watched-book snapshot and unsubscribe() read this map
+            // under the same lock while the tick thread advances windows.
+            std::lock_guard<std::mutex> lock(mutex_);
+            watching_[series] = window->symbol;
+        }
         logger_.info("watching " + series + " on " + window->symbol +
                      (previous.empty() ? "" : " (was " + previous + ")"));
         if (previous.empty() || previous == window->symbol) continue;
         // The window that just closed: let it go unless a strategy is still
         // on it, in which case it is that strategy's to drop.
+        // list() returns a vector by value. Both iterators must belong to
+        // this same snapshot, not to two separate temporary vectors.
+        const auto strategies = host_.list();
         const bool claimed = std::any_of(
-            host_.list().begin(), host_.list().end(), [&](const cpm::strategy::StrategyInfo& row) {
+            strategies.begin(), strategies.end(), [&](const cpm::strategy::StrategyInfo& row) {
                 return std::find(row.symbols.begin(), row.symbols.end(), previous) !=
                        row.symbols.end();
             });

@@ -377,5 +377,11 @@ TEST(QuotingMmHost, UsesTheExistingHostWithAnEmptyBookAndResetsWindowOverridesOn
     ASSERT_TRUE(host.roll(id, "BTCD15M-BTC26NOV111230-0").empty());
     EXPECT_EQ(host.list().front().params.at("opening-price"), "0");
     EXPECT_TRUE(host.list().front().armed);
+    // The next instance consumes the feed's already-warm history; creating
+    // it must not impose another 20-minute delay at every window roll.
+    venue.now += 15min;
+    host.tick(venue.now);
+    EXPECT_EQ(venue.sent.size(), 4u);
+    EXPECT_EQ(host.list().front().status.diagnostics.at("Volatility returns"), "1200 / 1200");
 }
 }  // namespace

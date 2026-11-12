@@ -16,6 +16,9 @@ std::optional<double> quoting_probability(std::int64_t spot, std::int64_t openin
 
 // Sample standard deviation of contiguous completed one-second log returns.
 // The current partial second is excluded, as are future observations.
+int contiguous_reference_returns(const cpm::binance::HistoryView& history,
+                                  int lookback_seconds,
+                                  cpm::binance::HistoryClock::time_point now);
 std::optional<double> reference_volatility(const cpm::binance::HistoryView& history,
                                            int lookback_seconds,
                                            cpm::binance::HistoryClock::time_point now);
