@@ -1601,15 +1601,29 @@
     });
   }
 
-  // The columns after Buttons and Kind: every parameter any registered kind
-  // has, in the order the schema gives them, each name once. One kind is
-  // the usual case and this is then just its schema; two kinds share the
-  // columns they have in common and leave each other's cells empty, which
-  // is what keeps a column a column when a second kind is registered.
+  // The columns after Buttons and Kind: every parameter of the kinds that
+  // are actually ON THE PAGE - a strategy that is running, or the kind a
+  // draft row has selected - in the order the schema gives them, each name
+  // once. One kind is the usual case and this is then just its schema; two
+  // kinds share the columns they have in common and leave each other's
+  // cells empty, which is what keeps a column a column when both are being
+  // quoted at once.
+  //
+  // Not every REGISTERED kind: a build knows several market makers and an
+  // operator is quoting one of them, so taking the union over the registry
+  // put another strategy's parameters on the header of a page where no row
+  // could ever fill them in.
   function columns() {
+    var wanted = {};
+    if (snapshot) {
+      snapshot.strategies.forEach(function (strategy) { wanted[strategy.kind] = true; });
+    }
+    (drafts || []).forEach(function (draft) { if (draft.kind) wanted[draft.kind] = true; });
+
     var out = [];
     var seen = {};
     kinds.forEach(function (kind) {
+      if (!wanted[kind.name]) return;
       kind.params.forEach(function (spec) {
         if (seen[spec.name]) return;
         seen[spec.name] = true;

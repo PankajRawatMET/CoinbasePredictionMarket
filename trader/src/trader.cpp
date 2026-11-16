@@ -220,8 +220,8 @@ Trader::Trader(TraderOptions options, const cpm::strategy::StrategyRegistry& reg
     env.axis = [this](const std::string& symbol) {
         AxisView view;
         view.symbol = symbol;
-        view.structure = to_string(options_.ticks);
-        view.prices = cpm::md::price_grid(options_.ticks);
+        view.structure = cpm::md::kPriceLevelStructure;
+        view.prices = cpm::md::price_grid();
         return view;
     };
     env.limits = [this] {
@@ -810,7 +810,9 @@ ControlApi::Env::Resolved Trader::resolve_series(const std::string& series) {
                         "the daemon, or name a full ticker";
             return out;
         }
-        const auto found = cpm::md::open_instruments(options_.rest, series);
+        cpm::md::HttpsFetch fetch = options_.rest_fetch;
+        if (!fetch) fetch = cpm::https_get;
+        const auto found = cpm::md::open_instruments(options_.rest, series, fetch);
         if (!found.ok()) {
             out.error = found.error;
             return out;
@@ -824,9 +826,21 @@ ControlApi::Env::Resolved Trader::resolve_series(const std::string& series) {
         const auto& instrument = found.instruments.front();
         logger_.info("resolved " + series + " to " + instrument.ticker + " (ends " +
                      cpm::md::to_utc_string(instrument.expected_close) + ")");
+        // This build prices on one grid, the venue's TAPERED_DECI_CENT. An
+        // instrument the catalog says trades on another one cannot be quoted
+        // here at all: every price would be off its grid, and an order at a
+        // price the venue does not have is a reject, which halts the daemon
+        // (OE-Q6). So it is said loudly rather than discovered that way.
+        if (!instrument.price_level_structure.empty() &&
+            instrument.price_level_structure != cpm::md::kPriceLevelStructure) {
+            logger_.warn("the catalog reports " + instrument.ticker + " on " +
+                         instrument.price_level_structure + ", and this build prices only on " +
+                         cpm::md::kPriceLevelStructure + ": do not quote it");
+        }
         out.symbol = instrument.ticker;
         return out;
 }
+
 
 void Trader::follow_watch_list(Clock::time_point now) {
     if (options_.watch.empty()) return;

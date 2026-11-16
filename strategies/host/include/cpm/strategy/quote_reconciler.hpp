@@ -21,7 +21,6 @@ struct DesiredQuotes {
 
 struct QuoteSettings {
     std::string symbol;
-    cpm::md::TickStructure ticks = cpm::md::TickStructure::TaperedDeciCent;
     int requote_threshold_ticks = 1;
 };
 

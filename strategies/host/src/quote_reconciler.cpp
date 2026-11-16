@@ -46,7 +46,7 @@ bool QuoteReconciler::worth_replacing(const LiveQuote& live, const Quote& desire
     // Otherwise: how far is the target from where the quote actually rests?
     // Measuring against the resting price is what makes the quotes track the
     // mid rather than the intention behind them.
-    const Price tick = tick_at(live.price, settings_.ticks);
+    const Price tick = tick_at(live.price);
     const Price moved = live.price > desired.price ? live.price - desired.price
                                                    : desired.price - live.price;
     // A flicker of less than the threshold is left alone, so the strategy does

@@ -134,6 +134,34 @@ std::string parse_mapping(std::string_view value, const std::string& key, Mappin
 
 }  // namespace
 
+std::string parse_rest_url(std::string_view url, RestEndpoint& into) {
+    url = trim(url);
+    if (lower(url).rfind("https://", 0) != 0) {
+        return "a rest url must start with https://";
+    }
+    url.remove_prefix(8);
+    if (const auto slash = url.find('/'); slash != std::string_view::npos) {
+        // Anything after the host would be a path, and the paths here are
+        // the venue's, not the operator's.
+        if (!trim(url.substr(slash + 1)).empty()) {
+            return "a rest url is a host, with no path: https://fapi.binance.com";
+        }
+        url = url.substr(0, slash);
+    }
+    if (url.empty()) return "a rest url needs a host";
+
+    int port = 443;
+    if (const auto colon = url.find(':'); colon != std::string_view::npos) {
+        if (!to_int(url.substr(colon + 1), port) || port <= 0 || port > 65535) {
+            return "the port in a rest url must be a port number";
+        }
+        url = url.substr(0, colon);
+    }
+    into.host = std::string(url);
+    into.port = port;
+    return {};
+}
+
 std::string parse_config(std::string_view text, Config& into) {
     std::istringstream lines{std::string(text)};
     std::string line;
@@ -166,6 +194,10 @@ std::string parse_config(std::string_view text, Config& into) {
         auto& feed = into.feed;
         if (key == "url") {
             if (const auto failed = parse_ws_url(value, feed); !failed.empty()) {
+                return failed + where;
+            }
+        } else if (key == "rest_url") {
+            if (const auto failed = parse_rest_url(value, into.rest); !failed.empty()) {
                 return failed + where;
             }
         } else if (key == "ca_file") {

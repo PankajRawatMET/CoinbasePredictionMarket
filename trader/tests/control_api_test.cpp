@@ -199,7 +199,7 @@ TEST(ControlApi, PublishesTheKindsAndTheirSchemas) {
     EXPECT_FALSE(schema.empty());
     EXPECT_EQ(schema.front().name, "symbol");
     EXPECT_TRUE(schema.front().required());
-    for (const auto& wanted : {"symbol", "qty", "width-ticks", "withdraw-before", "ticks"}) {
+    for (const auto& wanted : {"symbol", "qty", "width-ticks", "withdraw-before"}) {
         const bool present = std::any_of(schema.begin(), schema.end(),
                                          [&](const cpm::strategy::ParamSpec& spec) {
                                              return spec.name == wanted;

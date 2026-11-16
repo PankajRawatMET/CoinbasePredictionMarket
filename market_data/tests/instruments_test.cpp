@@ -14,7 +14,6 @@ using cpm::md::InstrumentQuery;
 using cpm::md::open_instruments;
 using cpm::md::parse_rest_url;
 using cpm::md::RestConfig;
-using cpm::md::TickStructure;
 
 RestConfig config() {
     RestConfig out;
@@ -127,9 +126,9 @@ TEST(Instruments, ReadsWhatTheVenueAnswered) {
     // honest.
     EXPECT_EQ(instrument.expected_close, at(1793190600));
     EXPECT_EQ(cpm::md::parse_ticker(instrument.ticker)->window_end, instrument.expected_close);
-    // The venue states the grid, so it stops being the --tick-structure guess.
-    ASSERT_TRUE(instrument.ticks.has_value());
-    EXPECT_EQ(*instrument.ticks, TickStructure::TaperedDeciCent);
+    // The venue states the grid. This build prices on exactly one, so the
+    // answer is kept verbatim and only ever compared against it.
+    EXPECT_EQ(instrument.price_level_structure, cpm::md::kPriceLevelStructure);
 }
 
 TEST(Instruments, SortsBySoonestToEndAndFallsBackToTheName) {
@@ -148,7 +147,8 @@ TEST(Instruments, SortsBySoonestToEndAndFallsBackToTheName) {
     EXPECT_EQ(result.instruments[0].ticker, "BTCD15M-BTC26OCT281230-0");
     EXPECT_EQ(result.instruments[0].expected_close, at(1793190600)) << "taken from the name";
     EXPECT_EQ(result.instruments[1].ticker, "BTCD15M-BTC26OCT281245-0");
-    EXPECT_FALSE(result.instruments[0].ticks.has_value()) << "no structure was stated";
+    EXPECT_TRUE(result.instruments[0].price_level_structure.empty())
+        << "no structure was stated";
 }
 
 TEST(Instruments, SaysWhatWentWrongRatherThanReturningNothing) {

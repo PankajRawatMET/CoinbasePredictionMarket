@@ -6,6 +6,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace cpm::strategy {
 namespace {
@@ -21,6 +22,67 @@ std::string decimal(double value, int precision) {
 bool inventory_limit(const Position& position, const QuotingMmParams& p) {
     return p.max_inventory > 0 &&
            (position.net >= p.max_inventory || position.net <= -p.max_inventory);
+}
+
+// `steps` grid prices above or below `price`, or nullopt when the grid runs
+// out before then. Stepped rather than multiplied: a tick is not one size
+// everywhere, and arithmetic on tick_at() lands off the grid wherever the
+// taper changes it (0.100 and 0.900 on the venue's own structure).
+std::optional<Price> step_up(Price price, int steps) {
+    const Price maximum = cpm::md::price_below(kPriceOne);
+    for (int i = 0; i < steps; ++i) {
+        if (price >= maximum) return std::nullopt;
+        price = cpm::md::price_above(price);
+    }
+    return price;
+}
+
+std::optional<Price> step_down(Price price, int steps) {
+    const Price minimum = cpm::md::price_above(0);
+    for (int i = 0; i < steps; ++i) {
+        if (price <= minimum) return std::nullopt;
+        price = cpm::md::price_below(price);
+    }
+    return price;
+}
+
+// The pair of grid prices exactly `width` steps apart that straddles fair
+// most evenly.
+//
+// The width is a HARD CAP, not a minimum: a quoting obligation says the
+// market we show may not be wider than the one we promised, so neither leg
+// is ever rounded away from the other to reach the grid. Both legs come off
+// the grid by construction instead, and the pair is slid as a pair until it
+// sits as near centred on fair as the grid allows - at most half a step of
+// skew either way.
+//
+// Nullopt when the grid itself has no such pair straddling fair, which is
+// only near 0 and 1 where it runs out.
+std::optional<std::pair<Price, Price>> straddling_pair(double center, int width) {
+    if (width < 1) return std::nullopt;
+    const auto start = static_cast<Price>(std::floor(center));
+    // 0 and 1.000 are on the grid but are settlement values, not prices an
+    // order may rest at (O5), so the market lives strictly between them.
+    const Price minimum = cpm::md::price_above(0);
+    std::optional<std::pair<Price, Price>> best;
+    double best_skew = 0;
+    // Every bid within `width` steps below fair is a candidate, and nothing
+    // else can straddle it.
+    std::optional<Price> bid = cpm::md::snap_down(std::clamp<Price>(start, 0, kPriceOne));
+    for (int i = 0; bid && i <= width; ++i, bid = step_down(*bid, 1)) {
+        if (*bid < minimum) break;
+        const auto ask = step_up(*bid, width);
+        if (!ask) continue;
+        if (static_cast<double>(*bid) >= center || static_cast<double>(*ask) <= center) continue;
+        const double skew = std::abs((static_cast<double>(*bid) + static_cast<double>(*ask)) / 2.0 - center);
+        // Ties go to the lower pair: of two equally skewed markets, the one
+        // that buys cheaper is the one to show.
+        if (!best || skew < best_skew) {
+            best = std::make_pair(*bid, *ask);
+            best_skew = skew;
+        }
+    }
+    return best;
 }
 
 }  // namespace
@@ -49,24 +111,29 @@ DesiredQuotes quoting_mm_quotes(double fair, const InstrumentView& book,
         return out;
     }
     const double center = fair * kPriceOne;
-    const Price tick = cpm::md::tick_at(static_cast<Price>(center), p.ticks);
-    const double half = static_cast<double>(tick * p.spread_ticks) / 2.0;
-    // Round outwards: the configured spread is a minimum before touch/bounds
-    // adjustments, and neither side improves through the model's fair value.
-    Price bid = cpm::md::snap_down(static_cast<Price>(std::floor(center - half)), p.ticks);
-    Price ask = cpm::md::snap_up(static_cast<Price>(std::ceil(center + half)), p.ticks);
-    const Price minimum = cpm::md::price_above(0, p.ticks);
-    const Price maximum = cpm::md::price_below(kPriceOne, p.ticks);
-    bid = std::clamp(bid, minimum, maximum);
-    ask = std::clamp(ask, minimum, maximum);
+    const auto pair = straddling_pair(center, p.spread_ticks);
+    if (!pair) {
+        out.reason = "no room for model quotes on the price grid";
+        return out;
+    }
+    const Price bid = pair->first;
+    const Price ask = pair->second;
+    // Neither leg may rest at or inside the opposing touch - that is not
+    // making a market, it is taking one. The old code moved the offending
+    // leg clear, which widened the quote beyond what was asked for. Under a
+    // quoting obligation that is not available, and neither is sliding the
+    // pair, which would post prices the model does not believe. So it stands
+    // aside and says so until the book leaves room.
     if (!book.no.empty() && bid >= kPriceOne - book.no.front().price) {
-        bid = cpm::md::price_below(kPriceOne - book.no.front().price, p.ticks);
+        out.reason = "a " + std::to_string(p.spread_ticks) +
+                     "-tick market would bid at or through the best offer (" +
+                     format_price(kPriceOne - book.no.front().price) + ")";
+        return out;
     }
     if (!book.yes.empty() && ask <= book.yes.front().price) {
-        ask = cpm::md::price_above(book.yes.front().price, p.ticks);
-    }
-    if (bid < minimum || ask > maximum || bid >= ask) {
-        out.reason = "no room for model quotes on the price grid";
+        out.reason = "a " + std::to_string(p.spread_ticks) +
+                     "-tick market would offer at or through the best bid (" +
+                     format_price(book.yes.front().price) + ")";
         return out;
     }
     Qty buy_qty = p.quantity, sell_qty = p.quantity;
@@ -84,7 +151,7 @@ DesiredQuotes quoting_mm_quotes(double fair, const InstrumentView& book,
 
 QuotingMm::QuotingMm(QuotingMmParams params, StrategyHooks hooks)
     : params_(std::move(params)),
-      orders_({params_.symbol, params_.ticks, 1}, hooks),
+      orders_({params_.symbol, 1}, hooks),
       ticker_(cpm::md::parse_ticker(params_.symbol)),
       log_(std::move(hooks.log)) {
     last_now_ = Clock::now();
@@ -94,7 +161,16 @@ QuotingMm::QuotingMm(QuotingMmParams params, StrategyHooks hooks)
     if (!std::isfinite(params_.correction) || params_.correction <= 0) {
         throw std::invalid_argument("QuotingMM needs a positive calibrated correction-factor");
     }
-    if (params_.opening_price > 0) opening_ = params_.opening_price;
+    // Both come from the warmup the factory did, so an instance that exists
+    // can price. There is no state in which this strategy is waiting for a
+    // volatility to arrive.
+    if (!std::isfinite(params_.sigma) || params_.sigma <= 0) {
+        throw std::invalid_argument("QuotingMM needs a positive sigma from the window's warmup");
+    }
+    opening_ = params_.warmup_opening;
+    if (!opening_ || *opening_ <= 0) {
+        throw std::invalid_argument("QuotingMM needs this window's opening price");
+    }
 }
 
 void QuotingMm::stand_aside(const std::string& why) {
@@ -132,44 +208,40 @@ void QuotingMm::on_reference(const cpm::binance::ReferenceView& reference, Clock
     if (before_close(now)) return;
     if (!reference.usable() || reference.mid <= 0) {
         fair_.reset();
-        sigma_.reset();
-        volatility_returns_ = 0;
+        z_.reset();
         previous_reference_.reset();
         previous_reference_time_ = {};
         stand_aside("waiting for a fresh underlying reference and tick size");
         return;
     }
-    // Compare both to the price behind live quotes and to observed ranges.
-    // The latter catches a jump and reversal hidden by latest-price delivery.
+    // PricingMidMoveThreshold: how far the reference venue's mid may move
+    // in ONE update before the quotes standing behind it are stale. Two
+    // tests, one threshold:
+    //
+    //   - this update against the last one, which is the move as it happens
+    //   - the high-low range of any one second just passed, because the feed
+    //     hands over only the LATEST touch at each wake, so a spike that
+    //     reverts before the next one is invisible to the first test
+    //
+    // It is deliberately not the drift of the mid away from where a resting
+    // order was priced. That is a different question - it asks whether a
+    // quote has aged, not whether the market just jumped - and it is what
+    // CryptoMM's parameter of the same name measures.
     const auto exceeds = [&](std::int64_t a, std::int64_t b) {
         // Division avoids overflowing ticks * tick_size for large mappings.
-        return distance(a, b) / reference.tick_size >= params_.sharp_move_ticks;
+        return distance(a, b) / reference.tick_size >= params_.mid_move_threshold_ticks;
     };
     bool breach = false;
-    if (params_.sharp_move_ticks > 0) {
+    if (params_.mid_move_threshold_ticks > 0) {
         breach = previous_reference_ && exceeds(reference.mid, *previous_reference_);
-        const auto legs = orders_.legs();
-        if (!held_) {
-            for (const auto& leg : legs) {
-                const auto anchor = reference_anchors_.find(leg.cl_ord_id);
-                if (anchor != reference_anchors_.end() && exceeds(reference.mid, anchor->second.first)) breach = true;
-            }
-        }
-        if (reference.history) {
+        if (!breach && reference.history) {
             const auto recent = previous_reference_time_ == Clock::time_point{}
                                     ? std::chrono::floor<std::chrono::seconds>(now) - std::chrono::seconds(1)
                                     : std::chrono::floor<std::chrono::seconds>(previous_reference_time_);
-            for (auto it = reference.history->rbegin(); it != reference.history->rend() && it->second >= recent; ++it) {
+            for (auto it = reference.history->rbegin();
+                 it != reference.history->rend() && it->second >= recent; ++it) {
                 if (it->second > now) continue;
                 if (exceeds(it->high, it->low)) breach = true;
-                if (!held_) {
-                    for (const auto& leg : legs) {
-                        const auto anchor = reference_anchors_.find(leg.cl_ord_id);
-                        if (anchor != reference_anchors_.end() &&
-                            it->second >= std::chrono::floor<std::chrono::seconds>(anchor->second.second) &&
-                            (exceeds(it->high, anchor->second.first) || exceeds(it->low, anchor->second.first))) breach = true;
-                    }
-                }
             }
         }
     }
@@ -177,8 +249,9 @@ void QuotingMm::on_reference(const cpm::binance::ReferenceView& reference, Clock
     previous_reference_time_ = now;
     if (breach) {
         held_ = true;
-        hold_until_ = now + params_.resume_quiet;
-        stand_aside("sharp underlying move: waiting for a quiet reference and confirmed cancellations");
+        hold_until_ = now + params_.mid_breach_resume;
+        stand_aside("the pricing mid moved more than PricingMidMoveThreshold in one update: "
+                    "waiting for a quiet reference and confirmed cancellations");
     }
 }
 
@@ -204,53 +277,41 @@ void QuotingMm::on_market(const InstrumentView& book, const Position& position, 
             return;
         }
         held_ = false;
-        reference_anchors_.clear();
-    }
-    if (!opening_ && reference_.history) {
-        opening_ = reference_opening(*reference_.history, ticker_->window_end - std::chrono::minutes(15));
-    }
-    if (!opening_) {
-        stand_aside("opening price unavailable: supply this window's opening-price or wait for a captured window");
-        return;
-    }
-    volatility_returns_ = reference_.history
-                              ? contiguous_reference_returns(*reference_.history, params_.vol_lookback_seconds, now)
-                              : 0;
-    sigma_ = reference_.history
-                 ? reference_volatility(*reference_.history, params_.vol_lookback_seconds, now)
-                 : std::nullopt;
-    if (!sigma_) {
-        fair_.reset();
-        stand_aside("warming volatility: need " + std::to_string(params_.vol_lookback_seconds) +
-                    " contiguous completed one-second returns with nonzero variance");
-        return;
     }
     const double remaining = std::chrono::duration<double>(ticker_->window_end - now).count();
-    fair_ = quoting_probability(reference_.mid, *opening_, *sigma_, remaining, params_.correction, params_.t_scale);
+    // z first, then the probability that follows from it: the log line below
+    // has to show the model's working, not just its answer. Fair alone
+    // cannot say whether it moved because the underlying did or because the
+    // window ran down, and a correction factor is fitted against z.
+    z_ = quoting_z(reference_.mid, *opening_, params_.sigma, remaining, params_.correction);
+    fair_ = z_ ? std::optional<double>(student_t4_cdf(*z_)) : std::nullopt;
     if (!fair_) {
         stand_aside("model inputs do not produce a valid probability");
         return;
     }
     if (orders_.quiescent()) target_fair_.reset();
     if (!target_fair_ || std::abs(*fair_ - *target_fair_) * kPriceOne >=
-                             params_.fair_move_ticks * cpm::md::tick_at(
-                                 static_cast<Price>(*target_fair_ * kPriceOne), params_.ticks)) {
+                             params_.fair_move_ticks * cpm::md::tick_at(static_cast<Price>(*target_fair_ * kPriceOne))) {
         target_fair_ = fair_;
     }
     const auto desired = quoting_mm_quotes(*target_fair_, book, position, params_);
     if (desired.bid || desired.ask) --passes_without_target_;
     reason_ = desired.reason;
     orders_.update(desired);
-    std::map<std::string, std::pair<cpm::binance::Price, Clock::time_point>> next_anchors;
-    for (const auto& leg : orders_.legs()) {
-        const auto anchor = reference_anchors_.find(leg.cl_ord_id);
-        next_anchors[leg.cl_ord_id] = anchor == reference_anchors_.end()
-                                          ? std::make_pair(reference_.mid, now) : anchor->second;
-    }
-    reference_anchors_ = std::move(next_anchors);
-    const auto message = "fair " + decimal(*fair_, 6) + ", sigma " + decimal(*sigma_, 8) +
-                         " -> " + (desired.bid ? format_price(desired.bid->price) : "-") + " / " +
-                         (desired.ask ? format_price(desired.ask->price) : "-");
+    // Everything the model used, so a finished run can be re-priced from its
+    // own log: the strike, where the underlying was against it, how much of
+    // the window was left, and the volatility that was frozen at the open.
+    // ln(S/K) is written out beside z because it is the quantity the model
+    // is defined on, and z is it divided by correction * sigma * sqrt(tau).
+    const double travelled =
+        std::log(static_cast<double>(reference_.mid) / static_cast<double>(*opening_));
+    const auto message =
+        "fair " + decimal(*fair_, 6) + ", z " + decimal(*z_, 6) + ", ln(S/K) " +
+        decimal(travelled, 8) + ", spot " + format_scaled(reference_.mid, cpm::binance::kScale) +
+        ", open " + format_scaled(*opening_, cpm::binance::kScale) + ", left " +
+        decimal(remaining, 1) + "s, sigma " + decimal(params_.sigma, 8) + " -> " +
+        (desired.bid ? format_price(desired.bid->price) : "-") + " / " +
+        (desired.ask ? format_price(desired.ask->price) : "-");
     if (message != last_log_) {
         if (log_) log_(message);
         last_log_ = message;
@@ -263,7 +324,6 @@ void QuotingMm::abandon(const std::string& why) {
     orders_.abandon(why);
     reason_ = why;
     target_fair_.reset();
-    reference_anchors_.clear();
 }
 
 StrategyStatus QuotingMm::status() const {
@@ -272,15 +332,12 @@ StrategyStatus QuotingMm::status() const {
     out.passes_without_target = passes_without_target_;
     out.reason = reason_;
     out.diagnostics["Fair YES (%)"] = fair_ ? decimal(*fair_ * 100, 3) : "unavailable";
-    out.diagnostics["Sigma / sqrt(second)"] = sigma_ ? decimal(*sigma_, 8) : "warming";
-    out.diagnostics["Volatility returns"] = std::to_string(volatility_returns_) + " / " +
-                                          std::to_string(params_.vol_lookback_seconds);
-    out.diagnostics["Warmup remaining (minimum)"] =
-        volatility_returns_ < params_.vol_lookback_seconds
-            ? std::to_string(params_.vol_lookback_seconds - volatility_returns_) + " seconds of uninterrupted observations"
-            : sigma_ ? "ready" : "waiting for nonzero variance";
-    out.diagnostics["Opening price"] = opening_ ? format_scaled(*opening_, cpm::binance::kScale) : "unavailable";
-    out.diagnostics["Opening source"] = params_.opening_price > 0 ? "window override" : "mapped reference opening second";
+    out.diagnostics["Sigma / sqrt(second)"] = decimal(params_.sigma, 8);
+    out.diagnostics["Sigma source"] =
+        params_.warmup_note.empty() ? "supplied" : params_.warmup_note;
+    // The opening price is not here any more: it comes from Binance like
+    // everything else the model prices with, and it is written on every
+    // strategy.log line instead of being a number to read off a row.
     out.diagnostics["Underlying price"] = reference_.usable() && reference_.mid > 0
                                               ? format_scaled(reference_.mid, cpm::binance::kScale) : "unavailable";
     out.diagnostics["Correction factor"] = decimal(params_.correction, 6);
@@ -305,18 +362,24 @@ ParamSchema quoting_mm_schema() {
     add("width-ticks", Type::Int, "4", "1", "500", "minimum whole spread around model fair value, in prediction-market ticks");
     add("qty", Type::Decimal, "1", "0.01", "10000", "contracts per side, capped by remaining inventory capacity", cpm::kQtyScale);
     add("max-inventory", Type::Decimal, "5", "0", "1000000", "stop at this absolute net position; 0 disables", cpm::kQtyScale);
-    add("vol-lookback-seconds", Type::Int, "1200", "2", "3600", "volatility history length: 1200 is 20 minutes; 60 gives a one-minute simulator warmup but changes the estimate");
-    add("correction-factor", Type::Decimal, "", "0.000001", "1000", "required calibrated multiplier of sigma; kept fixed until explicitly edited", 6);
-    add("t-scale", Type::Enum, "raw", "", "", "raw matches the PDF formula; unit-variance rescales Student t4 to variance one");
-    schema.back().choices = {"raw", "unit-variance"};
+    add("vol-lookback-minutes", Type::Int, "20", "2", "1440", "minutes of one-minute Binance klines, ending at the window's opening, that sigma is taken over; read once when the instance is built");
+    add("correction-factor", Type::Decimal, "1", "0.000001", "1000", "calibrated multiplier of sigma; 1 prices straight off the measured volatility, which is a starting point and not a calibration. Kept fixed until explicitly edited", 6);
     add("fair-value-move-threshold", Type::Int, "1", "1", "500", "reprice once fair value moves this many prediction ticks from the last target");
-    add("sharp-move-threshold", Type::Int, "2500", "0", "1000000000", "withdraw on this many reference ticks of movement or a one-second range; 0 disables");
-    add("resume-quiet-ms", Type::Int, "1000", "1", "60000", "quiet time after the last detected sharp move; previous cancels must also be confirmed");
+    add("pricing-mid-move-threshold", Type::Int, "2500", "0", "1000000000",
+        "pull the quotes when the reference venue's mid moves this many of its own ticks in a "
+        "single update, or over any one second; 0 is off. BTCUSDT on the USD-M futures venue "
+        "ticks at 0.1, so 2500 is a $250 move");
+    schema.back().label = "PricingMidMoveThreshold";
+    add("pricing-mid-breach-resume-sec", Type::Int, "1", "0", "900",
+        "seconds to stand aside after such a move; the previous cancels must also be confirmed "
+        "before quoting resumes");
+    schema.back().label = "PricingMidBreachResumeSec";
     add("withdraw-before", Type::Int, "25", "0", "899", "seconds before close to withdraw; default 25");
-    add("opening-price", Type::Decimal, "0", "0", "1000000000", "this window's underlying opening/strike; 0 uses the captured reference opening second; reset on series roll", cpm::binance::kScale);
-    schema.back().reset_on_roll = true;
-    add("ticks", Type::Enum, "tapered", "", "", "prediction-market price grid");
-    schema.back().choices = {"tapered", "tapered-cent", "cent", "deci"};
+    // No opening-price here any more. The strike comes from the venue this
+    // model prices against, like the spot and the volatility do: the open of
+    // the window's own Binance kline, fetched when the instance is built. A
+    // typed-in opening was a way to correct a strike the daemon could not
+    // read, and there is nothing left for it to correct.
     return schema;
 }
 
@@ -326,22 +389,74 @@ QuotingMmParams quoting_mm_params(const ParamValues& values) {
     p.spread_ticks = static_cast<int>(param_int(values, "width-ticks"));
     p.quantity = param_decimal(values, "qty", cpm::kQtyScale);
     p.max_inventory = param_decimal(values, "max-inventory", cpm::kQtyScale);
-    p.vol_lookback_seconds = static_cast<int>(param_int(values, "vol-lookback-seconds"));
+    p.vol_lookback_minutes = static_cast<int>(param_int(values, "vol-lookback-minutes"));
     p.correction = static_cast<double>(param_decimal(values, "correction-factor", 6)) / 1000000;
-    p.t_scale = param_text(values, "t-scale") == "raw" ? TScale::Raw : TScale::UnitVariance;
     p.fair_move_ticks = static_cast<int>(param_int(values, "fair-value-move-threshold"));
-    p.sharp_move_ticks = param_int(values, "sharp-move-threshold");
-    p.resume_quiet = std::chrono::milliseconds(param_int(values, "resume-quiet-ms"));
+    p.mid_move_threshold_ticks = param_int(values, "pricing-mid-move-threshold");
+    p.mid_breach_resume = std::chrono::seconds(param_int(values, "pricing-mid-breach-resume-sec"));
     p.withdraw_before = std::chrono::seconds(param_int(values, "withdraw-before"));
-    p.opening_price = param_decimal(values, "opening-price", cpm::binance::kScale);
-    p.ticks = cpm::md::tick_structure_from(param_text(values, "ticks")).value();
     return p;
 }
 
-void register_quoting_mm(StrategyRegistry& registry) {
+std::string reference_symbol_for(const std::map<std::string, cpm::binance::Mapping>& symbols,
+                                 const std::string& instrument) {
+    // The same two keys the daemon maps a reference price with: the ticker's
+    // asset (BTC), and whatever precedes the first dash (BTCD15M), which is
+    // what makes an instrument with no readable asset mappable at all.
+    std::vector<std::string> keys;
+    if (const auto parsed = cpm::md::parse_ticker(instrument)) keys.push_back(parsed->asset);
+    if (const auto dash = instrument.find('-'); dash != std::string::npos) {
+        keys.push_back(instrument.substr(0, dash));
+    }
+    for (const auto& key : keys) {
+        const auto found = symbols.find(key);
+        if (found != symbols.end()) return found->second.symbol;
+    }
+    return {};
+}
+
+void register_quoting_mm(StrategyRegistry& registry, QuotingMmVenue venue) {
+    if (!venue.cache) venue.cache = std::make_shared<WarmupCache>();
+    if (!venue.fetch) venue.fetch = cpm::https_get;
     registry.add("QuotingMM", "quotes Student t4 model fair value, including on an empty prediction book",
-                 quoting_mm_schema(), [](const ParamValues& values, StrategyHooks hooks) {
-                     return std::make_unique<QuotingMm>(quoting_mm_params(values), std::move(hooks));
+                 quoting_mm_schema(), [venue](const ParamValues& values, StrategyHooks hooks) {
+                     auto params = quoting_mm_params(values);
+                     const auto ticker = cpm::md::parse_ticker(params.symbol);
+                     // Let the constructor refuse an instrument this kind
+                     // does not quote: it says so better, and there is no
+                     // point asking Binance about a window that is not one.
+                     if (ticker && ticker->series.ends_with("15M")) {
+                         const auto symbol = reference_symbol_for(venue.symbols, params.symbol);
+                         if (symbol.empty()) {
+                             throw std::invalid_argument(
+                                 "no Binance symbol is mapped for " + params.symbol +
+                                 ": add it to config/binance.conf before quoting this model");
+                         }
+                         WarmupRequest request;
+                         request.symbol = symbol;
+                         // The window this instrument is: the one that opened
+                         // fifteen minutes before it closes, whether that was
+                         // a moment ago or twelve minutes ago.
+                         request.window_start = ticker->window_end - std::chrono::minutes(15);
+                         request.lookback_minutes = params.vol_lookback_minutes;
+                         request.host = venue.host;
+                         request.port = venue.port;
+                         request.ca_file = venue.ca_file;
+                         request.timeout = venue.timeout;
+                         const auto warmed = venue.cache->get(request, venue.fetch);
+                         if (!warmed.ok()) {
+                             // Refused rather than quoted on a guess. On a
+                             // create the operator sees this; on a roll the
+                             // host keeps the old instance and the daemon's
+                             // next tick tries again (host.cpp, trader.cpp).
+                             throw std::runtime_error("cannot price " + params.symbol + " yet: " +
+                                                      warmed.error);
+                         }
+                         params.sigma = warmed.warmup.sigma;
+                         params.warmup_opening = warmed.warmup.opening;
+                         params.warmup_note = warmed.warmup.describe();
+                     }
+                     return std::make_unique<QuotingMm>(std::move(params), std::move(hooks));
                  });
 }
 

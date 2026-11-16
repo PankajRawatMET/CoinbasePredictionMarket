@@ -53,13 +53,13 @@ struct TraderOptions {
     // run's whole account - narrative, strategy chatter, wire and records -
     // is one directory. Empty writes straight into the day's, as before.
     std::string log_run;
-    // The price grid every instrument here is assumed to trade on. One
-    // setting for the daemon, because the structure is not on the FIX feed
-    // and there is nowhere else to learn it from (O5).
-    cpm::md::TickStructure ticks = cpm::md::TickStructure::TaperedDeciCent;
     // The REST instrument catalog. Optional: without it a series cannot be
     // resolved, and everything that names a full ticker still works.
     cpm::md::RestConfig rest;
+    // The HTTP call the instrument catalog is read with. Empty means
+    // cpm::https_get; a test supplies its own so a resolution, and the price
+    // grid that comes back with it, can be driven without a network.
+    cpm::md::HttpsFetch rest_fetch;
     std::chrono::milliseconds stale_after{std::chrono::seconds(30)};
     // Where the record files go: fills-*.csv and orders-*.csv, beside the
     // daemon's .log files (docs/design-logs.md). Empty writes none, which is

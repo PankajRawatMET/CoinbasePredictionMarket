@@ -232,4 +232,35 @@ TEST(BinanceConfig, ReferenceHistoryCacheCanUseAnExplicitLocalPath) {
     EXPECT_EQ(config.feed.history_file, "/tmp/reference history");
 }
 
+TEST(BinanceConfig, RestIsAHostAndNothingElse) {
+    // Where QuotingMM reads a window's sigma and opening price from. The
+    // default is production USD-M futures, so a file that says nothing
+    // about REST still works (B-Q19).
+    Config defaults;
+    EXPECT_EQ(cpm::binance::parse_config("url = wss://fstream.binance.com/ws\n", defaults), "");
+    EXPECT_EQ(defaults.rest.host, "fapi.binance.com");
+    EXPECT_EQ(defaults.rest.port, 443);
+
+    Config testnet;
+    EXPECT_EQ(cpm::binance::parse_config("rest_url = https://testnet.binancefuture.com\n", testnet), "");
+    EXPECT_EQ(testnet.rest.host, "testnet.binancefuture.com");
+
+    Config ported;
+    EXPECT_EQ(cpm::binance::parse_config("rest_url = https://localhost:8443\n", ported), "");
+    EXPECT_EQ(ported.rest.host, "localhost");
+    EXPECT_EQ(ported.rest.port, 8443);
+
+    // A trailing slash is a host; a path is the venue's to choose, not an
+    // operator's, and http:// would hand the answer to whoever replied.
+    Config slash;
+    EXPECT_EQ(cpm::binance::parse_config("rest_url = https://fapi.binance.com/\n", slash), "");
+    EXPECT_EQ(slash.rest.host, "fapi.binance.com");
+    Config pathed;
+    EXPECT_NE(cpm::binance::parse_config("rest_url = https://fapi.binance.com/fapi/v1\n", pathed), "");
+    Config plain;
+    EXPECT_NE(cpm::binance::parse_config("rest_url = http://fapi.binance.com\n", plain), "");
+    Config bad_port;
+    EXPECT_NE(cpm::binance::parse_config("rest_url = https://fapi.binance.com:none\n", bad_port), "");
+}
+
 }  // namespace

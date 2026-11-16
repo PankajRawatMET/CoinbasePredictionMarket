@@ -47,10 +47,12 @@ struct InstrumentInfo {
     // does not depend on parsing the ticker - though parse_ticker agrees, and
     // the catalog checks that they do.
     Clock::time_point expected_close{};
-    // What the venue says this instrument's tick grid is, which is better
-    // than the configured guess (GUI-Q23). Nullopt for a structure this build
-    // does not know.
-    std::optional<TickStructure> ticks;
+    // What the venue says this instrument's tick grid is, verbatim -
+    // "TAPERED_DECI_CENT" for every series this build can quote. Kept so the
+    // daemon can say so when it is anything else, because there is one grid
+    // in this build and an instrument on another one cannot be priced
+    // (cpm/md/ticks.hpp). Empty when the catalog did not say.
+    std::string price_level_structure;
 };
 
 struct InstrumentQuery {

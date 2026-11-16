@@ -11,24 +11,26 @@ The model follows `Pred Quoting Summary.pdf`:
 ```text
 z        = log(underlying / opening) / (correction * sigma * sqrt(seconds_left))
 fair YES = StudentT4CDF(z)
-bid/ask  = fair YES +/- half the configured spread
+bid/ask  = the grid pair `width-ticks` apart straddling fair YES
 ```
 
-`sigma` is the sample standard deviation of completed one-second log
-returns over the last 1,200 seconds by default. It is in return per square
-root second, not annualized. Missing seconds are not forward-filled and
-zero variance is not accepted. A complete 1,200-return estimate requires
-1,201 consecutive observed second buckets. The current partial bucket is
-excluded.
+`sigma` is the sample standard deviation of completed one-minute log
+returns over the 20 minutes ending at the window's open, in return per
+square root second rather than annualized. A gap in those minutes is
+refused rather than stepped over, and zero variance is not accepted. See
+"Where sigma and the opening come from" below.
 
-The `raw` t scale implements the PDF formula directly. `unit-variance`
-multiplies z by sqrt(2), accounting for the ordinary t4 distribution's
-variance of two. Choose the convention used in your calibration.
+`StudentT4CDF` is the ordinary Student t CDF with four degrees of freedom,
+applied to z exactly as the PDF writes it. There is no alternative scaling:
+a knob whose only effect is to multiply z by a constant would silently
+invalidate a correction factor fitted without it.
 
-The correction factor must be supplied. This version does not infer it,
-recalibrate it automatically, or reproduce the PDF's historical backtest.
-Update it explicitly using your calibrated value; normal disarm/edit rules
-apply.
+The correction factor defaults to **1**, which prices straight off the
+measured sigma. That is a starting point, not a calibration: the PDF asks
+for a factor fitted over a one-to-two-week lookback and held constant until
+the next one. This version does not infer it, recalibrate it automatically,
+or reproduce the PDF's historical backtest. Set it explicitly once you have
+fitted it; normal disarm/edit rules apply.
 
 ## Empty and quiet books
 
@@ -43,10 +45,23 @@ QuotingMM tolerates a silent, unchanged book; CryptoMM retains its existing
 book-silence timeout. Disconnects, sequence gaps and subscription rejects
 still halt both strategies through the existing monitor.
 
-Prices are snapped outwards to the configured instrument grid. The spread
-is a minimum before price-bound and touch adjustments. Orders share
-CryptoMM's extracted QuoteReconciler: GTC limit, post-only slide, unique IDs,
-cancel-before-replace, actual resting-price tracking and execution reports.
+`width-ticks` is a **hard cap**, not a minimum: the market shown is never
+wider than the one configured. Fair value is almost never on a grid point,
+so the pair of grid prices exactly `width-ticks` steps apart that straddles
+fair most evenly is used - at most half a step of skew either way, and
+neither leg is ever rounded away from the other to reach the grid. Width is
+counted in grid *steps*, not in a tick size multiplied out, so it stays
+right where the venue's taper changes the step (0.100 and 0.900).
+
+A leg may not rest at or inside the opposing touch - that is taking, not
+making. Because the quote may not be widened past the cap, and sliding the
+pair clear would post prices the model does not believe, the strategy
+**stands aside** while the book leaves no room, and the row says which side
+conflicted. It resumes as soon as the touch moves.
+
+Orders share CryptoMM's extracted QuoteReconciler: GTC limit, post-only
+slide, unique IDs, cancel-before-replace, actual resting-price tracking and
+execution reports.
 
 ## Reference history and opening price
 
@@ -56,36 +71,51 @@ and the chosen opening price match your intended model and the contract's
 benchmark; a Binance observation is not an official Coinbase settlement
 strike.
 
-`opening-price = 0` uses the first observed mapped reference price within
-the window's first UTC second. A strategy started mid-window can recover
-that observation from shared history, but never substitutes its startup
-price for an unknown opening. Supply the known official opening using
-`opening-price` when needed. That override is reset to zero on a series roll
-so it cannot silently carry an old strike into a new window.
+## Where sigma and the opening come from
 
-Reference history is bounded to one hour and shared across strategies and
-window rolls. It is built from the live stream; there is no new HTTP data
-dependency. Pin the mapped stream in `binance.conf` to warm history before
-starting a strategy. A cold start waits for the required contiguous history.
+Both are read **once**, from Binance's own kline history, when the instance
+is built - at create, and again at every window roll. Neither is recomputed
+while the window runs.
 
-Warmup is shared across window rolls: a new strategy instance uses the same
-underlying history and does not start another 20-minute collection period.
-The Pricing model section shows `Volatility returns` and the minimum time
-still needed. Gaps in the reference observations can extend that minimum.
+For a window that opened at 06:00, one public GET of
+`/fapi/v1/klines?symbol=BTCUSDT&interval=1m&limit=22&endTime=<06:00>` returns
+the 21 closes before the window plus the window's own bar. Sigma is the
+sample standard deviation of those 20 one-minute log returns, divided by
+`sqrt(60)` to put it per `sqrt(second)`; the opening is the window bar's
+`open`, which is the first price the venue traded at or after 06:00.
 
-For a shorter simulator experiment, set `vol-lookback-seconds` to `60` in
-the strategy form before starting. That uses one minute of returns and
-changes the volatility estimate; it is not a fast way to obtain the same
-20-minute model. Keep the default `1200` to preserve the intended lookback,
-and run the reference feed ahead of the trading window. This version does
-not automatically download historical observations at startup.
+That means an instance created at 06:12 prices exactly as one created at
+06:00:02 would: the bars behind a window are closed and never change again.
+It also means there is no warmup state at all - a strategy either has its
+inputs when it is built, or it is not built.
 
-The daemon saves a source-tagged history cache on clean shutdown beside
-its bookmark (`<bookmark>.reference-history`). `history_file` in the Binance
-configuration overrides that location. Cache loading never makes the live
-feed fresh. Restart gaps still require fresh contiguous returns, and a crash
-may lose history since the last clean save. The cache is not a historical
-data downloader or a substitute for observing an opening.
+The call is refused rather than guessed around. If the venue is unreachable,
+if any of the 21 bars is missing, or if the window's own bar has not printed
+yet, `create` fails with the reason and a roll keeps the old instance while
+the daemon's next tick tries again. Results are cached per window and a
+failure is not retried more than once every two seconds, so a roll retried
+on every tick cannot put a blocking HTTPS call in the daemon's loop.
+
+`rest_url` in `binance.conf` says where REST is (default
+`https://fapi.binance.com`). No credential is involved: klines are public
+market data. This reverses B-Q17's "no REST call of any kind"; see
+`docs/open-questions-binance.txt`.
+
+There is no `opening-price` parameter any more. The strike comes from the
+venue the model prices against, like the spot and the volatility do, so
+there is nothing left for a typed-in opening to correct. If the contract
+ever has to be struck against something other than Binance's window-open
+print - the catalog's own `metadata.market.price_strike`, say - that is a
+change to where the strike is read from, not a box on a form.
+
+A sigma taken from 20 one-minute returns is a coarser estimate than one
+taken from 1200 one-second returns, and a different one: minute closes do
+not see intra-minute reversal. `binance_klines --symbol BTCUSDT --minutes 20`
+prints the bars and the same sigma figure, for comparing the two.
+
+The live one-second history is no longer read for pricing. It is still what
+the PricingMidMoveThreshold guard reads, and the daemon still keeps and
+caches it.
 
 ## Refresh, withdrawal and inventory
 
@@ -95,14 +125,28 @@ The model is evaluated on host passes, including reference-triggered wakes;
 time remaining can also move fair value. Fills replenish through the shared
 reconciler.
 
-The sharp-move guard counts **reference** ticks, not prediction ticks. It
-checks movement from each live order's pricing reference, successive
-reference observations, and observed second-bucket high/low ranges since the
-previous pass. The ranges preserve a jump followed by a reversal between
-passes. For the shipped BTC mapping (0.1), 2,500 ticks means a $250 move.
+There is no `ticks` parameter: every instrument this build quotes trades on
+the venue's `TAPERED_DECI_CENT` grid (`cpm/md/ticks.hpp`), and the daemon
+says so loudly if the catalog ever reports an instrument on another one.
 
-A breach cancels both quotes. Re-entry requires fresh inputs, a quiet period
-after the last detected breach, and confirmed completion of the old orders.
+`PricingMidMoveThreshold` counts **reference** ticks, not prediction ticks:
+how far the reference venue's mid may move in a *single update* before the
+quotes standing behind it are stale. Two tests share the one threshold -
+this update against the last, and the high-low range of any one second just
+passed. The second test is not redundant: the feed hands the strategy only
+the latest touch at each wake, so a spike that reverts before the next wake
+is invisible to the first. For the shipped BTC mapping (0.1), 2,500 ticks
+means a **$250** move - wide enough that it has never fired, so pick a
+number that suits the market you are quoting.
+
+It deliberately does not measure how far the mid has drifted from where a
+resting order was priced. That asks whether a quote has aged, not whether
+the market just jumped, and it is what CryptoMM's parameter of the same name
+measures. The two strategies answer different questions under one name.
+
+A breach cancels both quotes. Re-entry requires fresh inputs,
+`PricingMidBreachResumeSec` seconds of quiet, and confirmed completion of
+the old orders.
 It does not wait for other prediction-market participants to move their
 quotes. Reference loss also withdraws. The existing wake pipe is reused;
 the PDF's 60 ms objective is not an end-to-end latency guarantee.
@@ -122,23 +166,46 @@ Asynchronous fills and cancels remain subject to the existing OMS rules.
 | Name | Default | Unit / purpose |
 |---|---|---|
 | `symbol` | required | Dated 15-minute instrument, or series through the existing control API |
-| `correction-factor` | required | Positive calibrated multiplier |
-| `width-ticks` | 4 | Whole spread in prediction ticks |
+| `correction-factor` | 1 | Positive multiplier of sigma; 1 is uncalibrated |
+| `width-ticks` | 4 | Whole spread in grid steps; a hard cap, never exceeded |
 | `qty` | 1 | Contracts per side |
 | `max-inventory` | 5 | Contracts, absolute net; 0 disables |
-| `vol-lookback-seconds` | 1200 | Completed one-second returns; 2–3600 |
-| `t-scale` | raw | `raw` or `unit-variance` |
+| `vol-lookback-minutes` | 20 | Minutes of 1m klines before the window's open; 2–1440 |
 | `fair-value-move-threshold` | 1 | Prediction ticks from the last target |
-| `sharp-move-threshold` | 2500 | Reference ticks; 0 disables |
-| `resume-quiet-ms` | 1000 | Quiet period after the last detected breach |
+| `pricing-mid-move-threshold` | 2500 | `PricingMidMoveThreshold` — reference ticks in one update; 0 disables |
+| `pricing-mid-breach-resume-sec` | 1 | `PricingMidBreachResumeSec` — seconds to stand aside after a breach |
 | `withdraw-before` | 25 | Seconds before expiry; 0 rests until close |
-| `opening-price` | 0 | Underlying price override for this window only |
-| `ticks` | tapered | Existing prediction-market tick grid |
 
-Select QuotingMM in the existing strategy form and enter the correction
-factor before creating it. The expandable Pricing model section shows fair
-YES probability, sigma, underlying and opening prices, remaining time and
-readiness/hold state. Feed, Start, Arm, Stop and parameter edits use the same
+Select QuotingMM in the existing strategy form; the correction factor
+defaults to 1 and can be edited before arming. The expandable Pricing model section shows fair
+YES probability, sigma and where it came from, the underlying, remaining
+time and readiness/hold state. The opening price is **not** on the row: it
+comes from Binance like every other input, and is written on every
+`strategy.log` line instead.
+
+## What a run leaves behind
+
+Each time the quoting changes, `strategy.log` gets the model's whole
+working, so a finished run can be re-priced from its own log:
+
+```
+fair 0.528114, z 0.075058, ln(S/K) 0.00018158, spot 64440.3,
+  open 64428.6, left 834.0s, sigma 0.00008377 -> 0.51 / 0.55
+```
+
+These lines do **not** go to the console. A strategy quoting puts out some
+thirty lines a second, which buries the daemon's own events, so the terminal
+keeps the narrative and `strategy.log` keeps the commentary; the page's log
+panel still shows both. `--console-strategy` puts them back on stdout. A
+Warn or an Error from a strategy is never silenced.
+
+`open` is the strike this window is settled against, `spot` the underlying
+at that instant, `left` the seconds remaining, and `sigma` the figure frozen
+at the window's open. `ln(S/K)` is the distance the model is defined on and
+`z` is that divided by `correction * sigma * sqrt(left)` - so `fair` is
+reproducible from the line, and a correction factor can be fitted against
+it afterwards. When spot equals the strike the line reads `z 0.000000` and
+`fair 0.500000`, whatever sigma says. Feed, Start, Arm, Stop and parameter edits use the same
 controls as CryptoMM. Test disarmed and in the simulators/replay environment
 before arming on a live venue.
 

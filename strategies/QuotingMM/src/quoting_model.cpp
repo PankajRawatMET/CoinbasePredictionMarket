@@ -14,18 +14,27 @@ double student_t4_cdf(double z) {
     return z < 0 ? tail : 1.0 - tail;
 }
 
-std::optional<double> quoting_probability(std::int64_t spot, std::int64_t opening,
-                                         double sigma, double seconds_left,
-                                         double correction, TScale scale) {
+std::optional<double> quoting_z(std::int64_t spot, std::int64_t opening, double sigma,
+                                double seconds_left, double correction) {
     if (spot <= 0 || opening <= 0 || !std::isfinite(sigma) || sigma <= 0 ||
         !std::isfinite(seconds_left) || seconds_left <= 0 ||
         !std::isfinite(correction) || correction <= 0) return std::nullopt;
     const double denominator = correction * sigma * std::sqrt(seconds_left);
     if (!std::isfinite(denominator) || denominator <= 0) return std::nullopt;
-    double z = std::log(static_cast<double>(spot) / static_cast<double>(opening)) / denominator;
-    if (scale == TScale::UnitVariance) z *= std::sqrt(2.0);
+    const double z =
+        std::log(static_cast<double>(spot) / static_cast<double>(opening)) / denominator;
     if (std::isnan(z)) return std::nullopt;
-    return student_t4_cdf(z);
+    return z;
+}
+
+std::optional<double> quoting_probability(std::int64_t spot, std::int64_t opening,
+                                         double sigma, double seconds_left,
+                                         double correction) {
+    // One formula, in one place: the probability is the t4 CDF of the z this
+    // strategy logs, so the two can never drift apart.
+    const auto z = quoting_z(spot, opening, sigma, seconds_left, correction);
+    if (!z) return std::nullopt;
+    return student_t4_cdf(*z);
 }
 
 int contiguous_reference_returns(const cpm::binance::HistoryView& history,

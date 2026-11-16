@@ -128,7 +128,7 @@ TEST_F(ServerTest, ServesAnInstrumentsWholePriceGrid) {
     const auto parsed = cpm::gui::json_parse(body_of(response));
     ASSERT_TRUE(parsed.ok()) << parsed.error;
     EXPECT_EQ(parsed.value.find("symbol")->text, kSym);
-    EXPECT_EQ(parsed.value.find("structure")->text, "tapered");
+    EXPECT_EQ(parsed.value.find("structure")->text, "TAPERED_DECI_CENT");
 
     // TAPERED_DECI_CENT, which is what the venue reports for these series
     // (docs/spec/capture-rest-20261028T1205-instruments.txt): a tenth of a

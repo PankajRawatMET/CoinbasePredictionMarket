@@ -67,7 +67,8 @@ struct Rig {
     // up and stops sending, which is staleness rather than a disconnect.
     explicit Rig(bool allow_orders = true, std::optional<int> drop_seq = std::nullopt,
                  std::vector<std::string> watch = {},
-                 std::optional<int> quiet_after = std::nullopt) {
+                 std::optional<int> quiet_after = std::nullopt,
+                 cpm::md::HttpsFetch catalog = {}) {
         cpm::strategy::register_crypto_mm(registry);
 
         const cpm::Credentials md_creds{"md-key", "md-pass", "bWQtc2ltLXNlY3JldA=="};
@@ -108,6 +109,15 @@ struct Rig {
         options.limits.max_orders_per_sec = 20;
         options.stale_after = 2s;
         options.watch = std::move(watch);
+        if (catalog) {
+            // A catalog this test answers for, so a series resolution - and
+            // the price grid the venue reports with it - needs no network.
+            options.rest.api_key = "rest-key";
+            options.rest.passphrase = "rest-pass";
+            options.rest.secret_b64 = "cmVzdC1zZWNyZXQ=";
+            options.rest.url = "https://rest.invalid";
+            options.rest_fetch = std::move(catalog);
+        }
         trader = std::make_unique<Trader>(std::move(options), registry, logger);
     }
 
@@ -313,6 +323,42 @@ TEST(Trader, AnUnresolvableWatchedSeriesDoesNotStopTheDaemon) {
     EXPECT_EQ(rig.trader->start(), "") << rig.logs();
     EXPECT_NE(rig.logs().find("not watching BTCD15M"), std::string::npos) << rig.logs();
     EXPECT_TRUE(rig.trader->api().snapshot().books.empty());
+}
+
+// This build prices on one grid, the venue's own TAPERED_DECI_CENT. The
+// catalog is still read, so an instrument the venue says trades on another
+// structure is reported rather than quoted onto the wrong rungs.
+TEST(Trader, SaysSoWhenTheVenueReportsAGridThisBuildCannotPrice) {
+    const auto catalog = [](const cpm::HttpsRequest&) {
+        return cpm::HttpsResponse{200,
+                                  R"({"data":[{"ticker":"SIMGAME-26NOV01HOMAWY-HOM",)"
+                                  R"("series_ticker":"SIMGAME","status":"OPEN",)"
+                                  R"("price_level_structure":"LINEAR_CENT"}]})",
+                                  ""};
+    };
+    Rig rig(true, std::nullopt, {"SIMGAME"}, std::nullopt, catalog);
+    EXPECT_EQ(rig.trader->start(), "") << rig.logs();
+    EXPECT_NE(rig.logs().find("this build prices only on TAPERED_DECI_CENT"), std::string::npos)
+        << rig.logs();
+
+    // And the ladder is the one grid, whatever the catalog said.
+    const auto axis = rig.trader->api().axis(kSym);
+    EXPECT_EQ(axis.structure, "TAPERED_DECI_CENT");
+    EXPECT_EQ(axis.prices.size(), 281u);
+}
+
+TEST(Trader, SaysNothingWhenTheVenueAgrees) {
+    const auto catalog = [](const cpm::HttpsRequest&) {
+        return cpm::HttpsResponse{200,
+                                  R"({"data":[{"ticker":"SIMGAME-26NOV01HOMAWY-HOM",)"
+                                  R"("series_ticker":"SIMGAME","status":"OPEN",)"
+                                  R"("price_level_structure":"TAPERED_DECI_CENT"}]})",
+                                  ""};
+    };
+    Rig rig(true, std::nullopt, {"SIMGAME"}, std::nullopt, catalog);
+    EXPECT_EQ(rig.trader->start(), "") << rig.logs();
+    EXPECT_EQ(rig.logs().find("prices only on"), std::string::npos) << rig.logs();
+    EXPECT_EQ(rig.trader->api().axis(kSym).prices.size(), 281u);
 }
 
 TEST(Trader, RefusesAStrategyWhoseFeedCouldNotBeOpened) {

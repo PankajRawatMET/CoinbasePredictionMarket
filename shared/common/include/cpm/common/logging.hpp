@@ -54,6 +54,14 @@ public:
                                     std::string_view message)>;
     void also_to(Sink sink);
 
+    // Keeps one source off the stream while still giving it to every sink,
+    // so it reaches its file and the page's panel but not the terminal. A
+    // strategy's running commentary on its own quoting is thirty lines a
+    // second and buries the daemon's own events; the file is where it is
+    // read, not the console. A Warn or an Error is never silenced - whatever
+    // the source, something that went wrong belongs on screen.
+    void keep_off_stream(LogSource source);
+
     void log(LogLevel level, std::string_view message, LogSource source = LogSource::Daemon);
     void debug(std::string_view message, LogSource source = LogSource::Daemon) {
         log(LogLevel::Debug, message, source);
@@ -69,10 +77,13 @@ public:
     }
 
 private:
+    bool on_stream(LogLevel level, LogSource source) const;
+
     std::mutex mutex_;
     std::ostream& out_;
     LogLevel min_level_;
     std::vector<Sink> sinks_;
+    std::vector<LogSource> quiet_;
 };
 
 }  // namespace cpm

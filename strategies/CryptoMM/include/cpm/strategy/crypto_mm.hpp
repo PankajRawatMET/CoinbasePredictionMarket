@@ -31,7 +31,6 @@ namespace cpm::strategy {
 // It now belongs to the instrument rather than to this strategy - a grid
 // decides what any order may be priced at, and what rungs a ladder has - so
 // the definition lives in cpm/md/ticks.hpp and these names stay as they were.
-using TickStructure = cpm::md::TickStructure;
 using cpm::md::tick_at;
 
 struct Params {
@@ -52,7 +51,6 @@ struct Params {
     // it leaves behind is the position - nothing flattens it, and the row
     // stays on the page with its feed up, saying why it stopped.
     Qty max_inventory = 500;
-    TickStructure ticks = TickStructure::TaperedDeciCent;
     // Re-quote only when the target has moved at least this many ticks, so a
     // one-tick flicker does not cause a cancel and replace on every update.
     int requote_threshold_ticks = 1;
@@ -176,11 +174,6 @@ private:
 ParamSchema crypto_mm_schema();
 // Turns an already validated value set into Params.
 Params crypto_mm_params(const ParamValues& values);
-// The "tapered" / "cent" / "deci" spelling the schema, the CLI and the GUI
-// share, from cpm/md/ticks.hpp.
-using cpm::md::tick_structure_from;
-using cpm::md::to_string;
-
 void register_crypto_mm(StrategyRegistry& registry);
 
 }  // namespace cpm::strategy

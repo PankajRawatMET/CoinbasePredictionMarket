@@ -115,7 +115,7 @@ DesiredQuotes desired_quotes(const InstrumentView& book, const Position& positio
     const Price mid2 = bid_ex_ours.price + ask_ex_ours;
     const Price mid = mid2 / 2;
 
-    const Price tick = tick_at(mid, params.ticks);
+    const Price tick = tick_at(mid);
     // The whole width, so each side is half of it away from the mid.
     const Price span = tick * params.spread_ticks;
 
@@ -143,10 +143,10 @@ DesiredQuotes desired_quotes(const InstrumentView& book, const Position& positio
     // Onto the grid, both sides the same way. That is what holds the width at
     // exactly span: rounding each side away from the touch instead would add a
     // tick whenever the mid fell between two of them.
-    Price bid = round_up ? cpm::md::snap_up(ceil_half(mid2 - span), params.ticks)
-                         : cpm::md::snap_down(floor_half(mid2 - span), params.ticks);
-    Price ask = round_up ? cpm::md::snap_up(ceil_half(mid2 + span), params.ticks)
-                         : cpm::md::snap_down(floor_half(mid2 + span), params.ticks);
+    Price bid = round_up ? cpm::md::snap_up(ceil_half(mid2 - span))
+                         : cpm::md::snap_down(floor_half(mid2 - span));
+    Price ask = round_up ? cpm::md::snap_up(ceil_half(mid2 + span))
+                         : cpm::md::snap_down(floor_half(mid2 + span));
     bid = std::clamp(bid, kMinPrice, kMaxPrice);
     ask = std::clamp(ask, kMinPrice, kMaxPrice);
 
@@ -157,8 +157,8 @@ DesiredQuotes desired_quotes(const InstrumentView& book, const Position& positio
     // venue's price and need not sit on our grid, and a tick taken off it
     // lands between rungs: one below 99% is 98%, not 98.9%, and an order at
     // 98.9% is the reject this line exists to avoid.
-    if (bid >= best_ask) bid = cpm::md::price_below(best_ask, params.ticks);
-    if (ask <= best_bid) ask = cpm::md::price_above(best_bid, params.ticks);
+    if (bid >= best_ask) bid = cpm::md::price_below(best_ask);
+    if (ask <= best_bid) ask = cpm::md::price_above(best_bid);
     if (bid < kMinPrice || ask > kMaxPrice || bid >= ask) {
         out.reason = "no room between the touch and the price bounds";
         return out;
@@ -183,7 +183,7 @@ DesiredQuotes desired_quotes(const InstrumentView& book, const Position& positio
 }
 
 QuoteManager::QuoteManager(Params params, Hooks hooks)
-    : QuoteReconciler({params.symbol, params.ticks, params.requote_threshold_ticks}, std::move(hooks)),
+    : QuoteReconciler({params.symbol, params.requote_threshold_ticks}, std::move(hooks)),
       params_(std::move(params)) {}
 
 void QuoteManager::announce(const InstrumentView& book, const DesiredQuotes& desired, bool may_send) {
@@ -394,15 +394,6 @@ ParamSchema crypto_mm_schema() {
                       "ticks at 0.01, so 2500 is a $25 move";
     schema.push_back(std::move(speed_bump));
 
-    ParamSpec ticks;
-    ticks.name = "ticks";
-    ticks.type = ParamSpec::Type::Enum;
-    ticks.default_value = "tapered";
-    ticks.choices = {"tapered", "tapered-cent", "cent", "deci"};
-    ticks.help = "the instrument's tick grid; tapered is TAPERED_DECI_CENT, which is "
-                 "what the venue reports for BTCD15M and ETHD15M over REST";
-    schema.push_back(std::move(ticks));
-
     return schema;
 }
 
@@ -415,8 +406,6 @@ Params crypto_mm_params(const ParamValues& values) {
     params.requote_threshold_ticks = static_cast<int>(param_int(values, "requote-threshold"));
     // The schema has already refused anything else.
     params.withdraw_before = std::chrono::seconds(param_int(values, "withdraw-before"));
-    params.ticks = tick_structure_from(param_text(values, "ticks"))
-                       .value_or(TickStructure::TaperedDeciCent);
     params.mid_move_threshold_ticks = param_int(values, "pricing-mid-move-threshold");
     return params;
 }

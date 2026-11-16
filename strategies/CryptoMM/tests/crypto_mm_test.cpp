@@ -35,7 +35,6 @@ using cpm::oms::Position;
 using cpm::oms::Side;
 using cpm::strategy::Params;
 using cpm::strategy::QuoteManager;
-using cpm::strategy::TickStructure;
 using cpm::strategy::desired_quotes;
 using cpm::strategy::tick_at;
 
@@ -81,17 +80,14 @@ InstrumentView book_with(cpm::Price yes_bid, cpm::Price no_bid, cpm::Qty bid_qty
 // --- the tick grid --------------------------------------------------------
 
 TEST(CryptoMmTicks, TheTaperedGridIsFineAtTheEdgesAndCoarseInTheMiddle) {
-    // O5: 0.001 below 0.100 and above 0.900, 0.01 between.
-    EXPECT_EQ(tick_at(50, TickStructure::TaperedDeciCent), 1);
-    EXPECT_EQ(tick_at(99, TickStructure::TaperedDeciCent), 1);
-    EXPECT_EQ(tick_at(100, TickStructure::TaperedDeciCent), 10);
-    EXPECT_EQ(tick_at(500, TickStructure::TaperedDeciCent), 10);
-    EXPECT_EQ(tick_at(900, TickStructure::TaperedDeciCent), 10);
-    EXPECT_EQ(tick_at(901, TickStructure::TaperedDeciCent), 1);
-
-    EXPECT_EQ(tick_at(500, TickStructure::LinearCent), 10);
-    EXPECT_EQ(tick_at(50, TickStructure::LinearCent), 10);
-    EXPECT_EQ(tick_at(500, TickStructure::DeciCent), 1);
+    // O5: 0.001 below 0.100 and above 0.900, 0.01 between. It is the only
+    // grid this build prices on (cpm/md/ticks.hpp).
+    EXPECT_EQ(tick_at(50), 1);
+    EXPECT_EQ(tick_at(99), 1);
+    EXPECT_EQ(tick_at(100), 10);
+    EXPECT_EQ(tick_at(500), 10);
+    EXPECT_EQ(tick_at(900), 10);
+    EXPECT_EQ(tick_at(901), 1);
 }
 
 // --- the decision ---------------------------------------------------------
@@ -371,13 +367,12 @@ TEST(CryptoMmQuotes, QuotesOnlyAtPricesTheGridHas) {
     // run (OE-Q6) - so neither the rounding nor the step away from the touch
     // may land between them.
     const auto on_grid = [](cpm::Price price) {
-        return cpm::md::snap_down(price, cpm::md::TickStructure::TaperedCent) == price;
+        return cpm::md::snap_down(price) == price;
     };
 
     for (cpm::Price bid_price = 100; bid_price <= 980; bid_price += 7) {
         for (const int width : {1, 2, 5}) {
             auto p = params(width);
-            p.ticks = cpm::md::TickStructure::TaperedCent;
             // A book whose own prices are off our grid, which is exactly when
             // stepping a tick off the touch used to land between rungs.
             // book() takes the NO bid, so this is an ask 11 thousandths
@@ -393,10 +388,11 @@ TEST(CryptoMmQuotes, QuotesOnlyAtPricesTheGridHas) {
         }
     }
 
-    // And the case that reaches the taper: one price below 99% is 98%.
-    EXPECT_EQ(cpm::md::price_below(990, cpm::md::TickStructure::TaperedCent), 980);
-    EXPECT_EQ(cpm::md::price_above(990, cpm::md::TickStructure::TaperedCent), 991);
-    EXPECT_EQ(cpm::md::price_below(1000, cpm::md::TickStructure::TaperedCent), 999);
+    // And the case that reaches the taper: above 90% the step is a tenth of
+    // a point, so one price below 99% is 98.9%.
+    EXPECT_EQ(cpm::md::price_below(990), 989);
+    EXPECT_EQ(cpm::md::price_above(990), 991);
+    EXPECT_EQ(cpm::md::price_below(1000), 999);
 }
 
 // Inventory: stop adding to the side that would extend the position.

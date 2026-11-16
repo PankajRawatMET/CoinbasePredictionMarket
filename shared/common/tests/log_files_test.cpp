@@ -171,4 +171,31 @@ TEST(LogFilesTest, LeavesTheLogRingWithEverythingItHad) {
     EXPECT_NE(contents(files.narrative_path()).find("the feed went quiet"), std::string::npos);
 }
 
+
+// The console and the files are not the same audience. A strategy's running
+// commentary belongs in strategy.log and on the page, not in the terminal
+// an operator is watching for events - but a problem is never silenced,
+// whoever noticed it.
+TEST(LoggerStream, KeepsAChosenSourceOffTheStreamButNotOffTheSinks) {
+    std::ostringstream stream;
+    cpm::Logger logger(stream);
+    std::vector<std::string> sunk;
+    logger.also_to([&sunk](cpm::LogLevel, cpm::LogSource, std::string_view, std::string_view line) {
+        sunk.emplace_back(line);
+    });
+    logger.keep_off_stream(cpm::LogSource::Strategy);
+
+    logger.info("fair 0.5, z 0.0 -> 0.48 / 0.52", cpm::LogSource::Strategy);
+    logger.info("resolved BTCD15M");
+    logger.warn("could not reach the venue", cpm::LogSource::Strategy);
+
+    EXPECT_EQ(stream.str().find("fair 0.5"), std::string::npos) << stream.str();
+    EXPECT_NE(stream.str().find("resolved BTCD15M"), std::string::npos) << stream.str();
+    EXPECT_NE(stream.str().find("could not reach the venue"), std::string::npos)
+        << "a Warn is never silenced: " << stream.str();
+
+    ASSERT_EQ(sunk.size(), 3u) << "every line still reaches its file and the page";
+    EXPECT_EQ(sunk.front(), "fair 0.5, z 0.0 -> 0.48 / 0.52");
+}
+
 }  // namespace

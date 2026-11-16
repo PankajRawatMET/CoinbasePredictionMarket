@@ -11,13 +11,6 @@ namespace cpm::md {
 namespace {
 
 // The venue's PriceLevelStructure spelling, which is not ours.
-std::optional<TickStructure> structure_from_rest(const std::string& name) {
-    if (name == "TAPERED_DECI_CENT") return TickStructure::TaperedDeciCent;
-    if (name == "DECI_CENT") return TickStructure::DeciCent;
-    if (name == "LINEAR_CENT") return TickStructure::LinearCent;
-    return std::nullopt;
-}
-
 // Milliseconds since the epoch, as every timestamp in the catalog is written.
 std::optional<Clock::time_point> from_millis(const cpm::JsonValue* value) {
     if (value == nullptr || value->type != cpm::JsonValue::Type::Number) return std::nullopt;
@@ -166,7 +159,7 @@ InstrumentQuery open_instruments(const RestConfig& config, const std::string& se
         if (const auto* status = text_of(row, "status")) info.status = *status;
         if (const auto* owner = text_of(row, "series_ticker")) info.series_ticker = *owner;
         if (const auto* structure = text_of(row, "price_level_structure")) {
-            info.ticks = structure_from_rest(*structure);
+            info.price_level_structure = *structure;
         }
         if (const auto when = from_millis(row.find("expected_close_time"))) {
             info.expected_close = *when;

@@ -34,7 +34,6 @@ TEST(QuotingModel, UsesLogMoneynessTimeAndCorrectionInCompatibleUnits) {
     EXPECT_NEAR(*p, student_t4_cdf(std::log(1.1) / 0.2), 1e-14);
     EXPECT_GT(*quoting_probability(110000, 100000, 0.01, 25, 2), *p);
     EXPECT_LT(*quoting_probability(110000, 100000, 0.01, 100, 4), *p);
-    EXPECT_GT(*quoting_probability(110000, 100000, 0.01, 100, 2, TScale::UnitVariance), *p);
 }
 
 TEST(QuotingModel, RejectsUnusableInputsInsteadOfInventingFairValue) {

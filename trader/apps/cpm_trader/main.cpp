@@ -108,6 +108,9 @@ using cpm::trader::Snapshot;
 struct Args {
     bool allow_orders = false;
     bool verbose = false;
+    // A strategy's commentary on its own quoting goes to strategy.log and to
+    // the page, and stays off the console unless it is asked for.
+    bool console_strategy = false;
     int duration_secs = 0;  // 0 = until stopped
     std::string dict_dir = CPM_DEFAULT_DICT_DIR;
     std::string bookmark = "cpm-trader-bookmark.txt";
@@ -126,7 +129,6 @@ struct Args {
     int book_depth = 10;
     // The price grid the ladder is drawn on, and what a quote may be priced
     // at. Not on the FIX feed, so it is configured (O5).
-    std::string ticks = "tapered";
     // The GUI. Loopback only, always: --port moves it, nothing widens it
     // (GUI-Q3). 0 asks the kernel for a free one.
     int port = 8080;
@@ -157,8 +159,7 @@ void usage() {
                  "                  [--max-order-qty Q] [--max-orders-per-sec N]\n"
                  "                  [--max-notional A] [--stale-after SECS]\n"
                  "                  [--port PORT] [--book-depth 1|10]\n"
-                 "                  [--tick-structure tapered|tapered-cent|cent|deci]\n"
-                 "                  [--duration SECS] [--verbose]\n"
+                 "                  [--duration SECS] [--verbose] [--console-strategy]\n"
                  "                  [--binance-on] [--binance SYMBOL]... [--binance-url URL]\n"
                  "                  [--binance-config PATH] [--binance-stale-after MS]\n"
                  "                  [--watch SERIES]... (default: the series in binance.conf)\n"
@@ -200,6 +201,7 @@ Args parse_args(int argc, char** argv) {
         else if (flag == "--binance-url") a.binance_url = value();
         else if (flag == "--binance-stale-after") { a.binance_stale_ms = to_int(flag, value()); a.binance_stale_set = true; }
         else if (flag == "--verbose") a.verbose = true;
+        else if (flag == "--console-strategy") a.console_strategy = true;
         else if (flag == "--duration") a.duration_secs = to_int(flag, value());
         else if (flag == "--bookmark") a.bookmark = value();
         else if (flag == "--log-dir") a.log_dir = value();
@@ -208,7 +210,6 @@ Args parse_args(int argc, char** argv) {
         else if (flag == "--stale-after") a.stale_after_secs = to_int(flag, value());
         else if (flag == "--port") a.port = to_int(flag, value());
         else if (flag == "--book-depth") a.book_depth = to_int(flag, value());
-        else if (flag == "--tick-structure") a.ticks = value();
         else if (flag == "--max-orders-per-sec") a.max_orders_per_sec = to_int(flag, value());
         else if (flag == "--max-order-qty") a.max_order_qty = to_decimal(flag, value(), cpm::kQtyScale);
         else if (flag == "--max-notional") a.max_notional = to_decimal(flag, value(), cpm::kAmtScale);
@@ -481,6 +482,12 @@ int main(int argc, char** argv) {
     pthread_sigmask(SIG_BLOCK, &signals, nullptr);
 
     cpm::Logger logger(std::cout, args.verbose ? cpm::LogLevel::Debug : cpm::LogLevel::Info);
+    // Two strategies quoting put out some thirty lines a second, and every
+    // one of them is a model's working rather than an event an operator has
+    // to act on. They go to strategy.log and to the page's own panel; the
+    // console keeps the daemon's narrative, and any Warn or Error whatever
+    // wrote it. --console-strategy puts them back.
+    if (!args.console_strategy) logger.keep_off_stream(cpm::LogSource::Strategy);
 
     // The log on disk, before anything else is done: a run whose first line
     // is a configuration failure is exactly the run whose log is wanted
@@ -636,14 +643,14 @@ int main(int argc, char** argv) {
                 logger.info("  " + instrument + " -> " + mapping.symbol + ", tick " +
                             cpm::format_scaled(mapping.tick_size, cpm::binance::kScale));
             }
+            // Said out loud because it is the one place this daemon asks the
+            // reference venue a question over HTTP rather than listening to
+            // it: one public GET per quoted window, no credential.
+            logger.info("reference history https://" + reference.rest.host + ":" +
+                        std::to_string(reference.rest.port) +
+                        "/fapi/v1/klines, read once per quoted window");
         }
 
-        if (const auto structure = cpm::md::tick_structure_from(args.ticks); structure) {
-            options.ticks = *structure;
-        } else {
-            logger.error("--tick-structure must be tapered, tapered-cent, cent or deci");
-            return 64;
-        }
         options.limits.max_quantity = args.max_order_qty;
         options.limits.max_orders_per_sec = args.max_orders_per_sec;
         // A per-order cap, not an exposure limit: the worst a single order of
@@ -661,7 +668,16 @@ int main(int argc, char** argv) {
 
         cpm::strategy::StrategyRegistry registry;
         cpm::strategy::register_crypto_mm(registry);
-        cpm::strategy::register_quoting_mm(registry);
+        // QuotingMM reads its sigma and its opening price from the venue's
+        // kline history once per window, so it is built against the same
+        // mapping the reference feed uses and the REST endpoint beside it.
+        cpm::strategy::QuotingMmVenue quoting_venue;
+        quoting_venue.symbols = reference.symbols;
+        quoting_venue.host = reference.rest.host;
+        quoting_venue.port = reference.rest.port;
+        // The same trust settings as the stream: one venue, one CA bundle.
+        quoting_venue.ca_file = options.reference.ca_file;
+        cpm::strategy::register_quoting_mm(registry, std::move(quoting_venue));
 
         cpm::trader::Trader trader(std::move(options), registry, logger);
         if (const auto error = trader.start(); !error.empty()) {

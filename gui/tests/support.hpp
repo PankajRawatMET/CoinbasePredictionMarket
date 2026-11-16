@@ -112,8 +112,8 @@ struct Daemon {
         env.axis = [](const std::string& symbol) {
             cpm::trader::AxisView axis;
             axis.symbol = symbol;
-            axis.structure = cpm::md::to_string(cpm::md::TickStructure::TaperedDeciCent);
-            axis.prices = cpm::md::price_grid(cpm::md::TickStructure::TaperedDeciCent);
+            axis.structure = cpm::md::kPriceLevelStructure;
+            axis.prices = cpm::md::price_grid();
             return axis;
         };
         env.subscribe = [](const std::string&) { return std::string(); };

@@ -21,12 +21,27 @@ struct Mapping {
     Price tick_size = 0;  // 0.1, scaled; what PricingMidMoveThreshold counts
 };
 
+// Where the venue's REST endpoint is. One GET, public market data, no
+// credential: the kline history QuotingMM's volatility and opening price are
+// read from when a window's strategy is built (B-Q17's "no REST" reversed,
+// the way [MD] Q13's was for the instrument catalog).
+struct RestEndpoint {
+    std::string host = "fapi.binance.com";
+    int port = 443;
+};
+
 struct Config {
     ReferenceFeed::Options feed;
+    RestEndpoint rest;
     // Keyed by the CPM asset or series - BTCD15M, or BTC - whichever the
     // operator wrote. Both are looked for in a ticker (B-Q7).
     std::map<std::string, Mapping> symbols;
 };
+
+// https://fapi.binance.com -> host, port. https:// only, and no path: the
+// endpoint paths are the venue's own (/fapi/v1/klines) and are not an
+// operator's to spell. Returns an empty string on success, or what is wrong.
+std::string parse_rest_url(std::string_view url, RestEndpoint& into);
 
 // wss://fstream.binance.com/ws -> host, port, tls, path. ws:// and wss://
 // only; the port defaults to 443 for wss and 80 for ws. Returns an empty

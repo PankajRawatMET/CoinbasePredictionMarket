@@ -1,5 +1,7 @@
 #include "cpm/common/logging.hpp"
 
+#include <algorithm>
+
 #include <chrono>
 #include <cstdio>
 #include <ctime>
@@ -38,12 +40,26 @@ void Logger::also_to(Sink sink) {
     sinks_.push_back(std::move(sink));
 }
 
+void Logger::keep_off_stream(LogSource source) {
+    std::lock_guard lock(mutex_);
+    if (std::find(quiet_.begin(), quiet_.end(), source) == quiet_.end()) quiet_.push_back(source);
+}
+
+bool Logger::on_stream(LogLevel level, LogSource source) const {
+    if (level >= LogLevel::Warn) return true;  // a problem is never silenced
+    return std::find(quiet_.begin(), quiet_.end(), source) == quiet_.end();
+}
+
 void Logger::log(LogLevel level, std::string_view message, LogSource source) {
     if (level < min_level_) return;
     const std::string stamp = utc_stamp();
     std::lock_guard lock(mutex_);
-    out_ << stamp << ' ' << to_string(level) << ' ' << message << '\n';
-    out_.flush();
+    // The sinks still get it, whatever the stream does: a line kept off the
+    // console is still in its file and still on the page's panel.
+    if (on_stream(level, source)) {
+        out_ << stamp << ' ' << to_string(level) << ' ' << message << '\n';
+        out_.flush();
+    }
     for (const auto& sink : sinks_) sink(level, source, stamp, message);
 }
 
