@@ -150,7 +150,8 @@
   .field input[aria-invalid="true"], .field select[aria-invalid="true"] { border-color: var(--bad); }
   /* A box that cannot be typed in says so rather than waiting to be clicked:
      the kind and the symbol on every live row, and every parameter of a
-     strategy that is armed (GUI-Q30). */
+     strategy that is quoting - stopped, and they are editable again
+     (GUI-Q30). */
   .field input:disabled {
     color: var(--dim); background: #0b0e12; border-color: #1a1f27; cursor: not-allowed;
   }
@@ -672,6 +673,20 @@
 
   function dirty(strategy) { return Object.keys(changedParams(strategy)).length > 0; }
 
+  // What the row's boxes say right now: the strategy's own values with
+  // anything retyped over the top. Start confirms these and sends these,
+  // because a dialog that showed the old width while the box in front of
+  // the operator showed the new one would be the quiet kind of wrong.
+  function effectiveParams(strategy) {
+    var out = {};
+    Object.keys(strategy.params).forEach(function (name) {
+      out[name] = strategy.params[name];
+    });
+    var changed = changedParams(strategy);
+    Object.keys(changed).forEach(function (name) { out[name] = changed[name]; });
+    return out;
+  }
+
   // Three buttons, the same three a blank row has (GUI-Q26). Arm is still
   // not one of them: Start arms. Stop stops the quoting and leaves the row
   // where it is with its parameters, and the x is what throws it away.
@@ -692,9 +707,13 @@
 
     var start = actionButton('Start', '', stopped && !halted, function () {
       startQuoting(strategy.kind, strategy.series || strategy.symbols.join(', '),
-                   strategy.params, strategy, null);
+                   effectiveParams(strategy), strategy, null);
     });
-    if (!stopped) start.title = strategy.id + ' is already running.';
+    start.title = !stopped
+      ? strategy.id + ' is already running.'
+      : (dirty(strategy)
+          ? 'Applies what was retyped on this row, then quotes with it.'
+          : 'Quotes ' + strategy.id + ' with the values in this row.');
     box.appendChild(start);
 
     // Stop means the quotes come off. The book stays: it belongs to the
@@ -712,6 +731,9 @@
     // Only on a row with nothing live behind it. The daemon refuses it
     // otherwise, and drops the row's own feed with it if it had one.
     var drop = actionButton('\u00d7', 'drop', stopped, function () {
+      // The row is going: whatever was retyped into it goes with it, rather
+      // than waiting under a dead id for another strategy to be given it.
+      delete edits[strategy.id];
       act('POST', base + 'destroy');
     });
     drop.title = stopped
@@ -734,11 +756,12 @@
     var specs = kind && kind.name === strategy.kind ? kind.params : [];
     var byName = {};
     specs.forEach(function (spec) { byName[spec.name] = spec; });
-    // Read-only. With no Apply button there is nothing to send an edit with,
-    // and a box that accepts typing it can never act on is worse than one
-    // that does not. Retuning is `set ID name=value` on the daemon's stdin,
-    // or Stop and start a fresh row.
-    var open = false;
+    // Open on a row that is not quoting, locked on one that is (GUI-Q30,
+    // reopened 2026-11-17 on the operator's ask). There is no Apply button:
+    // what is retyped here is sent by Start, which applies it, confirms the
+    // values it is about to quote and then arms - so a box is only editable
+    // in the one state where Start is the next thing that can happen to it.
+    var open = editable(strategy);
 
     function cell(value, classes, help, spec) {
       var holder = el('div', 'field ' + classes);
@@ -755,7 +778,13 @@
           edits[strategy.id][spec.name] = input.value.trim();
         });
       }
-      if (help) input.title = help;
+      // A box that cannot be typed in says why, not just that it cannot:
+      // "stopped and it is yours again" is the whole of the rule.
+      var locked = spec && !open
+        ? 'Locked while ' + strategy.id + ' is running. Stop it to change this.'
+        : '';
+      var title = [help, locked].filter(Boolean).join(' - ');
+      if (title) input.title = title;
       holder.appendChild(input);
       box.appendChild(holder);
     }
@@ -1403,7 +1432,22 @@
     };
     var go = function () {
       if (existing) {
-        run(existing.id);
+        // Anything retyped on a stopped row goes in first (GUI-Q30): the
+        // daemon rebuilds the instance from the new values, and only a
+        // clean apply gets as far as starting. A refusal has already been
+        // flashed by act(), and the text stays in the boxes to be corrected
+        // rather than being thrown away with the attempt.
+        var changed = changedParams(existing);
+        if (!Object.keys(changed).length) {
+          run(existing.id);
+          return;
+        }
+        act('POST', base(existing.id) + 'params', { params: changed })
+          .then(function (result) {
+            if (!result || !result.ok) return;
+            delete edits[existing.id];
+            run(existing.id);
+          });
         return;
       }
       createFromDraft(draft).then(function (result) {

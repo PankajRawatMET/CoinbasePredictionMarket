@@ -357,13 +357,18 @@ TEST(Page, GivesEveryRowTheSameButtons) {
     EXPECT_TRUE(contains(page, "Add row"));
 }
 
-TEST(Page, LocksTheParametersOnALiveRow) {
+TEST(Page, OpensTheParametersOnAStoppedRow) {
     const auto page = the_page();
-    // GUI-Q30, as it now stands: with Apply gone there is nothing on the page
-    // to send an edit with, so a live row's boxes are read-only rather than
-    // accepting text they can never act on. The daemon still refuses an edit
-    // to an armed strategy whatever any client believes.
-    EXPECT_TRUE(contains(page, "var open = false;"));
+    // GUI-Q30, as it now stands (2026-11-17): a row's boxes are open in every
+    // state short of quoting and locked once it is armed, which is the line
+    // the daemon draws too. The lock is computed, never hard-coded off.
+    EXPECT_TRUE(contains(page, "var open = editable(strategy);"));
+    EXPECT_FALSE(contains(page, "var open = false;"));
+    EXPECT_TRUE(contains(page, "return !strategy.armed && strategy.state !== 'stopping'"));
+    // There is no Apply button: Start is what sends an edit, and it sends it
+    // before it starts and arms, so what was confirmed is what is quoted.
+    EXPECT_TRUE(contains(page, "base(existing.id) + 'params'"));
+    EXPECT_TRUE(contains(page, "effectiveParams(strategy)"));
     // What is typed outlives a redraw, and a redraw does not take the caret
     // out of a box being typed into.
     EXPECT_TRUE(contains(page, "var edits = {}"));
