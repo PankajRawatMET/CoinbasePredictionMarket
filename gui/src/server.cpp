@@ -421,7 +421,7 @@ bool Server::authorised(const HttpRequest& request) const {
         }
     }
     // EventSource cannot set a header, so the stream and the page load carry
-    // the token in the query instead. The page strips it from the address bar.
+    // the token in the query instead. The page keeps it there for reloads.
     if (const auto value = request.query_param("t"); value) {
         return secret_equal(*value, token_);
     }

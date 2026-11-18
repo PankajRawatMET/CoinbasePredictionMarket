@@ -361,19 +361,8 @@
 (function () {
   'use strict';
 
-  // ---- the token ---------------------------------------------------------
-  // It arrives in the query on the first load. Keep it for this tab, then
-  // strip it from the address bar so it is not left in history or carried off
-  // in a copied URL (GUI-Q3).
-  var token = (function () {
-    var fromUrl = new URLSearchParams(window.location.search).get('t');
-    if (fromUrl) {
-      try { window.sessionStorage.setItem('cpm-token', fromUrl); } catch (e) { /* private mode */ }
-      window.history.replaceState(null, '', window.location.pathname + window.location.hash);
-      return fromUrl;
-    }
-    try { return window.sessionStorage.getItem('cpm-token') || ''; } catch (e) { return ''; }
-  })();
+  // Reloads need the run token in the query. View navigation only changes the hash.
+  var token = new URLSearchParams(window.location.search).get('t');
 
   var snapshot = null;
   var kinds = [];

@@ -202,9 +202,8 @@ TEST(Page, IsOnePagePerThingTheOperatorIsDoing) {
         EXPECT_TRUE(contains(page, "data-view=\"" + view + "\"")) << view << " has no section";
         EXPECT_TRUE(contains(page, "name: '" + view + "'")) << view << " is not in the nav";
     }
-    // The view is in the address, so it survives a reload and can be sent to
-    // someone - and stripping the token must not take it away with it.
-    EXPECT_TRUE(contains(page, "window.location.pathname + window.location.hash"));
+    // Change only the hash so reloads preserve both the view and the run token.
+    EXPECT_TRUE(contains(page, "window.location.hash = entry.name"));
     EXPECT_TRUE(contains(page, "hashchange"));
     // Whatever page is open, the daemon's state, the halt banner and the kill
     // switch are above the nav and on all of them.
@@ -443,12 +442,12 @@ TEST(Page, SaysWhenItHasStoppedHearingFromTheDaemon) {
     EXPECT_TRUE(contains(page, "pill('pill-state', 'last known'"));
 }
 
-TEST(Page, KeepsTheTokenOutOfTheAddressBar) {
+TEST(Page, KeepsTheRunTokenInTheQueryForReloads) {
     const auto page = the_page();
-    EXPECT_TRUE(contains(page, "history.replaceState"));
-    EXPECT_TRUE(contains(page, "sessionStorage"));
-    // The stream cannot send a header, so it is the one place the token stays
-    // in a URL (GUI-Q3).
+    EXPECT_TRUE(contains(page, "new URLSearchParams(window.location.search).get('t')"));
+    EXPECT_FALSE(contains(page, "history.replaceState"));
+    EXPECT_FALSE(contains(page, "sessionStorage"));
+    // EventSource cannot send an Authorization header.
     EXPECT_TRUE(contains(page, "/api/events?t="));
     EXPECT_TRUE(contains(page, "'Authorization': 'Bearer '"));
 }
