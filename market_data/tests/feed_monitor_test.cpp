@@ -24,9 +24,10 @@ const std::string kSym = "BTCD15M-BTC26OCT260615-0";
 
 // A monitor on a clock the test moves by hand.
 struct Rig {
-    Rig() {
+    explicit Rig(bool halt_on_stale = true) {
         monitor = std::make_unique<FeedMonitor>(
-            FeedMonitor::Options{30s, 250ms}, [this](const FeedHalt& h) { halts.push_back(h); },
+            FeedMonitor::Options{30s, 250ms, halt_on_stale},
+            [this](const FeedHalt& h) { halts.push_back(h); },
             [this] { return now; });
         session = monitor->session_callback();
         feed = monitor->callbacks();
@@ -89,6 +90,27 @@ TEST(FeedMonitorTest, EachUpdateResetsTheClock) {
     rig.advance(31s);
     rig.monitor->tick(rig.now);
     EXPECT_TRUE(rig.monitor->halted());
+}
+
+TEST(FeedMonitorTest, BookStalenessCanRecoverWithoutMaskingSessionFailure) {
+    Rig rig(false);
+    rig.subscribe_book();
+    rig.advance(30s);
+    rig.monitor->tick(rig.now);
+    EXPECT_EQ(rig.monitor->stale_book(kSym, rig.now), 30s);
+    EXPECT_FALSE(rig.monitor->stale_book("another-symbol", rig.now));
+    EXPECT_FALSE(rig.monitor->halted());
+
+    rig.book_update("unrelated-book");
+    EXPECT_EQ(rig.monitor->stale_book(kSym, rig.now), 30s);
+    rig.book_update();
+    EXPECT_FALSE(rig.monitor->stale_book(kSym, rig.now));
+
+    rig.advance(31s);
+    EXPECT_EQ(rig.monitor->stale_book(kSym, rig.now), 31s);
+    rig.session({SessionEvent::Kind::LoggedOut, "HEARTBEAT_TIMEOUT"});
+    ASSERT_EQ(rig.halts.size(), 1u);
+    EXPECT_EQ(rig.halts.front().reason, Reason::Disconnect);
 }
 
 TEST(FeedMonitorTest, ModelMakerCanUseAQuietBookButDisconnectStillHalts) {

@@ -43,11 +43,8 @@ struct TraderOptions {
     // it has gone. A strategy may still be created on anything else; that
     // subscription is opened on demand as it always was.
     //
-    // Watched-but-unquoted books are deliberately NOT given to FeedMonitor:
-    // staleness is fail-stop for the whole daemon, and a quiet market
-    // nobody is trading must not stop one that is being traded. The
-    // subscription is handed to the monitor when a strategy starts on it
-    // and taken back when the strategy lets it go.
+    // Watched books retain their freshness history when a strategy starts
+    // or stops using them.
     std::vector<std::string> watch;
     // This run's directory inside the day's, shared with the log files so a
     // run's whole account - narrative, strategy chatter, wire and records -
@@ -144,10 +141,6 @@ private:
     void request_halt(std::string reason);
     void apply_halt(Clock::time_point now);
     std::string subscribe(const std::string& symbol);
-    // `monitored` is whether FeedMonitor watches it: true for a strategy's
-    // book, false for one this daemon only watches. Subscribing a symbol
-    // that is already open upgrades it rather than opening it twice.
-    std::string subscribe(const std::string& symbol, bool monitored);
     // Keeps each watched series on the window that is open now. Called from
     // tick(), on the tick thread, like roll_series().
     void follow_watch_list(Clock::time_point now);
@@ -247,7 +240,6 @@ private:
     // symbol -> the MDReqIDs opened for it (book, then lifecycle).
     struct Subscription {
         std::vector<std::string> ids;
-        bool monitored = false;  // handed to FeedMonitor, so it can halt the run
     };
     std::map<std::string, Subscription> subscriptions_;
     // series -> the window of it this daemon is watching, for options_.watch.

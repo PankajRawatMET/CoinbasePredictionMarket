@@ -95,6 +95,12 @@ Trader::Trader(TraderOptions options, const cpm::strategy::StrategyRegistry& reg
                 feeds.reference = [this](const std::string& symbol) {
                     return reference_for(symbol);
                 };
+                feeds.stale_book_reason = [this](const std::string& symbol, Clock::time_point now) {
+                    const auto age = feed_->stale_book(symbol, now);
+                    if (!age) return std::string{};
+                    return "stale feed on " + symbol + " - no book update for " +
+                           std::to_string(age->count()) + "s";
+                };
                 return feeds;
             }(),
             logger) {
@@ -106,9 +112,9 @@ Trader::Trader(TraderOptions options, const cpm::strategy::StrategyRegistry& reg
 
     cpm::md::FeedMonitor::Options feed_options;
     feed_options.stale_after = options_.stale_after;
-    // Amendment 4: a gap, a stale book, a reject or a disconnect ends the run.
-    // crypto_mm never wired this up at all (GUI-N1), so this is the first
-    // binary in which market data is actually fail-stop.
+    // The host stops strategies on stale books. Feed integrity failures and
+    // disconnects still take the daemon-wide halt path.
+    feed_options.halt_on_stale = false;
     feed_ = std::make_unique<cpm::md::FeedMonitor>(
         feed_options, [this](const cpm::md::FeedHalt& halt) {
             request_halt(std::string("market data: ") + to_string(halt.reason) +
@@ -418,27 +424,9 @@ BookView Trader::view_of(const std::string& symbol) const {
     return view;
 }
 
-std::string Trader::subscribe(const std::string& symbol) { return subscribe(symbol, true); }
-
-std::string Trader::subscribe(const std::string& symbol, bool monitored) {
+std::string Trader::subscribe(const std::string& symbol) {
     std::lock_guard<std::mutex> lock(mutex_);
-    const auto channels = [this](const std::string& name) {
-        return std::pair<cpm::md::ChannelRequest, cpm::md::ChannelRequest>{
-            {cpm::md::Channel::Book, {name}, options_.book_depth},
-            {cpm::md::Channel::Lifecycle, {name}, 0}};
-    };
-    if (const auto open = subscriptions_.find(symbol); open != subscriptions_.end()) {
-        // Already open. A strategy arriving on a book this daemon was only
-        // watching upgrades it: from here on a dead feed on this instrument
-        // stops the run, because something is trading it.
-        if (monitored && !open->second.monitored && feed_ && open->second.ids.size() == 2) {
-            const auto [book, lifecycle] = channels(symbol);
-            feed_->track(open->second.ids[0], book);
-            feed_->track(open->second.ids[1], lifecycle);
-            open->second.monitored = true;
-        }
-        return {};
-    }
+    if (subscriptions_.contains(symbol)) return {};
     if (!md_.logged_on()) {
         return "the market data session is not logged on, so " + symbol +
                " would never get a book";
@@ -446,12 +434,12 @@ std::string Trader::subscribe(const std::string& symbol, bool monitored) {
     std::vector<std::string> ids;
     try {
         // The book, and the lifecycle so a closed window withdraws the quotes.
-        const auto [book, lifecycle] = channels(symbol);
+        const cpm::md::ChannelRequest book{cpm::md::Channel::Book, {symbol}, options_.book_depth};
+        const cpm::md::ChannelRequest lifecycle{cpm::md::Channel::Lifecycle, {symbol}, 0};
         ids.push_back(md_.subscribe(book));
-        if (feed_ && monitored) feed_->track(ids.back(), book);
+        feed_->track(ids.back(), book);
 
         ids.push_back(md_.subscribe(lifecycle));
-        if (feed_ && monitored) feed_->track(ids.back(), lifecycle);
     } catch (const std::exception& e) {
         for (const auto& id : ids) {
             if (feed_) feed_->forget(id);
@@ -459,7 +447,7 @@ std::string Trader::subscribe(const std::string& symbol, bool monitored) {
         }
         return std::string("could not subscribe to ") + symbol + ": " + e.what();
     }
-    subscriptions_[symbol] = Subscription{std::move(ids), monitored};
+    subscriptions_[symbol] = Subscription{std::move(ids)};
 
     return {};
 }
@@ -470,20 +458,10 @@ void Trader::unsubscribe(const std::string& symbol) {
     if (it == subscriptions_.end()) return;
     // A watched symbol keeps its book: the daemon holds this subscription for
     // its own sake, and dropping it because a strategy let go would put the
-    // page and every position's price back at the mercy of a row. It only
-    // leaves the monitor, so a quiet market nobody trades cannot halt a
-    // daemon that is trading something else.
+    // page and every position's price back at the mercy of a row.
     const bool watched = std::any_of(watching_.begin(), watching_.end(),
                                      [&](const auto& entry) { return entry.second == symbol; });
-    if (watched) {
-        if (it->second.monitored) {
-            for (const auto& id : it->second.ids) {
-                if (feed_) feed_->forget(id);
-            }
-            it->second.monitored = false;
-        }
-        return;
-    }
+    if (watched) return;
     for (const auto& id : it->second.ids) {
         if (feed_) feed_->forget(id);
         md_.unsubscribe(id);
@@ -700,7 +678,7 @@ std::string Trader::start(std::chrono::milliseconds timeout) {
             }
             symbol = found.symbol;
         }
-        if (const auto error = subscribe(symbol, false); !error.empty()) {
+        if (const auto error = subscribe(symbol); !error.empty()) {
             logger_.warn("not watching " + wanted + ": " + error);
             continue;
         }
@@ -742,15 +720,6 @@ void Trader::apply_halt(Clock::time_point now) {
 
 void Trader::tick(Clock::time_point now) {
     apply_halt(now);
-    std::vector<std::string> quiet_books;
-    for (const auto& strategy : host_.list()) {
-        // Quietness is a property of this subscribed instrument's consumer,
-        // including while it warms, is disarmed, or has been stopped.
-        if (strategy.feed && !strategy.requires_book_updates) {
-            quiet_books.insert(quiet_books.end(), strategy.symbols.begin(), strategy.symbols.end());
-        }
-    }
-    feed_->allow_quiet_books(std::move(quiet_books));
     follow_reference_demand();
     host_.tick(now);
 
@@ -857,8 +826,8 @@ void Trader::follow_watch_list(Clock::time_point now) {
         if (previous == window->symbol) continue;
 
         // The new window before the old one goes, so there is no instant
-        // with nothing watched, and never monitored: nothing is quoting it.
-        if (const auto error = subscribe(window->symbol, false); !error.empty()) {
+        // with nothing watched.
+        if (const auto error = subscribe(window->symbol); !error.empty()) {
             logger_.warn("could not watch " + window->symbol + ": " + error);
             continue;
         }

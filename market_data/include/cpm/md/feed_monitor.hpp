@@ -15,10 +15,8 @@
 
 namespace cpm::md {
 
-// Why the feed stopped being trustworthy. One of these ends the run: there is
-// no automatic recovery, because the strategy stops on any of them and
-// stopping the strategy stops the feed (project instructions amendment 4,
-// docs/open-questions.txt Q24/Q25/Q27/Q28).
+// Why the feed stopped being trustworthy. A silent book can be handled
+// separately from terminal session and feed-integrity failures.
 struct FeedHalt {
     enum class Reason {
         Gap,         // a MsgSeqNum gap: market data was lost
@@ -52,6 +50,8 @@ public:
         std::chrono::milliseconds stale_after{std::chrono::seconds(30)};
         // How often the driver thread re-checks.
         std::chrono::milliseconds poll{250};
+        // Owners with independent strategies can handle stale books locally.
+        bool halt_on_stale = true;
     };
 
     using HaltHandler = std::function<void(const FeedHalt&)>;
@@ -86,6 +86,10 @@ public:
 
     // One check, for tests and for the driver thread.
     void tick(Clock::time_point now);
+
+    // Age of a silent single-instrument book, when it has timed out.
+    std::optional<std::chrono::seconds> stale_book(const std::string& symbol,
+                                                   Clock::time_point now) const;
 
     bool halted() const;
     std::optional<FeedHalt> halt() const;

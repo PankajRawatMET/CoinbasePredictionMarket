@@ -87,6 +87,7 @@ public:
         // reads as "off" rather than as "unsafe" - a daemon with no Binance
         // feed configured is the daemon as it was before B3.
         std::function<cpm::binance::ReferenceView(const std::string& symbol)> reference;
+        std::function<std::string(const std::string& symbol, Clock::time_point now)> stale_book_reason{};
     };
 
     // `venue` is the owner's end of the hooks: send, cancel, next id, log. The
@@ -171,6 +172,7 @@ private:
         RunState state = RunState::Stopped;
         std::atomic<bool> armed{false};
         std::string note;
+        bool stopped_for_stale_book = false;
         // The owner's answer about the subscription, set through set_feed().
         bool feed = true;
         // A stop the strategy asked for during its pass, acted on the moment
@@ -194,6 +196,7 @@ private:
     // folds in this strategy's arming and the host-wide halt.
     StrategyHooks hooks_for(Entry& entry) const;
     void drive(Entry& entry, Clock::time_point now);
+    std::string stale_book_reason(const Entry& entry, Clock::time_point now) const;
     // Fills a StrategyInfo from an entry. Caller holds the lock.
     StrategyInfo describe(const Entry& entry) const;
     // Withdraws and moves to Stopping. Caller holds the lock.

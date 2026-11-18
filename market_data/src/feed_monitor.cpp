@@ -42,15 +42,9 @@ MdCallbacks FeedMonitor::callbacks() {
     const auto now = [this] { return clock_(); };
     callbacks.book_snapshot = [this, now](const BookSnapshot& e) { stamp(e.md_req_id, now()); };
     callbacks.book_update = [this, now](const BookUpdate& e) { stamp(e.md_req_id, now()); };
-    callbacks.trade = [this, now](const Trade& e) { stamp(e.md_req_id, now()); };
-    callbacks.volume = [this, now](const Volume& e) { stamp(e.md_req_id, now()); };
-    callbacks.open_interest = [this, now](const OpenInterest& e) { stamp(e.md_req_id, now()); };
-    callbacks.lifecycle = [this, now](const InstrumentLifecycle& e) {
-        {
-            std::lock_guard lock(mutex_);
-            statuses_[e.symbol] = e.status;
-        }
-        stamp(e.md_req_id, now());
+    callbacks.lifecycle = [this](const InstrumentLifecycle& e) {
+        std::lock_guard lock(mutex_);
+        statuses_[e.symbol] = e.status;
     };
     // Q27: any reject halts, whatever its code.
     callbacks.reject = [this, now](const MdReject& e) {
@@ -137,6 +131,7 @@ void FeedMonitor::run() {
 }
 
 void FeedMonitor::tick(Clock::time_point now) {
+    if (!options_.halt_on_stale) return;
     std::string stale_id;
     std::string stale_symbol;
     std::string detail;
@@ -161,6 +156,21 @@ void FeedMonitor::tick(Clock::time_point now) {
         }
     }
     if (!stale_id.empty()) raise(FeedHalt::Reason::StaleFeed, stale_id, stale_symbol, detail, now);
+}
+
+std::optional<std::chrono::seconds> FeedMonitor::stale_book(const std::string& symbol,
+                                                           Clock::time_point now) const {
+    std::lock_guard lock(mutex_);
+    if (halt_ || !logged_on_) return std::nullopt;
+    for (const auto& [id, subscription] : subscriptions_) {
+        if (subscription.channel != Channel::Book || subscription.symbols.size() != 1 ||
+            subscription.symbols.front() != symbol || all_instruments_finished(subscription)) continue;
+        const auto silence = now - subscription.last_message;
+        if (silence >= options_.stale_after) {
+            return std::chrono::duration_cast<std::chrono::seconds>(silence);
+        }
+    }
+    return std::nullopt;
 }
 
 bool FeedMonitor::all_instruments_finished(const Subscription& subscription) const {

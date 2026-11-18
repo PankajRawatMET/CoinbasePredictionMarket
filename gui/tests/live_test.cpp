@@ -496,7 +496,7 @@ TEST(Live, TheStreamFollowsTheMarketAndNotJustTheOperator) {
     EXPECT_TRUE(legs_changed) << "the stream never carried a re-quote";
 }
 
-TEST(Live, AStaleFeedHaltsAndThePageStaysUpToSayWhy) {
+TEST(Live, AStaleBookStopsTheStrategyAndTheDeskShowsWhy) {
     Live live(true, 2s, 4);  // the simulator goes quiet after 4 s
     ASSERT_EQ(live.start(), "") << live.logs();
     const auto id = id_of(live.request("POST", "/api/strategies", kCreate));
@@ -506,40 +506,26 @@ TEST(Live, AStaleFeedHaltsAndThePageStaysUpToSayWhy) {
 
     ASSERT_TRUE(live.eventually(
         [](const cpm::gui::JsonValue& snapshot) {
-            return snapshot.find("state")->text == "halted";
+            const auto* strategy = first_strategy(snapshot);
+            return strategy && strategy->find("state")->text == "stopped";
         },
         25s)) << live.logs();
 
-    // The whole point of GUI-Q4: the process is still here, and it can still
-    // be asked what happened.
     const auto snapshot = live.snapshot();
-    EXPECT_FALSE(snapshot.find("halt_reason")->text.empty());
-    EXPECT_NE(snapshot.find("halt_reason")->text.find("stale"), std::string::npos)
-        << snapshot.find("halt_reason")->text;
-
-    // A halt is two phases, and the page sees both: every strategy withdraws
-    // first, and the sessions go down only once those cancels are accounted
-    // for. The reason is readable throughout, which is the point.
-    EXPECT_TRUE(live.eventually(
-        [](const cpm::gui::JsonValue& state) {
-            return !state.find("market_data")->find("logged_on")->boolean &&
-                   !state.find("order_entry")->find("logged_on")->boolean;
-        },
-        15s)) << live.logs();
+    EXPECT_EQ(snapshot.find("state")->text, "live");
+    EXPECT_TRUE(snapshot.find("halt_reason")->text.empty());
+    EXPECT_TRUE(snapshot.find("market_data")->find("logged_on")->boolean);
+    EXPECT_TRUE(snapshot.find("order_entry")->find("logged_on")->boolean);
 
     const auto* strategy = first_strategy(snapshot);
     ASSERT_NE(strategy, nullptr);
-    EXPECT_EQ(strategy->find("state")->text, "halted");
     EXPECT_FALSE(strategy->find("armed")->boolean);
+    EXPECT_NE(strategy->find("note")->text.find("stale feed on "), std::string::npos);
 
-    // And nothing can be started again, in this process, ever.
-    const auto again = live.request("POST", "/api/strategies/" + id + "/arm");
+    const auto again = live.request("POST", "/api/strategies/" + id + "/start");
     EXPECT_EQ(status_of(again), 409);
-    EXPECT_NE(body_of(again).find("halted"), std::string::npos) << body_of(again);
-    EXPECT_EQ(status_of(live.request("POST", "/api/strategies", kCreate)), 409);
+    EXPECT_NE(body_of(again).find("stale feed on "), std::string::npos) << body_of(again);
 
-    // The page itself is still served: a halt at 02:00 must leave something to
-    // read, not an exit code on a closed window.
     EXPECT_EQ(status_of(live.request("GET", "/")), 200);
 }
 

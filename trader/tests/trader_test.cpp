@@ -268,9 +268,7 @@ TEST(Trader, StoppingAStrategysFeedKeepsAWatchedBook) {
     EXPECT_TRUE(eventually(*rig.trader, [&] { return top() != first; })) << rig.logs();
 }
 
-// Staleness is fail-stop for the whole daemon, so a quiet market nobody is
-// trading must not be able to stop one that is being traded. A watched book
-// is handed to FeedMonitor only when a strategy starts on it.
+// A quiet market nobody is trading does not stop the daemon.
 TEST(Trader, AQuietWatchedBookDoesNotHaltTheDaemon) {
     // The simulator goes quiet two seconds in, with the session still up:
     // staleness, which is what FeedMonitor judges, and not a disconnect,
@@ -292,27 +290,33 @@ TEST(Trader, AQuietWatchedBookDoesNotHaltTheDaemon) {
         << "a book nobody is quoting stopped a daemon that was not quoting it: " << rig.logs();
 }
 
-// The same book, once a strategy is running on it, is monitored again: now
-// something is trading it, and a dead feed under it must stop the run.
-TEST(Trader, AWatchedBookIsMonitoredOnceAStrategyIsOnIt) {
+TEST(Trader, StaleBookStopsItsStrategyAndKeepsBothFixSessionsOpen) {
     Rig rig(true, std::nullopt, {kSym}, 2);
     ASSERT_EQ(rig.trader->start(), "") << rig.logs();
     const auto created = rig.trader->api().create(rig.spec());
     ASSERT_TRUE(created.ok()) << created.error;
     ASSERT_TRUE(rig.trader->api().start(created.id).ok());
+    ASSERT_TRUE(rig.trader->api().arm(created.id).ok());
     ASSERT_TRUE(eventually(*rig.trader, [&] {
         const auto book = rig.trader->api().snapshot().books;
         return !book.empty() && book.front().valid;
     })) << rig.logs();
 
-    // The same silence, now under a running strategy.
-    EXPECT_TRUE(eventually(*rig.trader,
-                           [&] {
-                               return rig.trader->api().snapshot().state ==
-                                      cpm::trader::DaemonState::Halted;
-                           },
-                           10s))
-        << "a strategy's own feed went quiet and the daemon carried on: " << rig.logs();
+    ASSERT_TRUE(eventually(*rig.trader, [&] {
+        return rig.trader->api().snapshot().strategies.front().state == RunState::Stopped;
+    })) << rig.logs();
+    const auto snapshot = rig.trader->api().snapshot();
+    EXPECT_EQ(snapshot.state, DaemonState::Live);
+    EXPECT_TRUE(snapshot.market_data.logged_on);
+    EXPECT_TRUE(snapshot.order_entry.logged_on);
+    EXPECT_FALSE(snapshot.strategies.front().armed);
+    EXPECT_NE(snapshot.strategies.front().note.find("stale feed on " + kSym), std::string::npos);
+    EXPECT_FALSE(rig.trader->api().start(created.id).ok());
+    EXPECT_FALSE(rig.trader->api().arm(created.id).ok());
+
+    rig.md_sim->stop();
+    ASSERT_TRUE(eventually(*rig.trader, [&] { return rig.trader->halted(); }, 20s)) << rig.logs();
+    EXPECT_NE(rig.trader->api().snapshot().halt_reason.find("disconnect"), std::string::npos);
 }
 
 // A series nobody can resolve is a warning, not a failure to start: the
@@ -437,9 +441,7 @@ TEST(Trader, AnObserverCannotArmAnythingAndSendsNothing) {
     }));
 }
 
-TEST(Trader, AStaleFeedHaltsEverythingAndTheDaemonStaysUpToSayWhy) {
-    // Amendment 4, and the gap crypto_mm had: it never wired up FeedMonitor,
-    // so a feed that went silent stopped nothing.
+TEST(Trader, AMarketDataDisconnectHaltsEverythingAndTheDaemonStaysUpToSayWhy) {
     Rig rig;
     ASSERT_EQ(rig.trader->start(), "") << rig.logs();
     const auto id = rig.trader->api().create(rig.spec()).id;
@@ -447,7 +449,6 @@ TEST(Trader, AStaleFeedHaltsEverythingAndTheDaemonStaysUpToSayWhy) {
     ASSERT_TRUE(rig.trader->api().start(id).ok());
     ASSERT_TRUE(rig.trader->api().arm(id).ok());
 
-    // The simulator is told to go quiet 2 s after logon by stale_after.
     rig.md_sim->stop();
 
     ASSERT_TRUE(eventually(*rig.trader, [&] { return rig.trader->halted(); }, 20s)) << rig.logs();

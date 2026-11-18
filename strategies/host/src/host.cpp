@@ -211,8 +211,10 @@ std::string StrategyHost::start(const std::string& id) {
     // which is the diagnosis crypto_mm had to print on its way out. The feed
     // comes first, the way it does when a row is created.
     if (!entry->feed) return id + " has no feed: start its feed first";
+    if (const auto reason = stale_book_reason(*entry, Clock::now()); !reason.empty()) return reason;
 
     entry->state = RunState::Running;
+    entry->stopped_for_stale_book = false;
     entry->note.clear();
     entry->withdrawn_for_lifecycle = false;
     entry->running_since = Clock::now();
@@ -263,6 +265,8 @@ std::string StrategyHost::arm(const std::string& id) {
     if (halted_.load()) return "halted: " + halt_reason_;
     Entry* entry = find(id);
     if (!entry) return "no such strategy: " + id;
+    if (entry->state == RunState::Stopping) return id + " is still stopping";
+    if (const auto reason = stale_book_reason(*entry, Clock::now()); !reason.empty()) return reason;
     // The daemon-wide key is the other one: without --allow-orders nothing can
     // be armed at all, and saying so here beats arming something that then
     // silently sends nothing. Deliberately not can_submit(), which is also
@@ -334,7 +338,7 @@ std::string StrategyHost::roll(const std::string& id, const std::string& symbol)
     entry->strategy = std::move(built.strategy);
     entry->symbols = entry->strategy->symbols();
     entry->withdrawn_for_lifecycle = false;
-    entry->note.clear();
+    if (!entry->stopped_for_stale_book) entry->note.clear();
     entry->last_book_warning = Clock::now();
     logger_.info("rolled " + id + " from " + previous + " to " + symbol +
                  (entry->armed.load() ? " (still armed)" : " (disarmed)"));
@@ -414,7 +418,7 @@ std::string StrategyHost::update(const std::string& id, const ParamValues& param
     entry->params = std::move(built.values);
     entry->strategy = std::move(built.strategy);
     entry->withdrawn_for_lifecycle = false;
-    entry->note.clear();
+    if (!entry->stopped_for_stale_book) entry->note.clear();
     entry->last_book_warning = Clock::now();
     logger_.info("updated " + id + "'s parameters while " + to_string(entry->state));
     return {};
@@ -518,6 +522,29 @@ void StrategyHost::drive(Entry& entry, Clock::time_point now) {
     }
 }
 
+std::string StrategyHost::stale_book_reason(const Entry& entry, Clock::time_point now) const {
+    if (!feeds_.stale_book_reason || !entry.strategy->requires_book_updates()) return {};
+    if (!entry.feed) {
+        return entry.stopped_for_stale_book ? entry.id + " has no feed: start its feed first" : "";
+    }
+    for (const auto& symbol : entry.symbols) {
+        if (window_has_ended(symbol, now)) {
+            if (entry.stopped_for_stale_book) return symbol + "'s window has ended";
+            continue;  // Let drive() handle the venue's normal window close.
+        }
+        auto reason = feeds_.stale_book_reason(symbol, now);
+        if (!reason.empty()) return reason;
+        if (entry.stopped_for_stale_book) {
+            const auto view = feeds_.book ? feeds_.book(symbol) : std::nullopt;
+            if (!view || !view->book_valid) return "waiting for a fresh book on " + symbol;
+            if (!(feeds_.tradable ? feeds_.tradable(*view) : default_tradable(*view))) {
+                return symbol + " is not open for trading";
+            }
+        }
+    }
+    return {};
+}
+
 void StrategyHost::tick(Clock::time_point now) {
     drain_reports();
 
@@ -525,6 +552,11 @@ void StrategyHost::tick(Clock::time_point now) {
     for (auto& entry : entries_) {
         switch (entry->state) {
             case RunState::Running:
+                if (const auto reason = stale_book_reason(*entry, now); !reason.empty()) {
+                    entry->stopped_for_stale_book = true;
+                    begin_stop(*entry, reason);
+                    break;
+                }
                 drive(*entry, now);
                 // It asked to stop during that pass. Acted on here rather
                 // than inside it: the quotes come off at once, and nothing

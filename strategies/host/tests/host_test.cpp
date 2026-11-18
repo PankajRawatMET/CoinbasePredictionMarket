@@ -149,6 +149,9 @@ struct Fixture {
             position.symbol = symbol;
             return position;
         };
+        feeds.stale_book_reason = [this](const std::string& symbol, Clock::time_point) {
+            return symbol == stale_symbol ? "stale feed on " + symbol : std::string{};
+        };
 
         host = std::make_unique<StrategyHost>(options, registry, std::move(venue), std::move(feeds),
                                              logger);
@@ -193,6 +196,7 @@ struct Fixture {
     // halt. Separate from allow_orders, which is the static --allow-orders key.
     bool gate_open = true;
     bool have_book = true;
+    std::string stale_symbol;
     LifecycleStatus status = LifecycleStatus::Open;
     std::uint64_t counter = 0;
     // ClOrdID -> the strategy the host said it came from.
@@ -512,6 +516,42 @@ TEST(Host, StoppingSomethingWithNothingRestingIsImmediate) {
     const auto id = f.live();
     ASSERT_EQ(f.host->stop(id, "done"), "");
     EXPECT_EQ(f.host->info(id)->state, RunState::Stopped);
+}
+
+TEST(Host, OnlyStrategiesUsingAStaleBookStopAndRestartRequiresFreshData) {
+    Fixture f;
+    const auto affected = f.live(kSym);
+    const auto healthy = f.live(kOther);
+    f.fakes.at(0)->resting = true;
+    f.stale_symbol = kSym;
+    f.host->tick();
+
+    EXPECT_EQ(f.host->info(affected)->state, RunState::Stopping);
+    EXPECT_FALSE(f.host->info(affected)->armed);
+    EXPECT_EQ(f.fakes.at(0)->withdrawals, std::vector<std::string>{"stale feed on " + kSym});
+    EXPECT_EQ(f.fakes.at(0)->passes, 0u);
+    EXPECT_EQ(f.host->info(healthy)->state, RunState::Running);
+    EXPECT_TRUE(f.host->info(healthy)->armed);
+    EXPECT_EQ(f.fakes.at(1)->passes, 1u);
+
+    f.stale_symbol.clear();
+    EXPECT_FALSE(f.host->start(affected).empty());
+    f.stale_symbol = kSym;
+    f.fakes.at(0)->resting = false;
+    f.host->tick();
+    EXPECT_EQ(f.host->info(affected)->state, RunState::Stopped);
+    EXPECT_EQ(f.host->start(affected), "stale feed on " + kSym);
+    EXPECT_EQ(f.host->arm(affected), "stale feed on " + kSym);
+
+    f.stale_symbol.clear();
+    f.host->tick();
+    EXPECT_EQ(f.host->info(affected)->state, RunState::Stopped);
+    f.have_book = false;
+    EXPECT_EQ(f.host->start(affected), "waiting for a fresh book on " + kSym);
+    f.have_book = true;
+    ASSERT_EQ(f.host->start(affected), "");
+    EXPECT_FALSE(f.host->info(affected)->armed);
+    EXPECT_FALSE(f.host->halted());
 }
 
 TEST(Host, CannotRemoveAStrategyThatStillHasOrders) {
