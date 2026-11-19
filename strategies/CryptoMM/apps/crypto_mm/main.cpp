@@ -179,7 +179,10 @@ int main(int argc, char** argv) {
         cpm::strategy::StrategyRegistry registry;
         cpm::strategy::register_crypto_mm(registry);
 
-        std::atomic<std::uint64_t> counter{reconciler.cl_ord_counter()};
+        // Unique across restarts by the run tag in the prefix, not by a
+        // counter saved to disk on every allocation (cpm::oms::run_tag).
+        const auto cl_ord_prefix = cpm::oms::run_prefix("mm-", cpm::oms::run_tag());
+        std::atomic<std::uint64_t> counter{0};
         cpm::strategy::StrategyHooks venue;
         venue.can_submit = [&] { return args.allow_orders && reconciler.submission_allowed(); };
         venue.orders_permitted = [&] { return args.allow_orders; };
@@ -209,11 +212,7 @@ int main(int argc, char** argv) {
             }
             return out;
         };
-        venue.next_cl_ord_id = [&] {
-            const auto next = ++counter;
-            reconciler.note_cl_ord_counter(next);
-            return cpm::oms::make_cl_ord_id("mm-", next);
-        };
+        venue.next_cl_ord_id = [&] { return cpm::oms::make_cl_ord_id(cl_ord_prefix, ++counter); };
         venue.log = [&logger](const std::string& line) { logger.info(line); };
 
         cpm::strategy::StrategyHost::Feeds feeds;

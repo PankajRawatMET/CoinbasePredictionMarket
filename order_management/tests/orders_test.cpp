@@ -241,4 +241,76 @@ TEST(OrderRules, GeneratedClOrdIdsAreShortAndUnique) {
     }
 }
 
+// The run tag is what keeps ids unique across a restart now that no counter is
+// persisted, so it has to be fixed width, cover a run's whole id space, and
+// differ for any two seconds a daemon could start in.
+TEST(OrderRules, TheRunTagNamesTheSecondTheRunStarted) {
+    // Six base36 characters, always - a prefix built from it is one length.
+    EXPECT_EQ(cpm::oms::run_tag(0).size(), 6u);
+    EXPECT_EQ(cpm::oms::run_tag(0), "000000");
+    EXPECT_EQ(cpm::oms::run_tag(1), "000001");
+    EXPECT_EQ(cpm::oms::run_tag(35), "00000z");
+    EXPECT_EQ(cpm::oms::run_tag(36), "000010");
+    // 2026-11-19T06:12:36Z, the run the fsync measurements came from.
+    EXPECT_EQ(cpm::oms::run_tag(1'795'068'756ULL), "toqjx0");
+
+    // Every second of a run's life gets its own tag, and consecutive seconds
+    // never repeat until the 36^6-second wrap, about 69 years away.
+    std::set<std::string> seen;
+    for (std::uint64_t second = 1'795'068'756ULL; second < 1'795'068'756ULL + 20'000; ++second) {
+        EXPECT_TRUE(seen.insert(cpm::oms::run_tag(second)).second) << second;
+    }
+    EXPECT_EQ(cpm::oms::run_tag(7), cpm::oms::run_tag(7 + 2'176'782'336ULL)) << "wraps at 36^6";
+
+    // The clock's own tag is one of these and nothing else.
+    const auto now = cpm::oms::run_tag();
+    EXPECT_EQ(now.size(), 6u);
+    EXPECT_EQ(now.find_first_not_of("0123456789abcdefghijklmnopqrstuvwxyz"), std::string::npos)
+        << now;
+}
+
+// "mm-" plus a tag is ten characters, which must still leave a usable counter
+// inside the venue's sixteen.
+TEST(OrderRules, ARunPrefixLeavesRoomForTheCounter) {
+    const auto prefix = cpm::oms::run_prefix("mm-", "toqjx0");
+    EXPECT_EQ(prefix, "mm-toqjx0-");
+
+    EXPECT_EQ(cpm::oms::make_cl_ord_id(prefix, 0), "mm-toqjx0-0");
+    EXPECT_EQ(cpm::oms::make_cl_ord_id(prefix, 39'606), "mm-toqjx0-uk6");
+    // 36^6 - 1 is the largest counter that fits: about 2.2e9 ids in one run,
+    // or 22 years at the rate three strategies quote.
+    const auto last = cpm::oms::make_cl_ord_id(prefix, 2'176'782'335ULL);
+    EXPECT_EQ(last, "mm-toqjx0-zzzzzz");
+    EXPECT_EQ(last.size(), cpm::oms::kClOrdIdMaxBytes);
+    EXPECT_FALSE(cpm::oms::check_cl_ord_id(last).has_value()) << last;
+    // One beyond it throws rather than sending something the venue rejects.
+    EXPECT_THROW(cpm::oms::make_cl_ord_id(prefix, 2'176'782'336ULL), std::invalid_argument);
+
+    // The daemon's other roles fit too.
+    EXPECT_EQ(cpm::oms::run_prefix("ex-", "toqjx0"), "ex-toqjx0-");
+    EXPECT_EQ(cpm::oms::run_prefix("halt-", "toqjx0"), "halt-toqjx0-");
+    EXPECT_LE(cpm::oms::make_cl_ord_id(cpm::oms::run_prefix("halt-", "toqjx0"), 1'000'000).size(),
+              cpm::oms::kClOrdIdMaxBytes);
+
+    // A role so long that nothing is left to count is a configuration error.
+    EXPECT_THROW(cpm::oms::run_prefix("far-too-long-", "toqjx0"), std::invalid_argument);
+}
+
+// The point of the whole change: two runs that both start their counter at
+// zero still cannot mint the same id, so nothing has to be saved per order.
+TEST(OrderRules, TwoRunsCannotMintTheSameClOrdId) {
+    const auto first = cpm::oms::run_prefix("mm-", cpm::oms::run_tag(1'795'068'756ULL));
+    const auto second = cpm::oms::run_prefix("mm-", cpm::oms::run_tag(1'795'073'532ULL));
+    ASSERT_NE(first, second);
+
+    std::set<std::string> seen;
+    for (std::uint64_t i = 0; i < 2000; ++i) {
+        EXPECT_TRUE(seen.insert(cpm::oms::make_cl_ord_id(first, i)).second) << i;
+    }
+    for (std::uint64_t i = 0; i < 2000; ++i) {
+        EXPECT_TRUE(seen.insert(cpm::oms::make_cl_ord_id(second, i)).second)
+            << "the second run reused " << cpm::oms::make_cl_ord_id(second, i);
+    }
+}
+
 }  // namespace

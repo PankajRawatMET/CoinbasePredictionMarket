@@ -15,7 +15,9 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
+#include <fstream>
 #include <sstream>
 #include <thread>
 
@@ -415,6 +417,122 @@ TEST(Trader, AnArmedStrategyQuotesAndStoppingItLeavesNothingResting) {
     EXPECT_TRUE(none_of_ours(asks)) << "and no ask";
 }
 
+// An order's whole life in the strategy's own log: the send is the
+// reconciler's line, and these are the venue's answers to it. Before this,
+// strategy.log said an order had been sent and then never mentioned it again
+// - so a quote that was acknowledged 250ms later and taken 56ms after that
+// read exactly like one that rested for a quarter of a second by choice
+// (2026-11-19 07:01).
+TEST(Trader, AnOrdersWholeLifeIsInTheStrategyLog) {
+    Rig rig;
+    ASSERT_EQ(rig.trader->start(), "") << rig.logs();
+    const auto id = rig.trader->api().create(rig.spec()).id;
+    ASSERT_FALSE(id.empty());
+    ASSERT_TRUE(rig.trader->api().start(id).ok());
+    ASSERT_TRUE(rig.trader->api().arm(id).ok());
+
+    // Sent, then acknowledged. "added" is the line that says it is really on
+    // the book - and therefore that a cancel for it can be sent at all.
+    ASSERT_TRUE(eventually(*rig.trader, [&] {
+        return rig.logs().find("] added: buy ") != std::string::npos;
+    })) << rig.logs();
+
+    const auto logged = rig.logs();
+    const auto at = logged.find("] added: buy ");
+    const auto added = logged.substr(logged.rfind('\n', at) + 1,
+                                     logged.find('\n', at) - logged.rfind('\n', at) - 1);
+    EXPECT_NE(added.find("[" + id + " " + kSym + "] added: buy "), std::string::npos) << added;
+    // What the venue took to answer, which is the window in which the quote
+    // was live and could not yet be cancelled.
+    EXPECT_NE(added.find(", acked in "), std::string::npos) << added;
+    // The venue's own handle for it, which appears nowhere else in this file.
+    EXPECT_NE(added.find(", oid "), std::string::npos) << added;
+    // The ClOrdID last, where every line in the family puts it.
+    EXPECT_NE(added.find(" (mm-"), std::string::npos) << added;
+
+    // The send itself is still the reconciler's line, and still there.
+    EXPECT_NE(logged.find("] quoting buy "), std::string::npos) << logged;
+
+    // Stopping takes the quotes off, and the cancel is now answered in the
+    // log as well as requested in it. Both halves: before this only the
+    // request was written down, so a cancel that landed and one still in
+    // flight looked the same.
+    ASSERT_TRUE(rig.trader->api().stop(id).ok());
+    ASSERT_TRUE(eventually(*rig.trader, [&] {
+        return rig.logs().find("] deleted: ") != std::string::npos;
+    })) << rig.logs();
+
+    const auto after = rig.logs();
+    // A stop withdraws both sides at once, so the request is the reconciler's
+    // "withdrawing both quotes" and not the per-side line, which only appears
+    // when a running strategy drops one side and keeps the other.
+    EXPECT_NE(after.find("] withdrawing both quotes: "), std::string::npos) << "the request";
+    const auto gone = after.find("] deleted: ");
+    const auto deleted = after.substr(after.rfind('\n', gone) + 1,
+                                      after.find('\n', gone) - after.rfind('\n', gone) - 1);
+    // Our cancel, not the venue's, so it carries the round trip and the id of
+    // the cancel that did it rather than an ExecRestatementReason.
+    EXPECT_NE(deleted.find(", cancelled in "), std::string::npos) << deleted;
+    EXPECT_NE(deleted.find(" by mm-"), std::string::npos) << deleted;
+    EXPECT_EQ(deleted.find("by the venue"), std::string::npos) << deleted;
+}
+
+// A fill belongs in the strategy's own log, not only in fills.csv. The CSV is
+// the shape a dataframe wants and keeps every id; this is the line an operator
+// reads in the same file as the reasoning that led to it, so "why did it quote
+// there" and "did it work" are one scroll apart rather than two files.
+TEST(Trader, AFillIsLoggedToTheStrategyLogAndNotOnlyToFillsCsv) {
+    Rig rig;
+    ASSERT_EQ(rig.trader->start(), "") << rig.logs();
+    const auto id = rig.trader->api().create(rig.spec()).id;
+    ASSERT_FALSE(id.empty());
+    ASSERT_TRUE(rig.trader->api().start(id).ok());
+    ASSERT_TRUE(rig.trader->api().arm(id).ok());
+
+    // Our own bid has to be resting before anything can hit it.
+    ASSERT_TRUE(eventually(*rig.trader, [&] {
+        const auto bids = rig.oe_sim->book(kSym, cpm::oms::Side::Buy);
+        return std::any_of(bids.begin(), bids.end(), [](const auto& order) {
+            return order.cl_ord_id.rfind("mm-", 0) == 0;
+        });
+    })) << rig.logs();
+
+    // Somebody sells into it: price 1 crosses every bid there is, and enough
+    // quantity to sweep the simulator's own seeded liquidity (600, at 0.45
+    // and below) as well, because the engine fills the best bid first and
+    // the strategy's may not be it. A maker fill is the only way a position
+    // exists in this simulator at all.
+    const auto bids = rig.oe_sim->book(kSym, cpm::oms::Side::Buy);
+    const auto ours = std::find_if(bids.begin(), bids.end(), [](const auto& order) {
+        return order.cl_ord_id.rfind("mm-", 0) == 0;
+    });
+    ASSERT_NE(ours, bids.end());
+    ASSERT_GE(rig.oe_sim->trade(kSym, cpm::oms::Side::Sell, 1000, 1), ours->quantity)
+        << "the taker never reached our bid: " << rig.logs();
+
+    ASSERT_TRUE(eventually(*rig.trader, [&] {
+        return rig.logs().find("] fill: buy ") != std::string::npos;
+    })) << rig.logs();
+
+    const auto logged = rig.logs();
+    const auto at = logged.find("] fill: buy ");
+    const auto line = logged.substr(logged.rfind('\n', at) + 1,
+                                    logged.find('\n', at) - logged.rfind('\n', at) - 1);
+    // Tagged like every other line of a strategy's log, so the file reads as
+    // one timeline: the strategy that did it, then the instrument.
+    EXPECT_NE(line.find("[" + id + " " + kSym + "] fill: buy "), std::string::npos) << line;
+    // Resting, not crossing: it was our quote that was taken.
+    EXPECT_NE(line.find(" maker"), std::string::npos) << line;
+    // How long the quote waited, and where the fill left the position - the
+    // two things the CSV row has that a reader of the narrative would
+    // otherwise have to go and join to.
+    EXPECT_NE(line.find(", rested "), std::string::npos) << line;
+    EXPECT_NE(line.find(", net "), std::string::npos) << line;
+    EXPECT_NE(line.find(", cash "), std::string::npos) << line;
+    // And the ClOrdID, which is what joins it to orders.csv and to wire.log.
+    EXPECT_NE(line.find(" (mm-"), std::string::npos) << line;
+}
+
 TEST(Trader, AnObserverCannotArmAnythingAndSendsNothing) {
     Rig rig(/*allow_orders=*/false);
     ASSERT_EQ(rig.trader->start(), "") << rig.logs();
@@ -494,6 +612,50 @@ TEST(Trader, StopIsIdempotentAndSavesTheBookmark) {
     rig.trader->stop();
     rig.trader->stop();
     SUCCEED();
+}
+
+// A ClOrdID is unique across a restart because it names the run, not because
+// a counter was saved to disk before each send. The bookmark is therefore one
+// line, and allocating an id touches no file at all.
+TEST(Trader, EveryClOrdIdNamesTheRunAndTheBookmarkHoldsOnlyTheExecId) {
+    Rig rig;
+    ASSERT_EQ(rig.trader->start(), "") << rig.logs();
+    const auto id = rig.trader->api().create(rig.spec()).id;
+    ASSERT_FALSE(id.empty());
+    ASSERT_TRUE(rig.trader->api().start(id).ok());
+    ASSERT_TRUE(rig.trader->api().arm(id).ok());
+    ASSERT_TRUE(eventually(*rig.trader, [&] {
+        return rig.logs().find("] added: buy ") != std::string::npos;
+    })) << rig.logs();
+
+    const auto logged = rig.logs();
+    // The run is announced once, and every quote carries its tag.
+    const auto tag_at = logged.find("ClOrdID run tag ");
+    ASSERT_NE(tag_at, std::string::npos) << logged;
+    const auto tag = logged.substr(tag_at + std::string("ClOrdID run tag ").size(), 6);
+    EXPECT_EQ(tag.size(), 6u) << tag;
+    EXPECT_NE(logged.find(" (mm-" + tag + "-"), std::string::npos)
+        << "a quote's id does not name the run: " << logged;
+
+    // The counter still rises within the run, so two quotes are never the
+    // same order.
+    EXPECT_NE(logged.find("quoting buy "), std::string::npos) << logged;
+    EXPECT_NE(logged.find("quoting sell "), std::string::npos) << logged;
+    const auto buy_at = logged.find(" as mm-" + tag + "-");
+    const auto sell_at = logged.rfind(" as mm-" + tag + "-");
+    ASSERT_NE(buy_at, std::string::npos) << logged;
+    EXPECT_NE(buy_at, sell_at) << "both sides were quoted under one id";
+
+    // And the file on disk is the ExecID alone: nothing about the counter
+    // survives the run, because nothing needs to.
+    rig.trader->stop();
+    std::ifstream in(Rig::bookmark_path());
+    ASSERT_TRUE(in.is_open()) << "no bookmark at " << Rig::bookmark_path();
+    const std::string contents((std::istreambuf_iterator<char>(in)),
+                               std::istreambuf_iterator<char>());
+    EXPECT_EQ(contents.find("cl_ord_counter"), std::string::npos) << contents;
+    EXPECT_EQ(contents.rfind("last_exec_id=", 0), 0u) << contents;
+    EXPECT_EQ(std::count(contents.begin(), contents.end(), '\n'), 1) << contents;
 }
 
 TEST(Trader, TwoStrategiesOnOneSymbolAreRefusedByTheDaemonToo) {

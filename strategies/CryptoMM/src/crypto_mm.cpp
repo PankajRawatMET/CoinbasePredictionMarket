@@ -24,6 +24,27 @@ std::optional<Price> market_mid(const InstrumentView& book) {
     return (best_bid + best_ask) / 2;
 }
 
+// Is `ask` more than `limit` grid rungs above `bid`? That is the BADQ test.
+//
+// Walked rather than subtracted, because the grid is tapered - 0.001 below
+// 0.100, 0.01 between, 0.001 above 0.900 - so a difference in price is not a
+// number of ticks, and the same 5 ticks is 0.05 at 0.50 and 0.005 at 0.95.
+// price_above() is the venue's own stepping rule and the only thing that gets
+// the boundaries right: a step up from 0.900 lands on 0.910, not 0.901.
+//
+// At most `limit` steps, so the cost is the limit and not the width of the
+// book: an empty book is 126 rungs wide and we only need to know that it is
+// more than five. Exactly `limit` rungs is inside the limit, because the
+// operator's rule is "wider than BADQ", not "at least BADQ".
+bool wider_than(Price bid, Price ask, int limit) {
+    Price at = bid;
+    for (int step = 0; step < limit; ++step) {
+        if (at >= ask) return false;
+        at = cpm::md::price_above(at);
+    }
+    return at < ask;
+}
+
 // floor() and ceil() of v/2, for prices carried at twice their scale. The mid
 // of a one-tick market sits on a half, and so does either side of an odd
 // spread, so the halves are kept until the rounding below consumes them:
@@ -107,6 +128,26 @@ DesiredQuotes desired_quotes(const InstrumentView& book, const Position& positio
     const Price ask_ex_ours = kPriceOne - no_bid_ex_ours.price;
     if (ask_ex_ours <= bid_ex_ours.price) {
         out.reason = "crossed or locked book once our own orders are taken out";
+        return out;
+    }
+
+    // BADQ: a market this wide is not a price. Before the mid is taken,
+    // because the midpoint of a vacuum is arithmetic and not information -
+    // the mid of 0.44/0.98 is 0.71, and quoting around it is how this
+    // strategy came to bid 0.70 for something worth 0.47 (2026-11-19 06:13).
+    //
+    // Both quotes come off, which is what returning with neither side set
+    // means: QuoteReconciler cancels whatever is live and places nothing.
+    // Nothing latches, so the next pass that sees a market inside the limit
+    // quotes again - the condition is a property of the book in front of us
+    // and not a memory of the past, which is what makes this simpler than
+    // the reference speed bump above.
+    if (params.max_quote_spread_ticks > 0 &&
+        wider_than(bid_ex_ours.price, ask_ex_ours, params.max_quote_spread_ticks)) {
+        out.reason = "the market is " + format_price(bid_ex_ours.price) + " / " +
+                     format_price(ask_ex_ours) + " once our own orders are taken out, wider "
+                     "than the BADQ limit of " +
+                     std::to_string(params.max_quote_spread_ticks) + " ticks";
         return out;
     }
 
@@ -394,6 +435,20 @@ ParamSchema crypto_mm_schema() {
                       "ticks at 0.01, so 2500 is a $25 move";
     schema.push_back(std::move(speed_bump));
 
+    ParamSpec badq;
+    badq.name = "max-quote-spread";
+    // The operator's own spelling for the column, as PricingMidMoveThreshold is.
+    badq.label = "BADQ";
+    badq.type = ParamSpec::Type::Int;
+    badq.default_value = "0";
+    badq.min = "0";
+    badq.max = "500";
+    badq.help = "pull both quotes while the market excluding our own orders is wider than "
+                "this many ticks, and quote again once it narrows back inside; 0 is off. "
+                "Ticks are grid rungs, so 5 is 0.05 between 0.100 and 0.900 and 0.005 "
+                "outside it";
+    schema.push_back(std::move(badq));
+
     return schema;
 }
 
@@ -407,6 +462,7 @@ Params crypto_mm_params(const ParamValues& values) {
     // The schema has already refused anything else.
     params.withdraw_before = std::chrono::seconds(param_int(values, "withdraw-before"));
     params.mid_move_threshold_ticks = param_int(values, "pricing-mid-move-threshold");
+    params.max_quote_spread_ticks = static_cast<int>(param_int(values, "max-quote-spread"));
     return params;
 }
 

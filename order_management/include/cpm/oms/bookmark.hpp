@@ -8,13 +8,17 @@ namespace cpm::oms {
 
 // The only durable state an order manager keeps (OE-Q7, project instructions
 // amendment 6): the newest ExecID processed, which anchors EventResendRequest
-// after a restart, and the ClOrdID counter, so ids are never reused.
+// after a restart.
+//
+// It once carried a ClOrdID counter as well, saved on every id allocated so
+// that a restart could not reuse one. That is now the run tag inside the id
+// itself (cpm::oms::run_tag), which costs nothing, so the only thing left here
+// is the one value no clock can reconstruct: how far we had got.
 //
 // Written whole and renamed into place, so a crash leaves either the old file
 // or the new one and never a half-written line.
 struct Bookmark {
-    std::string last_exec_id;        // empty when nothing has been processed
-    std::uint64_t cl_ord_counter = 0;
+    std::string last_exec_id;  // empty when nothing has been processed
 };
 
 class BookmarkFile {

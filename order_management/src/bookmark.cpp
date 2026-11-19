@@ -15,16 +15,20 @@
 namespace cpm::oms {
 namespace {
 
-// Deliberately boring: two lines of key=value, so the file can be read by eye
+// Deliberately boring: a line of key=value, so the file can be read by eye
 // when something has gone wrong at four in the morning.
 constexpr const char* kExecKey = "last_exec_id=";
-constexpr const char* kCounterKey = "cl_ord_counter=";
+// Written by every build before the run tag replaced it. Read and ignored for
+// ever, not for one release: a rollback to an older binary writes it again,
+// and a bookmark that stops a start is worse than a line nobody reads.
+constexpr const char* kLegacyCounterKey = "cl_ord_counter=";
 
 // A temporary name no other write can be using. One fixed ".tmp" was shared by
-// every writer, and two saves at the same moment - an ExecutionReport on the
-// session's callback thread, a ClOrdID allocation on the strategy's - then
-// truncated each other's half-written file, so the loser's rename found nothing
-// to rename and the winner could carry a torn pair of lines into place.
+// every writer, and two saves at the same moment then truncated each other's
+// half-written file, so the loser's rename found nothing to rename and the
+// winner could carry a torn line into place. Only one caller is left now that
+// ClOrdID allocation no longer saves, but save_bookmark() is still reachable
+// from the session's callback thread and from a halt on another.
 std::string temporary_name(const std::string& path) {
     static std::atomic<std::uint64_t> sequence{0};
     return path + ".tmp." + std::to_string(::getpid()) + "." +
@@ -50,23 +54,21 @@ std::optional<Bookmark> BookmarkFile::read() const {
     if (!in.is_open()) return std::nullopt;
 
     Bookmark bookmark;
-    bool saw_counter = false;
+    bool saw_exec_id = false;
     std::string line;
     while (std::getline(in, line)) {
         if (line.rfind(kExecKey, 0) == 0) {
             bookmark.last_exec_id = line.substr(std::string(kExecKey).size());
-        } else if (line.rfind(kCounterKey, 0) == 0) {
-            try {
-                bookmark.cl_ord_counter = std::stoull(line.substr(std::string(kCounterKey).size()));
-            } catch (const std::exception&) {
-                throw std::runtime_error("bookmark " + path_ + " has a malformed cl_ord_counter");
-            }
-            saw_counter = true;
+            saw_exec_id = true;
+        } else if (line.rfind(kLegacyCounterKey, 0) == 0) {
+            continue;  // an older run's ClOrdID counter; nothing reads it now
         } else if (!line.empty()) {
             throw std::runtime_error("bookmark " + path_ + " has an unrecognised line: " + line);
         }
     }
-    if (!saw_counter) throw std::runtime_error("bookmark " + path_ + " has no cl_ord_counter");
+    // A file with no last_exec_id at all is not a bookmark. An empty value is:
+    // it is what a run that processed nothing leaves behind.
+    if (!saw_exec_id) throw std::runtime_error("bookmark " + path_ + " has no last_exec_id");
     return bookmark;
 }
 
@@ -79,8 +81,7 @@ void BookmarkFile::write(const Bookmark& bookmark) const {
             throw std::runtime_error("cannot write bookmark " + temporary + ": " +
                                      std::strerror(errno));
         }
-        out << kExecKey << bookmark.last_exec_id << '\n'
-            << kCounterKey << bookmark.cl_ord_counter << '\n';
+        out << kExecKey << bookmark.last_exec_id << '\n';
         out.flush();
         if (!out) throw std::runtime_error("cannot write bookmark " + temporary);
     }

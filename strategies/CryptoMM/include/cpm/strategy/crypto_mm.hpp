@@ -74,6 +74,27 @@ struct Params {
     //
     // 0 - the default - is off, and the strategy is exactly what it was.
     std::int64_t mid_move_threshold_ticks = 0;
+    // BADQ (the GUI column): the widest market, in grid rungs, that this
+    // strategy will lean on. While the book EXCLUDING OUR OWN ORDERS is wider
+    // than this, both quotes come off and nothing is placed; when it narrows
+    // back inside, quoting resumes by itself.
+    //
+    // Measured on the book without our orders because that is the book the
+    // mid is taken from, and because the raw book is the wrong answer
+    // exactly when this guard is needed: when our own pair is the only thing
+    // at the touch, the raw spread is our own width and looks tight. On
+    // 2026-11-19 at 06:13 the raw book read 0.70/0.72 while the market
+    // behind it was 0.44/0.98; the mid of that vacuum is 0.71, so the
+    // strategy bid 0.70 in a market that had been trading at 0.50 ten
+    // seconds earlier and was taken twice inside eleven seconds.
+    //
+    // In grid rungs and not in price, because the grid is tapered: 5 rungs is
+    // 0.05 between 0.100 and 0.900 and 0.005 outside it (md/ticks.hpp). A
+    // difference in price is therefore not a number of ticks, which is why
+    // this is counted by walking the grid rather than by subtracting.
+    //
+    // 0 - the default - is off, and the strategy is exactly what it was.
+    int max_quote_spread_ticks = 0;
 };
 
 // The whole decision, as a pure function of the book, the position and the

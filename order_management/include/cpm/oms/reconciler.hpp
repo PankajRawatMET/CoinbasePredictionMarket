@@ -73,6 +73,11 @@ public:
         // two containers do not depend on each other. Unset means "never",
         // which is the behaviour this had before (OE-Q6).
         std::function<bool(const std::string& symbol)> window_has_ended;
+        // This run's tag, for the mass-cancel ClOrdIDs raised from here
+        // (cpm::oms::run_tag). Empty takes it from the clock, which is right
+        // for anything that owns a Reconciler by itself; the daemon passes its
+        // own so that every id in a run, whoever built it, names the same run.
+        std::string run_tag;
     };
 
     // Called once, from whichever thread noticed. It must not stop the client:
@@ -92,10 +97,6 @@ public:
     OeCallbacks callbacks();
     OrderState::AnomalyHandler anomaly_handler();
 
-    // The counter to start ClOrdIDs from, read from the bookmark at startup.
-    std::uint64_t cl_ord_counter() const;
-    // Records the counter so a restart never reuses an id.
-    void note_cl_ord_counter(std::uint64_t counter);
     // Persists the newest ExecID the state has processed.
     void save_bookmark();
 
@@ -122,6 +123,8 @@ private:
     BookmarkFile bookmark_;
     Logger& logger_;
     const HaltHandler on_halt_;
+    // "halt-<run tag>-", built once at construction.
+    const std::string halt_prefix_;
 
     // Serialises save_bookmark. The file is written whole, so two threads
     // saving at once must not interleave, and a save that started earlier must
@@ -132,7 +135,10 @@ private:
     RecoveryState state_value_ = RecoveryState::Starting;
     std::optional<Halt> halt_;
     bool delivered_ = false;
-    std::uint64_t cl_ord_counter_ = 0;
+    // Only this class's own mass-cancel ids come from here, and only on a halt
+    // or a reconnect - a handful in a run. Nothing persists it: the run tag in
+    // halt_prefix_ is what keeps them unique across a restart.
+    std::uint64_t halt_counter_ = 0;
     std::string bookmarked_exec_id_;
     std::string newest_at_exchange_;
     Clock::time_point phase_started_{};

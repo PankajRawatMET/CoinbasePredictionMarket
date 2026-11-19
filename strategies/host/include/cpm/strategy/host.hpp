@@ -195,6 +195,9 @@ private:
     // The hooks one strategy gets: the owner's venue, plus a can_submit that
     // folds in this strategy's arming and the host-wide halt.
     StrategyHooks hooks_for(Entry& entry) const;
+    // Every parameter a strategy is starting with, to its own log. Caller
+    // holds the lock.
+    void log_params(const Entry& entry) const;
     void drive(Entry& entry, Clock::time_point now);
     std::string stale_book_reason(const Entry& entry, Clock::time_point now) const;
     // Fills a StrategyInfo from an entry. Caller holds the lock.

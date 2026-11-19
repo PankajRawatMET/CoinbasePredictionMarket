@@ -82,23 +82,22 @@ TEST(BookmarkTest, RoundTripsAndStartsEmpty) {
     BookmarkFile file(path);
     EXPECT_FALSE(file.read().has_value()) << "a missing bookmark is a first run";
 
-    file.write({"480837776594436096", 42});
+    file.write({"480837776594436096"});
     const auto read = file.read();
     ASSERT_TRUE(read.has_value());
     EXPECT_EQ(read->last_exec_id, "480837776594436096");
-    EXPECT_EQ(read->cl_ord_counter, 42u);
 
     // Overwriting leaves one version, not a mixture.
-    file.write({"480837843678134272", 43});
+    file.write({"480837843678134272"});
     EXPECT_EQ(file.read()->last_exec_id, "480837843678134272");
     EXPECT_FALSE(std::filesystem::exists(path + ".tmp"));
     std::filesystem::remove(path);
 }
 
-// Two threads saving at once is the normal case once a strategy is armed: the
-// session thread bookmarks each ExecutionReport while the strategy thread
-// bookmarks each ClOrdID it allocates. Neither may fail, and neither may leave
-// a half-written file or a stray temporary behind.
+// Two threads saving at once: the session thread bookmarks each
+// ExecutionReport while a halt on another raises a mass cancel and saves on
+// its way out. Neither may fail, and neither may leave a half-written file or
+// a stray temporary behind.
 TEST(BookmarkTest, SurvivesConcurrentWriters) {
     const auto path = temp_path("cpm-bookmark-race-");
     std::filesystem::remove(path);
@@ -114,8 +113,7 @@ TEST(BookmarkTest, SurvivesConcurrentWriters) {
             while (!go.load()) std::this_thread::yield();
             for (int i = 0; i < kWrites; ++i) {
                 try {
-                    file.write({"4808377765944360" + std::to_string(writer) + std::to_string(i),
-                                static_cast<std::uint64_t>(i)});
+                    file.write({"4808377765944360" + std::to_string(writer) + std::to_string(i)});
                 } catch (const std::exception&) {
                     ++failures;
                 }
@@ -142,15 +140,37 @@ TEST(BookmarkTest, RefusesToGuessAtACorruptFile) {
     const auto path = temp_path("cpm-bookmark-bad-");
     {
         std::ofstream out(path, std::ios::trunc);
-        out << "last_exec_id=123\ncl_ord_counter=not-a-number\n";
+        out << "last_exec_id=123\nsomething_else=4\n";
     }
     EXPECT_THROW(BookmarkFile(path).read(), std::runtime_error);
 
     {
         std::ofstream out(path, std::ios::trunc);
-        out << "last_exec_id=123\n";  // no counter
+        out << "\n";  // no last_exec_id at all
     }
     EXPECT_THROW(BookmarkFile(path).read(), std::runtime_error);
+    std::filesystem::remove(path);
+}
+
+// A bookmark written by a build from before the run tag still starts a daemon.
+// The counter it carries is dead, but throwing on it would mean an upgrade -
+// or a rollback, which writes it again - could not start at all.
+TEST(BookmarkTest, ReadsABookmarkLeftByAnOlderBuild) {
+    const auto path = temp_path("cpm-bookmark-legacy-");
+    {
+        std::ofstream out(path, std::ios::trunc);
+        out << "last_exec_id=480837776594436096\ncl_ord_counter=39606\n";
+    }
+    const auto read = BookmarkFile(path).read();
+    ASSERT_TRUE(read.has_value());
+    EXPECT_EQ(read->last_exec_id, "480837776594436096");
+
+    // And writing it back drops the line rather than preserving it.
+    BookmarkFile(path).write(*read);
+    std::ifstream in(path);
+    const std::string contents((std::istreambuf_iterator<char>(in)),
+                               std::istreambuf_iterator<char>());
+    EXPECT_EQ(contents, "last_exec_id=480837776594436096\n");
     std::filesystem::remove(path);
 }
 
@@ -262,7 +282,7 @@ TEST(Recovery, ABookmarkNewerThanTheRetentionWindowIsNotAGap) {
     // A bookmark left by an earlier run, as a restart would find it.
     const auto path = temp_path("cpm-rec-ahead-");
     std::filesystem::remove(path);
-    BookmarkFile(path).write({"483656078886699010", 3});
+    BookmarkFile(path).write({"483656078886699010"});
 
     Rig rig("cpm-rec-ahead-");
     ASSERT_TRUE(rig.client->wait_logged_on(5s)) << rig.client_log.str();
@@ -524,14 +544,12 @@ TEST(Recovery, TheBookmarkSurvivesARestart) {
         rig.state.record_sent(rig.order("o1"));
         rig.client->send(rig.order("o1"));
         ASSERT_TRUE(eventually([&] { return !rig.state.last_exec_id().empty(); }, 5s));
-        rig.reconciler->note_cl_ord_counter(7);
     }
     // The rig removes its bookmark on the way out, so the restart is simulated
     // by writing one as a crashed process would have left it.
-    BookmarkFile(path).write({"480837776594436090", 7});
+    BookmarkFile(path).write({"480837776594436090"});
 
     Rig rig("cpm-rec-replay-");
-    EXPECT_EQ(rig.reconciler->cl_ord_counter(), 7u) << "the counter survived the restart";
     ASSERT_TRUE(rig.client->wait_logged_on(5s)) << rig.client_log.str();
     // Reconciliation runs before anything may be submitted, whatever it finds.
     ASSERT_TRUE(eventually([&] { return rig.reconciler->state() != RecoveryState::Starting; }, 5s));

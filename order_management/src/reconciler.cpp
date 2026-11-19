@@ -33,15 +33,14 @@ Reconciler::Reconciler(Options options, OeClient& client, OrderState& state, Boo
       state_(state),
       bookmark_(std::move(bookmark)),
       logger_(logger),
-      on_halt_(std::move(on_halt)) {
+      on_halt_(std::move(on_halt)),
+      halt_prefix_(run_prefix("halt-", options_.run_tag.empty() ? run_tag() : options_.run_tag)) {
     // A missing bookmark is a first run. A corrupt one throws, because
     // restarting from zero would replay nothing and silently lose history.
     if (const auto stored = bookmark_.read()) {
-        cl_ord_counter_ = stored->cl_ord_counter;
         bookmarked_exec_id_ = stored->last_exec_id;
         logger_.info("bookmark " + bookmark_.path() + ": last ExecID " +
-                     (bookmarked_exec_id_.empty() ? "<none>" : bookmarked_exec_id_) +
-                     ", ClOrdID counter " + std::to_string(cl_ord_counter_));
+                     (bookmarked_exec_id_.empty() ? "<none>" : bookmarked_exec_id_));
     } else {
         logger_.info("no bookmark at " + bookmark_.path() + ": starting fresh");
     }
@@ -49,27 +48,9 @@ Reconciler::Reconciler(Options options, OeClient& client, OrderState& state, Boo
 
 Reconciler::~Reconciler() { stop(); }
 
-std::uint64_t Reconciler::cl_ord_counter() const {
-    std::lock_guard lock(mutex_);
-    return cl_ord_counter_;
-}
-
-void Reconciler::note_cl_ord_counter(std::uint64_t counter) {
-    {
-        std::lock_guard lock(mutex_);
-        if (counter <= cl_ord_counter_) return;
-        cl_ord_counter_ = counter;
-    }
-    save_bookmark();
-}
-
 void Reconciler::save_bookmark() {
     std::lock_guard save_lock(save_mutex_);
     Bookmark bookmark;
-    {
-        std::lock_guard lock(mutex_);
-        bookmark.cl_ord_counter = cl_ord_counter_;
-    }
     // The state's newest ExecID is the authority: it is what has actually been
     // processed, which is what a replay must resume from.
     bookmark.last_exec_id = state_.last_exec_id();
@@ -296,10 +277,10 @@ void Reconciler::begin_reconcile() {
         std::uint64_t counter = 0;
         {
             std::lock_guard lock(mutex_);
-            counter = ++cl_ord_counter_;
+            counter = ++halt_counter_;
         }
         try {
-            request.cl_ord_id = make_cl_ord_id("halt-", counter);
+            request.cl_ord_id = make_cl_ord_id(halt_prefix_, counter);
             request.scope = MassCancel::Scope::All;
             if (client_.mass_cancel(request)) {
                 logger_.warn("mass cancel sent on reconnect: " + request.cl_ord_id);
@@ -342,10 +323,10 @@ void Reconciler::raise(Halt::Reason reason, std::string detail) {
         std::uint64_t counter = 0;
         {
             std::lock_guard lock(mutex_);
-            counter = ++cl_ord_counter_;
+            counter = ++halt_counter_;
         }
         try {
-            request.cl_ord_id = make_cl_ord_id("halt-", counter);
+            request.cl_ord_id = make_cl_ord_id(halt_prefix_, counter);
             request.scope = MassCancel::Scope::All;
             if (client_.mass_cancel(request)) {
                 logger_.warn("mass cancel sent: " + request.cl_ord_id);
