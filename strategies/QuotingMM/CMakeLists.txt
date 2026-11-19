@@ -1,6 +1,7 @@
 add_library(cpm_quoting_mm
   src/quoting_model.cpp
   src/quoting_mm.cpp
+  src/quoting_history.cpp
   # The REST kline reader, and the once-per-window warmup the strategy is
   # built from: its opening price and its sigma.
   src/quoting_klines.cpp

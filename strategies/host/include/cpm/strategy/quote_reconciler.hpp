@@ -21,7 +21,7 @@ struct DesiredQuotes {
 
 struct QuoteSettings {
     std::string symbol;
-    int requote_threshold_ticks = 1;
+    int requote_threshold_ticks = 1;  // 0 replaces on any grid-price change
 };
 
 // Order lifecycle only. Pricing belongs to the calling strategy. Extracted

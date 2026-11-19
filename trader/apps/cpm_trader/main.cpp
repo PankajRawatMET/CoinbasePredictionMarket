@@ -643,12 +643,6 @@ int main(int argc, char** argv) {
                 logger.info("  " + instrument + " -> " + mapping.symbol + ", tick " +
                             cpm::format_scaled(mapping.tick_size, cpm::binance::kScale));
             }
-            // Said out loud because it is the one place this daemon asks the
-            // reference venue a question over HTTP rather than listening to
-            // it: one public GET per quoted window, no credential.
-            logger.info("reference history https://" + reference.rest.host + ":" +
-                        std::to_string(reference.rest.port) +
-                        "/fapi/v1/klines, read once per quoted window");
         }
 
         options.limits.max_quantity = args.max_order_qty;
@@ -668,15 +662,37 @@ int main(int argc, char** argv) {
 
         cpm::strategy::StrategyRegistry registry;
         cpm::strategy::register_crypto_mm(registry);
-        // QuotingMM reads its sigma and its opening price from the venue's
-        // kline history once per window, so it is built against the same
-        // mapping the reference feed uses and the REST endpoint beside it.
         cpm::strategy::QuotingMmVenue quoting_venue;
         quoting_venue.symbols = reference.symbols;
-        quoting_venue.host = reference.rest.host;
-        quoting_venue.port = reference.rest.port;
-        // The same trust settings as the stream: one venue, one CA bundle.
-        quoting_venue.ca_file = options.reference.ca_file;
+        if (const char* configured = std::getenv("CPM_QUOTING_HISTORY_URL")) {
+            std::string url(configured);
+            cpm::binance::ReferenceFeed::Options endpoint;
+            if ((!url.starts_with("http://") && !url.starts_with("https://")) ||
+                url.find_first_of(" \t\r\n?#@") != std::string::npos) {
+                quoting_venue.configuration_error = "invalid CPM_QUOTING_HISTORY_URL";
+            } else {
+                const auto authority = url.find("://") + 3;
+                const auto prefix = url.starts_with("https://") ? "wss://" : "ws://";
+                if (url.find('/', authority) == std::string::npos) url += '/';
+                const auto error = cpm::binance::parse_ws_url(prefix + url.substr(authority), endpoint);
+                if (!error.empty() || endpoint.host.empty()) {
+                    quoting_venue.configuration_error = "invalid CPM_QUOTING_HISTORY_URL: " + error;
+                } else {
+                    quoting_venue.history.host = endpoint.host;
+                    quoting_venue.history.port = endpoint.port;
+                    quoting_venue.history.tls = endpoint.tls;
+                    quoting_venue.history.path = endpoint.path;
+                    while (quoting_venue.history.path.ends_with('/')) quoting_venue.history.path.pop_back();
+                }
+            }
+            const auto& feed = options.reference;
+            if (quoting_venue.configuration_error.empty() &&
+                (!options.reference_enabled || !feed.tls ||
+                 (feed.host != "stream.binance.com" && feed.host != "data-stream.binance.vision"))) {
+                quoting_venue.configuration_error =
+                    "QuotingMM requires an enabled Binance spot reference stream";
+            }
+        }
         cpm::strategy::register_quoting_mm(registry, std::move(quoting_venue));
 
         cpm::trader::Trader trader(std::move(options), registry, logger);

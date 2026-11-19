@@ -5,6 +5,8 @@
 
 #include <cmath>
 #include <sstream>
+#include <cstdio>
+#include <thread>
 
 namespace {
 using namespace std::chrono_literals;
@@ -29,35 +31,64 @@ QuotingMmParams parameters() {
     return p;
 }
 
-// The venue, with no socket: 22 one-minute bars ending at whatever window
-// the factory asks about, alternating by a tenth of a percent so there is a
-// variance to find.
-std::string klines_json(std::int64_t end_ms) {
-    const auto quoted = [](std::int64_t scaled) {
-        return "\"" + cpm::format_scaled(scaled, kKlineScale) + "\"";
-    };
-    std::string out = "[";
-    for (int i = 21; i >= 0; --i) {
-        const std::int64_t open_ms = end_ms - static_cast<std::int64_t>(i) * 60000;
-        const std::int64_t price = kSpot + (i % 2 ? kSpot / 1000 : 0);
-        if (out.size() > 1) out += ",";
-        out += "[" + std::to_string(open_ms) + "," + quoted(price) + "," + quoted(price) + "," +
-               quoted(price) + "," + quoted(price) + ",\"1\"," + std::to_string(open_ms + 59999) +
-               ",\"1\",1,\"0\",\"0\",\"0\"]";
-    }
-    return out + "]";
+std::string utc(PricingSecond t) {
+    const auto day = std::chrono::floor<std::chrono::days>(t);
+    const std::chrono::year_month_day date{day};
+    const std::chrono::hh_mm_ss time{t - day};
+    char out[40];
+    std::snprintf(out, sizeof(out), "%04d-%02u-%02uT%02d:%02d:%02dZ",
+                  int(date.year()), unsigned(date.month()), unsigned(date.day()),
+                  int(time.hours().count()), int(time.minutes().count()), int(time.seconds().count()));
+    return out;
 }
 
-QuotingMmVenue venue_for_tests() {
+QuotingMmVenue venue_for_tests(PricingSecond as_of = std::chrono::floor<std::chrono::seconds>(
+                                   cpm::md::parse_ticker(kSymbol)->window_end - 600s),
+                             std::string reference_symbol = "BTCUSDT") {
     QuotingMmVenue venue;
-    cpm::binance::Mapping mapping;
-    mapping.symbol = "BTCUSDT";
-    mapping.tick_size = 10000000;  // 0.1
-    venue.symbols = {{"BTCD15M", mapping}};
-    venue.fetch = [](const cpm::HttpsRequest& http) {
-        const auto at = http.query.find("endTime=");
-        if (at == std::string::npos) return cpm::HttpsResponse{400, "", "no endTime"};
-        return cpm::HttpsResponse{200, klines_json(std::stoll(http.query.substr(at + 8))), ""};
+    venue.symbols = {{"BTCD15M", {"BTCUSDT", 1000000}}};
+    venue.history.host = "history";
+    venue.fetch = [as_of, symbol = std::move(reference_symbol)](const cpm::HttpsRequest& http) {
+        if (http.path == "/v1/midpoints") {
+            const auto start = std::chrono::floor<std::chrono::minutes>(as_of);
+            if (http.query != "symbol=" + symbol + "&start=" + utc(start) + "&end=" + utc(as_of))
+                return cpm::HttpsResponse{400, "", "unexpected midpoint request"};
+            std::ostringstream out;
+            out << R"({"symbol":")" << symbol << R"(","start":")" << utc(start)
+                << R"(","end_exclusive":")" << utc(as_of) << R"(","samples":[)";
+            for (auto time = PricingSecond(start); time < as_of; time += 1s) {
+                if (time != start) out << ',';
+                out << R"({"time":")" << utc(time) << R"(","mid":100,"quote_age_seconds":0.5})";
+            }
+            out << "]}";
+            return cpm::HttpsResponse{200, out.str(), ""};
+        }
+        const auto window = http.query.find("window_open=");
+        if (http.path != "/v1/features" || window == std::string::npos ||
+            !http.query.starts_with("symbol=" + symbol + "&as_of=" + utc(as_of)))
+            return cpm::HttpsResponse{400, "", "unexpected request"};
+        std::ostringstream out;
+        out << R"({"symbol":")" << symbol
+            << R"(","feature_version":"mid-boundary-v1","history_complete":true,)"
+            << R"("max_quote_age_seconds":5,"fast_variance":0.00000004,"last_second_mid":100,)"
+            << R"("as_of":")" << utc(as_of) << R"(","last_second_timestamp":")" << utc(as_of - 1s)
+            << R"(","fast_variance_as_of":")" << utc(as_of - 1s)
+            << R"(","reference":{"window_open":")" << http.query.substr(window + 12)
+            << R"(","price":100,"valid":true,"valid_sample_count":60},"gk_minute_variances":[)";
+        const auto minute = std::chrono::floor<std::chrono::minutes>(as_of);
+        for (int i = 120; i > 0; --i) {
+            if (i != 120) out << ',';
+            out << R"({"variance":0.0000024,"valid_sample_count":60,"minute_start":")"
+                << utc(minute - std::chrono::minutes(i)) << R"("})";
+        }
+        out << ']';
+        if (as_of != minute) {
+            out << R"(,"partial_minute":{"minute_start":")" << utc(minute)
+                << R"(","open":100,"high":100,"low":100,"close":100,"valid_sample_count":)"
+                << (as_of - minute).count() << '}';
+        }
+        out << '}';
+        return cpm::HttpsResponse{200, out.str(), ""};
     };
     return venue;
 }
@@ -477,11 +508,9 @@ TEST(QuotingMm, SubmissionGateAndPreWireRefusalsAreRespected) {
     EXPECT_EQ(f.sent.size(), 2u);
 }
 
-TEST(QuotingMmSchema, DefaultsTheCorrectionToOneAndRejectsUnknownOrInvalidInputs) {
+TEST(QuotingMmSchema, AcceptsLegacySettingsAndRejectsInvalidInputs) {
     StrategyRegistry registry;
     register_quoting_mm(registry, venue_for_tests());
-    // A correction of 1 prices straight off the measured sigma, so a row can
-    // be created without one. Zero is still refused: it would divide by it.
     const auto bare = registry.create({"QuotingMM", {{"symbol", kSymbol}}}, {});
     ASSERT_TRUE(bare.ok()) << bare.error;
     EXPECT_EQ(bare.values.at("correction-factor"), "1");
@@ -502,61 +531,128 @@ TEST(QuotingMmSchema, RefusesAnInstrumentTheReferenceVenueDoesNotPrice) {
     EXPECT_NE(result.error.find("binance.conf"), std::string::npos) << result.error;
 }
 
-TEST(QuotingMmSchema, RefusesToBuildWhenTheVenueCannotBeReached) {
+TEST(QuotingMmHistory, RejectsAnIncompleteResponse) {
+    const auto as_of = std::chrono::floor<std::chrono::seconds>(
+        cpm::md::parse_ticker(kSymbol)->window_end - 600s);
+    const auto result = fetch_pricing_history({}, [](const cpm::HttpsRequest&) {
+        return cpm::HttpsResponse{200, R"({"history_complete":false})", ""};
+    }, "BTCUSDT", as_of, as_of - 300s, as_of + 540s);
+    EXPECT_NE(result.error.find("incomplete"), std::string::npos);
+}
+
+TEST(QuotingMmHistory, SeedsVolatilityAndUsesSettlementAverageWithoutOffset) {
+    const auto end = std::chrono::floor<std::chrono::seconds>(cpm::md::parse_ticker(kSymbol)->window_end);
+    const auto as_of = end - 60s;
+    const auto venue = venue_for_tests(as_of);
+    auto result = fetch_pricing_history(venue.history, venue.fetch, "BTCUSDT", as_of, end - 900s, as_of);
+    ASSERT_TRUE(result.error.empty()) << result.error;
+    auto& state = result.state;
+    EXPECT_NEAR(state.sigma(), 0.0002, 1e-12);
+    const auto before = state.z(100, 61, -1, 0.95, 0.001);
+    ASSERT_TRUE(before);
+    EXPECT_NEAR(*before, 0.001 / (0.95 * 0.0002 * std::sqrt(21.0)), 1e-9);
+    state.add(as_of, 101, as_of);
+    const auto transition = state.z(100, 60, 0, 0.95, 0.001);
+    ASSERT_TRUE(transition);
+    EXPECT_DOUBLE_EQ(*transition, 0);
+    const auto after = state.z(100, 59, 1, 0.95, 0.001);
+    ASSERT_TRUE(after);
+    EXPECT_GT(*after, 0);
+    EXPECT_FALSE(state.z(100, 57, 3, 0.95, 0));
+}
+
+TEST(QuotingMmHistory, BackfillsElapsedSettlementSecondsForAnotherCoin) {
+    const auto end = std::chrono::floor<std::chrono::seconds>(cpm::md::parse_ticker(kSymbol)->window_end);
+    const auto as_of = end - 32s;
+    const auto venue = venue_for_tests(as_of, "ETHUSDT");
+    const auto result = fetch_pricing_history(venue.history, venue.fetch, "ETHUSDT", as_of,
+                                              end - 900s, end - 60s);
+    ASSERT_TRUE(result.error.empty()) << result.error;
+    EXPECT_EQ(result.state.settlement_count, 28);
+    EXPECT_DOUBLE_EQ(result.state.settlement_sum, 2800);
+    EXPECT_EQ(result.state.minute_count, 28);
+    const auto z = result.state.z(100, 32, 28, 0.95, 0.002);
+    ASSERT_TRUE(z);
+    EXPECT_DOUBLE_EQ(*z, 0);
+}
+
+TEST(QuotingMmCalibration, UsesTheMedianAfterTwoHundredDistinctSecondsAndExpiresIt) {
+    PricingCalibration calibration;
+    const auto start = std::chrono::floor<std::chrono::seconds>(cpm::md::parse_ticker(kSymbol)->window_end);
+    for (int i = 0; i < 199; ++i) {
+        calibration.update(start + std::chrono::seconds(i), 0.001, 0.001, student_t4_cdf(0.5));
+    }
+    EXPECT_DOUBLE_EQ(calibration.correction, 0.95);
+    calibration.update(start + 198s, 0.001, 0.001, student_t4_cdf(0.5));
+    EXPECT_EQ(calibration.corrections.size(), 199u);
+    calibration.update(start + 199s, 0.001, 0.001, student_t4_cdf(0.5));
+    EXPECT_NEAR(calibration.correction, 2, 1e-10);
+    calibration.expire(start + 2h);
+    EXPECT_DOUBLE_EQ(calibration.correction, 0.95);
+}
+
+TEST(QuotingMmHost, WithdrawsOnMissingLiveBoundaryAndBootstrapsAgainOnRecoveryAndRoll) {
+    Fixture fixture;
     StrategyRegistry registry;
-    auto venue = venue_for_tests();
-    venue.fetch = [](const cpm::HttpsRequest&) {
-        return cpm::HttpsResponse{0, "", "connection refused"};
+    const auto as_of = std::chrono::floor<std::chrono::seconds>(fixture.now);
+    auto venue = venue_for_tests(as_of);
+    venue.fetch = [as_of, first = venue.fetch, recovered = venue_for_tests(as_of + 1s).fetch,
+                   rolled = venue_for_tests(as_of + 15min).fetch](const cpm::HttpsRequest& request) {
+        if (request.query.find("&as_of=" + utc(as_of + 1s)) != std::string::npos) return recovered(request);
+        if (request.query.find("&as_of=" + utc(as_of + 15min)) != std::string::npos) return rolled(request);
+        return first(request);
     };
     register_quoting_mm(registry, std::move(venue));
-    const auto result =
-        registry.create({"QuotingMM", {{"symbol", kSymbol}, {"correction-factor", "1"}}}, {});
-    EXPECT_FALSE(result.ok());
-    EXPECT_NE(result.error.find("connection refused"), std::string::npos) << result.error;
-}
-
-TEST(QuotingMmSchema, TakesItsSigmaAndOpeningFromTheWindowsKlines) {
-    StrategyRegistry registry;
-    register_quoting_mm(registry, venue_for_tests());
-    const auto result =
-        registry.create({"QuotingMM", {{"symbol", kSymbol}, {"correction-factor", "1"}}}, {});
-    ASSERT_TRUE(result.ok()) << result.error;
-    const auto status = result.strategy->status();
-    // 12:15 window end, so the window opened at 12:00.
-    EXPECT_EQ(status.diagnostics.at("Sigma source"),
-              "20m of 1m klines to 2026-11-11 12:00:00Z");
-    EXPECT_NE(status.diagnostics.at("Sigma / sqrt(second)"), "0.00000000");
-}
-
-TEST(QuotingMmHost, UsesTheExistingHostWithAnEmptyBookAndResetsWindowOverridesOnRoll) {
-    Fixture venue;
-    StrategyRegistry registry;
-    register_quoting_mm(registry, venue_for_tests());
     StrategyHost::Feeds feeds;
-    feeds.book = [](const std::string&) { return std::optional<InstrumentView>{empty_book()}; };
-    feeds.reference = [&](const std::string&) { return reference(venue.now); };
+    feeds.book = [](const std::string& symbol) {
+        auto book = empty_book();
+        book.symbol = symbol;
+        return std::optional<InstrumentView>{book};
+    };
+    bool has_history = true;
+    feeds.reference = [&](const std::string&) {
+        auto view = reference(fixture.now);
+        if (!has_history) view.history.reset();
+        return view;
+    };
     std::ostringstream log;
     cpm::Logger logger(log);
-    StrategyHost host({}, registry, venue.hooks, feeds, logger);
+    StrategyHost host({}, registry, fixture.hooks, feeds, logger);
     std::string id;
-    ASSERT_TRUE(host.create({"QuotingMM", {{"symbol", kSymbol}, {"correction-factor", "1"}}},
-                            id, "BTCD15M").empty());
+    ASSERT_TRUE(host.create({"QuotingMM", {{"symbol", kSymbol}}}, id, "BTCD15M").empty());
     ASSERT_TRUE(host.start(id).empty());
-    host.tick(venue.now);
-    EXPECT_TRUE(venue.sent.empty());  // starts disarmed
+    host.tick(fixture.now);
+    EXPECT_TRUE(fixture.sent.empty());
     ASSERT_TRUE(host.arm(id).empty());
-    host.tick(venue.now);
-    EXPECT_EQ(venue.sent.size(), 2u);
+    const auto tick_until_sent = [&](std::size_t count) {
+        for (int i = 0; i < 500 && fixture.sent.size() < count; ++i) {
+            host.tick(fixture.now);
+            std::this_thread::sleep_for(1ms);
+        }
+    };
+    tick_until_sent(2);
+    ASSERT_EQ(fixture.sent.size(), 2u);
     EXPECT_FALSE(host.list().front().requires_book_updates);
-    ASSERT_TRUE(host.roll(id, "BTCD15M-BTC26NOV111230-0").empty());
-    EXPECT_TRUE(host.list().front().armed);
-    // The rolled instance prices from its own window's warmup, fetched as
-    // it was built: a roll must not impose a 20-minute delay before the new
-    // window can be quoted.
-    venue.now += 15min;
-    host.tick(venue.now);
-    EXPECT_EQ(venue.sent.size(), 4u);
     EXPECT_EQ(host.list().front().status.diagnostics.at("Sigma source"),
-              "20m of 1m klines to 2026-11-11 12:15:00Z");
+              "historical API and live midpoint samples");
+    has_history = false;
+    fixture.now += 1s;
+    host.tick(fixture.now);
+    ASSERT_EQ(fixture.cancels.size(), 2u);
+    EXPECT_NE(host.list().front().status.reason.find("missing Binance midpoint"), std::string::npos);
+    has_history = true;
+    for (const auto& cancel : fixture.cancels) {
+        ExecutionReport report;
+        report.cl_ord_id = cancel.cl_ord_id;
+        report.orig_cl_ord_id = cancel.orig_cl_ord_id;
+        report.exec_type = ExecType::Canceled;
+        host.on_report(report);
+    }
+    tick_until_sent(4);
+    ASSERT_EQ(fixture.sent.size(), 4u);
+    ASSERT_TRUE(host.roll(id, "BTCD15M-BTC26NOV111230-0").empty());
+    fixture.now = as_of + 15min;
+    tick_until_sent(6);
+    EXPECT_EQ(fixture.sent.size(), 6u);
 }
 }  // namespace

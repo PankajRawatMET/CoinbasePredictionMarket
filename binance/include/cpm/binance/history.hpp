@@ -20,6 +20,9 @@ struct ReferenceSample {
     std::int64_t close = 0;
     std::int64_t low = 0;
     std::int64_t high = 0;
+    // Receipt timestamps are available only for live observations.
+    HistoryClock::time_point close_at{};
+    std::int64_t boundary_mid = 0;
 };
 
 using HistoryView = std::vector<ReferenceSample>;

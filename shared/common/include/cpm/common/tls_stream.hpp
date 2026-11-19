@@ -29,6 +29,7 @@ public:
         // Empty means the system trust store, as both FIX clients use.
         std::string ca_file;
         std::chrono::milliseconds connect_timeout{15000};
+        bool bounded_io = false;
     };
 
     enum class Read {
@@ -59,6 +60,8 @@ public:
 private:
     void* ctx_ = nullptr;  // SSL_CTX*, kept opaque so OpenSSL stays in the .cpp
     void* bio_ = nullptr;  // BIO*
+    bool bounded_io_ = false;
+    std::chrono::milliseconds timeout_{};
 };
 
 }  // namespace cpm

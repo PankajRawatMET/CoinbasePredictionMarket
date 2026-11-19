@@ -7,7 +7,9 @@
 
 #include <poll.h>
 
+#include <algorithm>
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
 
 namespace cpm {
@@ -19,6 +21,36 @@ std::string openssl_error() {
     char buffer[256];
     ERR_error_string_n(code, buffer, sizeof(buffer));
     return buffer;
+}
+
+using Deadline = std::chrono::steady_clock::time_point;
+
+bool wait_for_bio(BIO* bio, Deadline deadline) {
+    while (std::chrono::steady_clock::now() < deadline) {
+        int fd = -1;
+        if (BIO_get_fd(bio, &fd) <= 0 || fd < 0) return false;
+        const short events = BIO_should_read(bio) ? POLLIN : POLLOUT;
+        pollfd watch{fd, events, 0};
+        const auto left = std::chrono::ceil<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now()).count();
+        const int result = ::poll(&watch, 1, static_cast<int>(std::clamp<std::int64_t>(left, 0, 60000)));
+        if (result > 0) return true;
+        if (result < 0 && errno != EINTR) return false;
+    }
+    return false;
+}
+
+bool connect_bio(BIO* bio, bool tls, bool bounded, Deadline deadline) {
+    if (bounded) BIO_set_nbio(bio, 1);
+    while (BIO_do_connect(bio) <= 0) {
+        if (!bounded || !BIO_should_retry(bio) || !wait_for_bio(bio, deadline)) return false;
+    }
+    if (tls) {
+        while (BIO_do_handshake(bio) <= 0) {
+            if (!bounded || !BIO_should_retry(bio) || !wait_for_bio(bio, deadline)) return false;
+        }
+    }
+    return true;
 }
 
 }  // namespace
@@ -35,6 +67,9 @@ void TlsStream::close() {
 std::string TlsStream::connect(const Options& options) {
     close();
     if (options.host.empty()) return "no host to connect to";
+    bounded_io_ = options.bounded_io;
+    timeout_ = options.connect_timeout;
+    const auto deadline = std::chrono::steady_clock::now() + timeout_;
 
     const auto where = options.host + ":" + std::to_string(options.port);
     BIO* bio = nullptr;
@@ -78,13 +113,9 @@ std::string TlsStream::connect(const Options& options) {
             return "could not set the TLS hostname: " + openssl_error();
         }
         BIO_set_conn_hostname(bio, where.c_str());
-        if (BIO_do_connect(bio) <= 0) {
+        if (!connect_bio(bio, true, bounded_io_, deadline)) {
             close();
-            return "could not connect to " + where + ": " + openssl_error();
-        }
-        if (BIO_do_handshake(bio) <= 0) {
-            close();
-            return "the TLS handshake with " + where + " failed: " + openssl_error();
+            return "could not connect or finish TLS with " + where + ": " + openssl_error();
         }
         if (const long verified = SSL_get_verify_result(ssl); verified != X509_V_OK) {
             const std::string why = X509_verify_cert_error_string(verified);
@@ -97,7 +128,7 @@ std::string TlsStream::connect(const Options& options) {
     bio = BIO_new_connect(where.c_str());
     if (bio == nullptr) return "could not create the connection: " + openssl_error();
     bio_ = bio;
-    if (BIO_do_connect(bio) <= 0) {
+    if (!connect_bio(bio, false, bounded_io_, deadline)) {
         close();
         return "could not connect to " + where + ": " + openssl_error();
     }
@@ -107,6 +138,7 @@ std::string TlsStream::connect(const Options& options) {
 std::string TlsStream::write(std::string_view data) {
     if (bio_ == nullptr) return "not connected";
     auto* bio = static_cast<BIO*>(bio_);
+    const auto deadline = std::chrono::steady_clock::now() + timeout_;
     std::size_t sent = 0;
     while (sent < data.size()) {
         const int wrote = BIO_write(bio, data.data() + sent, static_cast<int>(data.size() - sent));
@@ -114,7 +146,10 @@ std::string TlsStream::write(std::string_view data) {
             sent += static_cast<std::size_t>(wrote);
             continue;
         }
-        if (BIO_should_retry(bio)) continue;
+        if (BIO_should_retry(bio)) {
+            if (!bounded_io_ || wait_for_bio(bio, deadline)) continue;
+            return "timed out sending request";
+        }
         return "could not send: " + openssl_error();
     }
     return {};
@@ -154,8 +189,8 @@ TlsStream::Read TlsStream::read(std::string& out, std::chrono::milliseconds wait
         out.append(chunk, static_cast<std::size_t>(got));
         return Read::Data;
     }
-    if (got == 0) return Read::Closed;
     if (BIO_should_retry(bio)) return Read::Timeout;
+    if (got == 0) return Read::Closed;
     error = "the connection failed: " + openssl_error();
     return Read::Error;
 }

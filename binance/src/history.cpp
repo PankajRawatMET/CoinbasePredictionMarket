@@ -11,10 +11,12 @@ void ReferenceHistory::observe(std::int64_t mid, HistoryClock::time_point at) {
     if (!samples_.empty() && second == samples_.back().second) {
         auto& sample = samples_.back();
         sample.close = mid;
+        sample.close_at = at;
+        if (at == second) sample.boundary_mid = mid;
         sample.low = std::min(sample.low, mid);
         sample.high = std::max(sample.high, mid);
     } else {
-        samples_.push_back({second, at, mid, mid, mid, mid});
+        samples_.push_back({second, at, mid, mid, mid, mid, at, at == second ? mid : 0});
     }
     while (!samples_.empty() &&
            (samples_.size() > kMaxSamples || second - samples_.front().second > kRetention)) {

@@ -49,6 +49,7 @@ bool QuoteReconciler::worth_replacing(const LiveQuote& live, const Quote& desire
     const Price tick = tick_at(live.price);
     const Price moved = live.price > desired.price ? live.price - desired.price
                                                    : desired.price - live.price;
+    if (settings_.requote_threshold_ticks == 0) return moved > 0;
     // A flicker of less than the threshold is left alone, so the strategy does
     // not cancel and replace on every update.
     return moved >= tick * std::max(1, settings_.requote_threshold_ticks);

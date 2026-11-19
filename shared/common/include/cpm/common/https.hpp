@@ -25,6 +25,7 @@ struct HttpsRequest {
     // A CA bundle to verify the server against. Empty means the system trust
     // store, which is what both FIX clients use against the sandbox.
     std::string ca_file;
+    bool tls = true;
 };
 
 struct HttpsResponse {

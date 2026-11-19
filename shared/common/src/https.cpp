@@ -73,8 +73,10 @@ HttpsResponse https_get(const HttpsRequest& request) {
     TlsStream::Options transport;
     transport.host = request.host;
     transport.port = request.port;
+    transport.tls = request.tls;
     transport.ca_file = request.ca_file;
     transport.connect_timeout = request.timeout;
+    transport.bounded_io = true;
     if (auto failed = stream.connect(transport); !failed.empty()) {
         response.error = failed;
         return response;
@@ -82,7 +84,9 @@ HttpsResponse https_get(const HttpsRequest& request) {
 
     std::string wire = "GET " + request.path;
     if (!request.query.empty()) wire += "?" + request.query;
-    wire += " HTTP/1.1\r\nHost: " + request.host + "\r\n";
+    wire += " HTTP/1.1\r\nHost: " + request.host;
+    if (request.port != (request.tls ? 443 : 80)) wire += ":" + std::to_string(request.port);
+    wire += "\r\n";
     for (const auto& [name, value] : request.headers) wire += name + ": " + value + "\r\n";
     // One request per connection: no keep-alive to manage, and the close is
     // how the body ends when there is no length.
