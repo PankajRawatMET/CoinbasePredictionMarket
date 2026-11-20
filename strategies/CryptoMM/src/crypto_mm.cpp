@@ -13,17 +13,6 @@ using cpm::oms::Side;
 constexpr Price kMinPrice = 1;              // 0.001
 constexpr Price kMaxPrice = kPriceOne - 1;  // 0.999
 
-// The mid of a CPM book, by the same rule desired_quotes uses: both sides,
-// with the YES ask implied by the best NO bid. Nullopt when there is not
-// one, which the guard reads as "nothing to measure against".
-std::optional<Price> market_mid(const InstrumentView& book) {
-    if (!book.book_valid || book.yes.empty() || book.no.empty()) return std::nullopt;
-    const Price best_bid = book.yes.front().price;
-    const Price best_ask = kPriceOne - book.no.front().price;
-    if (best_ask <= best_bid) return std::nullopt;
-    return (best_bid + best_ask) / 2;
-}
-
 // Is `ask` more than `limit` grid rungs above `bid`? That is the BADQ test.
 //
 // Walked rather than subtracted, because the grid is tapered - 0.001 below
@@ -256,20 +245,29 @@ void QuoteManager::on_reference(const cpm::binance::ReferenceView& reference,
     (void)now;
     reference_ = reference;
     if (params_.mid_move_threshold_ticks <= 0) return;  // the guard is off
-    if (!reference.usable() || !reference_at_quote_) return;
+    if (!reference.usable()) {
+        // A gap in the feed is not one update: the stale path withdraws on
+        // its own, and the first price after it starts a fresh comparison.
+        previous_reference_.reset();
+        return;
+    }
+    const auto previous = previous_reference_;
+    previous_reference_ = reference.mid;
+    if (!previous) return;
 
-    const Price moved = reference.mid > *reference_at_quote_
-                            ? reference.mid - *reference_at_quote_
-                            : *reference_at_quote_ - reference.mid;
+    // One update against the one before it (B-Q2), not a drift summed
+    // since we priced.
+    const Price moved = reference.mid > *previous ? reference.mid - *previous
+                                                  : *previous - reference.mid;
     const Price allowed = params_.mid_move_threshold_ticks * reference.tick_size;
     if (moved < allowed) return;
-    if (held_) return;  // already out; nothing to do until this market moves
+    if (held_) return;  // already out; nothing to do until this market updates
 
     held_ = true;
-    mid_at_withdraw_ = last_market_mid_;
+    book_time_at_withdraw_ = last_book_time_;
     const std::string why = "the reference moved " +
                             std::to_string(moved / reference.tick_size) +
-                            " ticks since we priced; waiting for this market";
+                            " ticks in one update; waiting for this market";
     last_reason_ = why;
     if (hooks_.log) hooks_.log(why);
     // Cancel, not abandon: these orders are still live on an open market and
@@ -282,7 +280,7 @@ void QuoteManager::on_market(const InstrumentView& book, const Position& positio
                              Clock::time_point now) {
     (void)now;
     ++passes_;
-    last_market_mid_ = market_mid(book);
+    last_book_time_ = book.book_time;
 
     // The guard, before anything is priced. Both of these end the pass: a
     // strategy with no trustworthy reference must not quote at all, which
@@ -302,19 +300,18 @@ void QuoteManager::on_market(const InstrumentView& book, const Position& positio
             return;
         }
         if (held_) {
-            // Out until this market reprices. Any move of a tick will do:
-            // what matters is that CPM has absorbed what the reference
-            // already knows (B-Q3).
-            const bool moved = last_market_mid_ && mid_at_withdraw_ &&
-                               *last_market_mid_ != *mid_at_withdraw_;
-            if (!moved) {
-                last_reason_ = "waiting for this market to reprice after the reference moved";
+            // Out until this market's book updates. Any update will do; the
+            // same book shown again on a reference wake is not one.
+            const bool updated = !book_time_at_withdraw_ ||
+                                 *last_book_time_ != *book_time_at_withdraw_;
+            if (!updated) {
+                last_reason_ = "waiting for this market to update after the reference moved";
                 ++passes_without_quotes_;
                 return;
             }
             held_ = false;
-            mid_at_withdraw_.reset();
-            if (hooks_.log) hooks_.log("this market repriced; quoting again");
+            book_time_at_withdraw_.reset();
+            if (hooks_.log) hooks_.log("this market updated; quoting again");
         }
     }
 
@@ -350,14 +347,6 @@ void QuoteManager::on_market(const InstrumentView& book, const Position& positio
     }
     reconcile_side(Side::Buy, desired.bid, bid_, params_.symbol);
     reconcile_side(Side::Sell, desired.ask, ask_, params_.symbol);
-
-    // Whatever is resting now was priced against this reference, so the next
-    // breach is measured from here (B-Q9).
-    if ((bid_ || ask_) && reference_.usable()) {
-        reference_at_quote_ = reference_.mid;
-    } else if (!bid_ && !ask_) {
-        reference_at_quote_.reset();
-    }
 }
 
 // --- CryptoMM as a hosted strategy ----------------------------------------
@@ -431,8 +420,8 @@ ParamSchema crypto_mm_schema() {
     speed_bump.default_value = "0";
     speed_bump.min = "0";
     speed_bump.help = "cancel and stand aside when the reference venue's mid moves this many "
-                      "of its own ticks from where it was when we priced; 0 is off. BTCUSDT "
-                      "ticks at 0.01, so 2500 is a $25 move";
+                      "of its own ticks in one update, and quote again on this market's next "
+                      "book update; 0 is off. BTCUSDT ticks at 0.1, so 10 is a $1 move";
     schema.push_back(std::move(speed_bump));
 
     ParamSpec badq;
