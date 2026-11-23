@@ -26,17 +26,22 @@ or futures.
 ## Startup and recovery
 
 At startup and on each window roll, QuotingMM fetches `/v1/features` off the
-order loop. The response supplies the pre-open 60-second reference average,
-120 completed minute variances, fast variance, partial-minute candle, and the
-last sampled midpoint. A restart during the final minute also reads elapsed
-settlement samples from `/v1/midpoints`.
+order loop. It requests the current UTC minute boundary, which needs
+historical samples only through the preceding minute. If the API reports
+incomplete history, QuotingMM tries the previous boundary if it falls within
+the trading window and the live buffer reaches it. The response supplies the
+pre-open 60-second reference average, 120 completed minute variances,
+fast variance, and the last sampled midpoint.
 
 Live sampling picks the latest observed midpoint at or before each UTC
 second boundary, subject to the API's maximum quote age. The live spot
 book-ticker stream is timestamped on receipt by the daemon. Historical
 sampling uses recorder event time. Both sides need synchronized clocks.
-QuotingMM uses the live history buffered while the request runs and continues
-strictly after the API's last timestamp.
+QuotingMM continues strictly after the API's last timestamp using buffered
+live midpoints, including elapsed settlement samples during the final minute.
+On a cold start it waits until the live buffer reaches a minute boundary
+that the API can serve. Pinning the reference symbol lets the daemon collect
+samples before a strategy starts.
 
 Incomplete or invalid history, stale live data, and gaps prevent quotes.
 QuotingMM withdraws resting orders on data loss and retries initialization

@@ -249,12 +249,10 @@ bool QuotingMm::update_history(PricingSecond now) {
             return false;
         }
         history_ = std::move(result.state);
-        cutoff_.reset();
     }
     if (history_) {
         if (now < history_->last_second) {
             history_.reset();
-            cutoff_ = now;
             history_hold_ = true;
             stand_aside("trader clock moved behind pricing history; reloading history");
             return false;
@@ -265,7 +263,7 @@ bool QuotingMm::update_history(PricingSecond now) {
                 ? boundary_mid(*reference_.history, next, history_->max_age) : std::nullopt;
             if (!mid) {
                 history_.reset();
-                cutoff_ = now;
+                retry_after_ = steady_clock::now() + seconds(2);
                 history_hold_ = true;
                 stand_aside("missing Binance midpoint at a required second; reloading history");
                 return false;
@@ -286,11 +284,21 @@ bool QuotingMm::update_history(PricingSecond now) {
     }
     if (!pending_history_.valid() && steady_clock::now() >= retry_after_) {
         const auto window_open = floor<seconds>(ticker_->window_end) - minutes(15);
-        if (!cutoff_) cutoff_ = now;
+        const PricingSecond as_of = floor<minutes>(now);
+        const auto& live = reference_.history;
+        if (!live || live->empty() || live->front().second > as_of) {
+            stand_aside("waiting for live Binance history to reach a published minute boundary");
+            return false;
+        }
+        const auto previous = as_of - minutes(1);
+        const bool can_fallback = previous >= window_open && live->front().second <= previous;
         auto task = std::packaged_task<HistoryResult()>(
             [request = params_.history_request, fetch = params_.history_fetch,
-             symbol = params_.history_symbol, as_of = *cutoff_, window_open, final_start] {
-                return fetch_pricing_history(request, fetch, symbol, as_of, window_open, final_start);
+             symbol = params_.history_symbol, as_of, window_open, final_start, previous, can_fallback] {
+                auto result = fetch_pricing_history(request, fetch, symbol, as_of, window_open, final_start);
+                if (result.incomplete && can_fallback)
+                    return fetch_pricing_history(request, fetch, symbol, previous, window_open, final_start);
+                return result;
             });
         auto result = task.get_future();
         try {
@@ -356,10 +364,7 @@ void QuotingMm::on_reference(const cpm::binance::ReferenceView& reference, Clock
     if (!reference.usable() || reference.mid <= 0) {
         if (params_.history_fetch) {
             history_hold_ = true;
-            if (history_) {
-                history_.reset();
-                cutoff_.reset();
-            }
+            history_.reset();
         }
         fair_.reset();
         z_.reset();

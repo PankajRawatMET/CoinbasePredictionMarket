@@ -91,7 +91,6 @@ private:
     decltype(StrategyHooks::resting_orders) resting_orders_;
     std::optional<PricingHistory> history_;
     std::future<HistoryResult> pending_history_;
-    std::optional<PricingSecond> cutoff_;
     std::chrono::steady_clock::time_point retry_after_{};
     bool history_hold_ = false;
     PricingSecond pricing_second_{};

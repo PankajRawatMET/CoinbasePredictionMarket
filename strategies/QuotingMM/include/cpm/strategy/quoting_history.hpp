@@ -32,6 +32,7 @@ struct PricingHistory {
 struct HistoryResult {
     PricingHistory state;
     std::string error;
+    bool incomplete = false;
 };
 
 HistoryResult fetch_pricing_history(cpm::HttpsRequest request, const HttpsFetch& fetch,

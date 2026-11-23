@@ -537,7 +537,7 @@ TEST(QuotingMmHistory, RejectsAnIncompleteResponse) {
     const auto result = fetch_pricing_history({}, [](const cpm::HttpsRequest&) {
         return cpm::HttpsResponse{200, R"({"history_complete":false})", ""};
     }, "BTCUSDT", as_of, as_of - 300s, as_of + 540s);
-    EXPECT_NE(result.error.find("incomplete"), std::string::npos);
+    EXPECT_NE(result.error.find("expected history_complete=true"), std::string::npos) << result.error;
 }
 
 TEST(QuotingMmHistory, SeedsVolatilityAndUsesSettlementAverageWithoutOffset) {
@@ -596,9 +596,8 @@ TEST(QuotingMmHost, WithdrawsOnMissingLiveBoundaryAndBootstrapsAgainOnRecoveryAn
     StrategyRegistry registry;
     const auto as_of = std::chrono::floor<std::chrono::seconds>(fixture.now);
     auto venue = venue_for_tests(as_of);
-    venue.fetch = [as_of, first = venue.fetch, recovered = venue_for_tests(as_of + 1s).fetch,
+    venue.fetch = [as_of, first = venue.fetch,
                    rolled = venue_for_tests(as_of + 15min).fetch](const cpm::HttpsRequest& request) {
-        if (request.query.find("&as_of=" + utc(as_of + 1s)) != std::string::npos) return recovered(request);
         if (request.query.find("&as_of=" + utc(as_of + 15min)) != std::string::npos) return rolled(request);
         return first(request);
     };
@@ -625,7 +624,8 @@ TEST(QuotingMmHost, WithdrawsOnMissingLiveBoundaryAndBootstrapsAgainOnRecoveryAn
     EXPECT_TRUE(fixture.sent.empty());
     ASSERT_TRUE(host.arm(id).empty());
     const auto tick_until_sent = [&](std::size_t count) {
-        for (int i = 0; i < 500 && fixture.sent.size() < count; ++i) {
+        const auto deadline = std::chrono::steady_clock::now() + 3s;
+        while (fixture.sent.size() < count && std::chrono::steady_clock::now() < deadline) {
             host.tick(fixture.now);
             std::this_thread::sleep_for(1ms);
         }
@@ -654,5 +654,36 @@ TEST(QuotingMmHost, WithdrawsOnMissingLiveBoundaryAndBootstrapsAgainOnRecoveryAn
     fixture.now = as_of + 15min;
     tick_until_sent(6);
     EXPECT_EQ(fixture.sent.size(), 6u);
+}
+
+TEST(QuotingMmHistory, SeedsFromPublishedMinutesAndRequiresLiveCoverage) {
+    const auto as_of = std::chrono::floor<std::chrono::seconds>(
+        cpm::md::parse_ticker(kSymbol)->window_end - 600s);
+    for (const bool publication_delayed : {false, true}) {
+        SCOPED_TRACE(publication_delayed);
+        auto params = parameters();
+        params.history_symbol = "BTCUSDT";
+        params.calibration = std::make_shared<PricingCalibration>();
+        const auto published = venue_for_tests(as_of - (publication_delayed ? 1min : 0min));
+        params.history_fetch = [as_of, publication_delayed, fetch = published.fetch](
+                                   const cpm::HttpsRequest& request) {
+            if (publication_delayed && request.query.find("&as_of=" + utc(as_of)) != std::string::npos)
+                return cpm::HttpsResponse{200, R"({"history_complete":false})", ""};
+            return fetch(request);
+        };
+        Fixture fixture(params);
+        fixture.now = as_of + 28s;
+        fixture.strategy->on_reference(reference(fixture.now, kSpot, 10), fixture.now);
+        fixture.strategy->on_market(fixture.book, fixture.position, fixture.now);
+        EXPECT_TRUE(fixture.sent.empty());
+        EXPECT_NE(fixture.strategy->status().reason.find("minute boundary"), std::string::npos);
+        const auto deadline = std::chrono::steady_clock::now() + 1s;
+        while (fixture.sent.empty() && std::chrono::steady_clock::now() < deadline) {
+            fixture.pass();
+            std::this_thread::sleep_for(1ms);
+        }
+        EXPECT_EQ(fixture.sent.size(), 2u) << fixture.strategy->status().reason;
+        EXPECT_FALSE(fixture.last_model_line().empty());
+    }
 }
 }  // namespace

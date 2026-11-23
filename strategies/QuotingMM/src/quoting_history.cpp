@@ -84,10 +84,18 @@ HistoryResult fetch_pricing_history(HttpsRequest request, const HttpsFetch& fetc
         request.path = prefix + "/v1/features";
         request.query = "symbol=" + symbol + "&as_of=" + utc(as_of) + "&window_open=" + utc(window_open);
         const auto payload = get(fetch, request);
-        if (!matches(payload, "feature_version", "mid-boundary-v1") ||
-            !matches(payload, "symbol", symbol) || !matches(payload, "as_of", utc(as_of)) ||
-            !flag(payload, "history_complete"))
-            throw std::runtime_error("historical features are incomplete or do not match the request");
+        const auto* complete = payload.find("history_complete");
+        if (!complete || complete->type != Type::Bool)
+            throw std::runtime_error("missing or invalid history field history_complete");
+        if (!complete->boolean)
+            return {{}, "historical features are incomplete: expected history_complete=true for " +
+                        symbol + " at " + utc(as_of), true};
+        if (!matches(payload, "feature_version", "mid-boundary-v1"))
+            throw std::runtime_error("history feature_version mismatch: expected mid-boundary-v1");
+        if (!matches(payload, "symbol", symbol))
+            throw std::runtime_error("history symbol mismatch: expected " + symbol);
+        if (!matches(payload, "as_of", utc(as_of)))
+            throw std::runtime_error("history as_of mismatch: expected " + utc(as_of));
 
         PricingHistory state;
         const auto& strike = field(payload, "reference", Type::Object);
