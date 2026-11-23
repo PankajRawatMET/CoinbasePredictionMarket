@@ -436,6 +436,109 @@ TEST(CryptoMmQuotes, StopsAtTheInventoryLimitRatherThanQuotingOneSide) {
     EXPECT_TRUE(off.bid.has_value());
 }
 
+// --- BADQ: the widest market this will lean on ---------------------------
+
+// The market the mid is taken from has to be a market. A book this wide
+// carries no price: its midpoint is arithmetic, not information.
+TEST(CryptoMmQuotes, BadqPullsBothQuotesWhileTheMarketIsTooWide) {
+    auto p = params(2);
+    p.max_quote_spread_ticks = 5;
+
+    // 0.44 / 0.98 - the vacuum of 2026-11-19 06:13, 126 rungs across.
+    const auto vacuum = desired_quotes(book(440, 20), flat(), p);
+    EXPECT_FALSE(vacuum.bid.has_value());
+    EXPECT_FALSE(vacuum.ask.has_value());
+    EXPECT_EQ(vacuum.reason,
+              "the market is 0.44 / 0.98 once our own orders are taken out, wider than the "
+              "BADQ limit of 5 ticks");
+    // Not a stop: the strategy is standing aside, not done.
+    EXPECT_FALSE(vacuum.stop);
+
+    // Nothing latches: the next book inside the limit quotes again.
+    const auto back = desired_quotes(book(500, 490), flat(), p);
+    EXPECT_TRUE(back.bid.has_value());
+    EXPECT_TRUE(back.ask.has_value());
+    EXPECT_TRUE(back.reason.empty());
+}
+
+// Without it, the same vacuum is quoted around its own midpoint - a 0.70 bid
+// for something the market had been pricing at 0.50. This is the behaviour
+// BADQ exists to stop, and it stays the default.
+TEST(CryptoMmQuotes, BadqIsOffAtZeroAndTheVacuumIsQuotedAsBefore) {
+    auto p = params(2);
+    EXPECT_EQ(p.max_quote_spread_ticks, 0) << "off unless the operator asks";
+    const auto quotes = desired_quotes(book(440, 20), flat(), p);
+    ASSERT_TRUE(quotes.bid.has_value());
+    ASSERT_TRUE(quotes.ask.has_value());
+    EXPECT_EQ(quotes.bid->price, 700);
+    EXPECT_EQ(quotes.ask->price, 720);
+}
+
+// "Wider than BADQ", so exactly BADQ is still a market.
+TEST(CryptoMmQuotes, BadqAllowsExactlyTheLimitAndRefusesOneMore) {
+    auto p = params(2);
+    p.max_quote_spread_ticks = 5;
+
+    // 0.50 / 0.55: five rungs of 0.01.
+    const auto at_limit = desired_quotes(book(500, 450), flat(), p);
+    EXPECT_TRUE(at_limit.bid.has_value()) << at_limit.reason;
+
+    // 0.50 / 0.56: six.
+    const auto over = desired_quotes(book(500, 440), flat(), p);
+    EXPECT_FALSE(over.bid.has_value());
+}
+
+// BADQ counts grid rungs, not price, because the grid is tapered. These two
+// books are the same 0.03 apart and are not the same number of ticks apart:
+// 3 in the coarse middle, 30 up where the grid is fine.
+TEST(CryptoMmQuotes, BadqCountsTicksAndNotPrice) {
+    auto p = params(2);
+    p.max_quote_spread_ticks = 5;
+
+    // 0.50 / 0.53, tick 0.01: three rungs, inside the limit.
+    const auto coarse = desired_quotes(book(500, 470), flat(), p);
+    EXPECT_TRUE(coarse.bid.has_value()) << coarse.reason;
+
+    // 0.93 / 0.96, tick 0.001: thirty rungs, outside it.
+    const auto fine = desired_quotes(book(930, 40), flat(), p);
+    EXPECT_FALSE(fine.bid.has_value());
+    EXPECT_NE(fine.reason.find("wider than the BADQ limit"), std::string::npos) << fine.reason;
+}
+
+// The one that matters, and the trap: measured on the book WITHOUT our own
+// orders. On 2026-11-19 at 06:13 the raw touch was 0.70 / 0.72 - our own pair,
+// two ticks apart - while the market behind it was 0.44 / 0.98. A BADQ read
+// off the raw book would have seen a tight market right up to the fill.
+TEST(CryptoMmQuotes, BadqIgnoresOurOwnQuotesWhenItMeasuresTheMarket) {
+    using cpm::strategy::LiveLeg;
+    auto p = params(2);
+    p.max_quote_spread_ticks = 5;
+
+    // Our 0.70 bid on top of their 0.44; our 0.72 ask - a NO bid of 0.28 -
+    // on top of their 0.98 ask, which is a NO bid of 0.02.
+    InstrumentView market;
+    market.symbol = kSym;
+    market.book_valid = true;
+    market.yes.push_back(BookLevel{700, 100});
+    market.yes.push_back(BookLevel{440, 500});
+    market.no.push_back(BookLevel{280, 100});
+    market.no.push_back(BookLevel{20, 500});
+
+    // Read raw, this book is 0.70 / 0.72 and nothing trips.
+    EXPECT_TRUE(desired_quotes(market, flat(), p).bid.has_value());
+
+    // Read as it should be, the two prices at the touch are ours and the
+    // market behind them is the vacuum.
+    const std::vector<LiveLeg> mine{{Side::Buy, "mm-1", 700, 100, false},
+                                    {Side::Sell, "mm-2", 720, 100, false}};
+    const auto guarded = desired_quotes(market, flat(), p, mine);
+    EXPECT_FALSE(guarded.bid.has_value());
+    EXPECT_FALSE(guarded.ask.has_value());
+    EXPECT_EQ(guarded.reason,
+              "the market is 0.44 / 0.98 once our own orders are taken out, wider than the "
+              "BADQ limit of 5 ticks");
+}
+
 // --- the driver, with fakes ----------------------------------------------
 
 struct Fake {
@@ -703,6 +806,55 @@ TEST(CryptoMmDriver, PlacesBothQuotesOnce) {
     fake.manager->on_market(book(500, 400), flat(), {});
     EXPECT_EQ(fake.sent.size(), placed) << "nothing moved, so nothing was re-sent";
     EXPECT_TRUE(fake.cancels.empty());
+}
+
+// "Pull the orders until it comes back in range", end to end: the quotes are
+// cancelled when the market blows out and replaced when it narrows, with
+// nothing resting in between and no operator action either way.
+TEST(CryptoMmDriver, BadqCancelsTheRestingQuotesAndPutsThemBackWhenTheMarketNarrows) {
+    auto p = params(2);
+    p.max_quote_spread_ticks = 5;
+    Fake fake(p);
+
+    // A market, quoted.
+    fake.manager->on_market(book(500, 490), flat(), {});
+    ASSERT_EQ(fake.sent.size(), 2u);
+    for (auto& order : fake.sent) fake.acknowledge(order);
+    const auto bid_id = id_of(fake.sent, Side::Buy);
+    const auto ask_id = id_of(fake.sent, Side::Sell);
+
+    // The book blows out to 0.44 / 0.98. Both quotes come off and nothing
+    // replaces them.
+    fake.manager->on_market(book(440, 20), flat(), {});
+    EXPECT_EQ(fake.sent.size(), 2u) << "it quoted into a market it should have stood out of";
+    ASSERT_EQ(fake.cancels.size(), 2u);
+    std::set<std::string> cancelled;
+    for (const auto& request : fake.cancels) cancelled.insert(request.orig_cl_ord_id);
+    EXPECT_EQ(cancelled, (std::set<std::string>{bid_id, ask_id}));
+
+    // Still wide: it does not thrash, because the quotes are already off.
+    fake.manager->on_market(book(440, 20), flat(), {});
+    EXPECT_EQ(fake.cancels.size(), 2u);
+    EXPECT_EQ(fake.sent.size(), 2u);
+
+    // It says why, once the reason is in the log at all.
+    EXPECT_TRUE(std::any_of(fake.log.begin(), fake.log.end(), [](const std::string& line) {
+        return line.find("wider than the BADQ limit of 5 ticks") != std::string::npos;
+    })) << "nothing in the log said why it stopped quoting";
+
+    // The market comes back and so does the strategy, with no prompting.
+    for (const auto& request : fake.cancels) {
+        ExecutionReport report;
+        report.cl_ord_id = request.cl_ord_id;
+        report.orig_cl_ord_id = request.orig_cl_ord_id;
+        report.exec_type = ExecType::Canceled;
+        report.status = OrdStatus::Canceled;
+        report.symbol = kSym;
+        report.side = request.side;
+        fake.manager->on_report(report);
+    }
+    fake.manager->on_market(book(500, 490), flat(), {});
+    EXPECT_EQ(fake.sent.size(), 4u) << "it did not come back when the market did";
 }
 
 TEST(CryptoMmDriver, AsksToBeStoppedAtTheInventoryLimitAndQuotesNothingMore) {
@@ -1204,9 +1356,9 @@ TEST(CryptoMmLive, QuotesRestOnTheSimulatorAndAreCancelled) {
 }
 
 // --- the pricing speed bump (B3) -----------------------------------------
-// The reference venue moves; our quotes become stale before this market
-// knows it. The guard leaves, and does not come back until this market has
-// repriced (docs/design-binance.md section 4).
+// The reference venue jumps in one update; our quotes become stale before
+// this market knows it. The guard leaves, and comes back on this market's
+// next book update.
 
 namespace {
 
@@ -1216,6 +1368,14 @@ cpm::binance::ReferenceView reference(const char* mid, bool stale = false) {
     view.stale = stale;
     view.mid = cpm::parse_scaled(mid, cpm::binance::kScale).value_or(0);
     view.tick_size = cpm::parse_scaled("0.01", cpm::binance::kScale).value_or(0);
+    return view;
+}
+
+// A book stamped as the venue's update number `n`: the guard tells a new
+// update from the same book shown again by this stamp.
+InstrumentView book_at(int n, cpm::Price yes_bid, cpm::Price no_bid) {
+    auto view = book(yes_bid, no_bid);
+    view.book_time = cpm::md::Clock::time_point{} + std::chrono::seconds(n);
     return view;
 }
 
@@ -1267,82 +1427,71 @@ TEST(CryptoMmSpeedBump, QuotesOnceTheReferenceIsThere) {
     EXPECT_EQ(fake.sent.size(), 2u);
 }
 
-TEST(CryptoMmSpeedBump, CancelsWhenTheReferenceMovesPastTheThreshold) {
-    Fake fake(guarded(2500));  // 2500 ticks of 0.01 = $25
+TEST(CryptoMmSpeedBump, CancelsWhenOneUpdateMovesPastTheThreshold) {
+    Fake fake(guarded(10));  // 10 ticks of 0.01 = $0.10
     fake.manager->on_reference(reference("67000.00"), cpm::oms::Clock::now());
-    fake.manager->on_market(book(500, 400), flat(), cpm::oms::Clock::now());
+    fake.manager->on_market(book_at(1, 500, 400), flat(), cpm::oms::Clock::now());
     ASSERT_EQ(fake.sent.size(), 2u);
     for (const auto& order : fake.sent) fake.acknowledge(order);
 
-    // $24 is inside the threshold: nothing happens, because a market maker
-    // that left on every wobble would never be in the market.
-    fake.manager->on_reference(reference("67024.00"), cpm::oms::Clock::now());
+    // 9 ticks in one update is inside the threshold.
+    fake.manager->on_reference(reference("67000.09"), cpm::oms::Clock::now());
     EXPECT_TRUE(fake.cancels.empty());
 
-    // $25 is not. Both sides come off, and on the reference's own update -
-    // no book arrived in between, which is B-Q5's whole point.
-    fake.manager->on_reference(reference("67025.00"), cpm::oms::Clock::now());
+    // 10 in one update is not. Both sides come off, on the reference's own
+    // update - no book arrived in between, which is B-Q5's whole point.
+    fake.manager->on_reference(reference("67000.19"), cpm::oms::Clock::now());
     EXPECT_EQ(fake.cancels.size(), 2u);
-    EXPECT_NE(fake.manager->last_reason().find("the reference moved"), std::string::npos);
+    EXPECT_NE(fake.manager->last_reason().find("in one update"), std::string::npos);
 }
 
 TEST(CryptoMmSpeedBump, CancelsWhicheverWayTheReferenceWent) {
-    Fake fake(guarded(1000));
+    Fake fake(guarded(10));
     fake.manager->on_reference(reference("67000.00"), cpm::oms::Clock::now());
-    fake.manager->on_market(book(500, 400), flat(), cpm::oms::Clock::now());
+    fake.manager->on_market(book_at(1, 500, 400), flat(), cpm::oms::Clock::now());
     for (const auto& order : fake.sent) fake.acknowledge(order);
 
-    // Down is as stale as up: the quote on one side is picked off either
-    // way, and leaving is right whichever it is.
-    fake.manager->on_reference(reference("66990.00"), cpm::oms::Clock::now());
+    fake.manager->on_reference(reference("66999.90"), cpm::oms::Clock::now());
     EXPECT_EQ(fake.cancels.size(), 2u);
 }
 
-TEST(CryptoMmSpeedBump, StaysOutUntilThisMarketReprices) {
-    Fake fake(guarded(1000));
+TEST(CryptoMmSpeedBump, SmallStepsThatAddUpDoNotFire) {
+    Fake fake(guarded(10));
     fake.manager->on_reference(reference("67000.00"), cpm::oms::Clock::now());
-    fake.manager->on_market(book(500, 400), flat(), cpm::oms::Clock::now());
+    fake.manager->on_market(book_at(1, 500, 400), flat(), cpm::oms::Clock::now());
     for (const auto& order : fake.sent) fake.acknowledge(order);
-    fake.manager->on_reference(reference("67010.00"), cpm::oms::Clock::now());
+
+    // Nine updates of 9 ticks is 81 ticks of drift, but no one update is a
+    // jump: the measure is update against update, not since we priced.
+    for (int i = 1; i <= 9; ++i) {
+        const std::string mid = "67000." + std::to_string(i * 9 / 10) + std::to_string(i * 9 % 10);
+        fake.manager->on_reference(reference(mid.c_str()), cpm::oms::Clock::now());
+    }
+    EXPECT_TRUE(fake.cancels.empty());
+}
+
+TEST(CryptoMmSpeedBump, ComesBackOnThisMarketsNextBookUpdate) {
+    Fake fake(guarded(10));
+    fake.manager->on_reference(reference("67000.00"), cpm::oms::Clock::now());
+    fake.manager->on_market(book_at(1, 500, 400), flat(), cpm::oms::Clock::now());
+    for (const auto& order : fake.sent) fake.acknowledge(order);
+    fake.manager->on_reference(reference("67000.10"), cpm::oms::Clock::now());
     ASSERT_EQ(fake.cancels.size(), 2u);
+    confirm_cancels(fake);
     fake.sent.clear();
 
-    // The same book, again and again: the reference has moved and CPM has
-    // not caught up, so quoting now is walking into the pick-off.
-    for (int i = 0; i < 5; ++i) fake.manager->on_market(book(500, 400), flat(), cpm::oms::Clock::now());
+    // The same book shown again - the host does this on every reference
+    // wake - is not an update, so we stay out.
+    for (int i = 0; i < 5; ++i) {
+        fake.manager->on_market(book_at(1, 500, 400), flat(), cpm::oms::Clock::now());
+    }
     EXPECT_TRUE(fake.sent.empty());
     EXPECT_NE(fake.manager->last_reason().find("waiting for this market"), std::string::npos);
 
-    // One tick of movement here is enough: what matters is that this market
-    // has absorbed what the reference already knows (B-Q3).
-    confirm_cancels(fake);
-    fake.manager->on_market(book(510, 400), flat(), cpm::oms::Clock::now());
-    EXPECT_FALSE(fake.sent.empty()) << "it must come back once this market moves";
-}
-
-TEST(CryptoMmSpeedBump, MeasuresFromWhereItLastPricedNotFromWhereItStarted) {
-    Fake fake(guarded(1000));  // $10
-    fake.manager->on_reference(reference("67000.00"), cpm::oms::Clock::now());
-    fake.manager->on_market(book(500, 400), flat(), cpm::oms::Clock::now());
-    for (const auto& order : fake.sent) fake.acknowledge(order);
-
-    // $9 of drift, no breach. Then this market moves and we re-quote, which
-    // takes a fresh reference at 67009 (B-Q9).
-    fake.manager->on_reference(reference("67009.00"), cpm::oms::Clock::now());
-    ASSERT_TRUE(fake.cancels.empty());
-    fake.manager->on_market(book(520, 380), flat(), cpm::oms::Clock::now());
-    confirm_cancels(fake);
-    fake.manager->on_market(book(520, 380), flat(), cpm::oms::Clock::now());
-    for (const auto& order : fake.sent) fake.acknowledge(order);
-    fake.cancels.clear();
-
-    // Another $9 from there is $18 from the start, and still no breach:
-    // the measure is "since we priced", not a drift summed up forever.
-    fake.manager->on_reference(reference("67018.00"), cpm::oms::Clock::now());
-    EXPECT_TRUE(fake.cancels.empty());
-    // $10 from where we priced is.
-    fake.manager->on_reference(reference("67019.00"), cpm::oms::Clock::now());
-    EXPECT_FALSE(fake.cancels.empty());
+    // Any update of this book brings us back, even one that leaves the mid
+    // exactly where it was.
+    fake.manager->on_market(book_at(2, 500, 400), flat(), cpm::oms::Clock::now());
+    EXPECT_FALSE(fake.sent.empty()) << "it must come back on the next book update";
 }
 
 TEST(CryptoMmSpeedBump, WithdrawsWhileTheReferenceIsStale) {

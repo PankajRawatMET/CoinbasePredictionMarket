@@ -24,6 +24,33 @@ using cpm::oms::NewOrder;
 using cpm::oms::Position;
 using Clock = cpm::oms::Clock;
 
+// The "[id symbol] " every line of strategy.log carries, so that one file
+// holding every series can still be read one instrument at a time
+// (docs/design-logs.md decision 4).
+//
+// Here rather than in either caller because there are two: the host puts it
+// on a strategy's own commentary, and the daemon puts it on the order
+// lifecycle it observes from outside - and a tag written two ways would
+// defeat the grep it exists for.
+//
+// Built from the arguments at the moment of the call, never frozen: a roll
+// gives a row a new window and the tag has to follow it. One symbol is the
+// shape there is - one kind, and a symbol is claimed by one strategy
+// (GUI-Q6) - so [id symbol] identifies a line completely; a kind quoting two
+// legs gets [id] alone and says the leg itself.
+inline std::string log_tag(const std::string& id, const std::vector<std::string>& symbols) {
+    std::string out = "[" + id;
+    if (symbols.size() == 1) out += " " + symbols.front();
+    return out + "] ";
+}
+
+// The same tag for one symbol that is already known, which is the shape the
+// daemon has: it reads a report, not a row.
+inline std::string log_tag(const std::string& id, const std::string& symbol) {
+    if (id.empty()) return symbol.empty() ? std::string() : "[" + symbol + "] ";
+    return symbol.empty() ? "[" + id + "] " : "[" + id + " " + symbol + "] ";
+}
+
 // One order a strategy currently has in the market, flattened for display.
 // Prices and quantities stay scaled integers all the way to the browser.
 struct LiveLeg {

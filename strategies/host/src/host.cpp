@@ -113,9 +113,7 @@ StrategyHooks StrategyHost::hooks_for(Entry& entry) const {
     // says the leg itself.
     if (const auto log = venue_.log) {
         hooks.log = [log, target](const std::string& line) {
-            std::string tag = "[" + target->id;
-            if (target->symbols.size() == 1) tag += " " + target->symbols.front();
-            log(tag + "] " + line);
+            log(log_tag(target->id, target->symbols) + line);
         };
     }
     if (venue_.attribute) {
@@ -220,7 +218,37 @@ std::string StrategyHost::start(const std::string& id) {
     entry->running_since = Clock::now();
     entry->last_book_warning = entry->running_since;
     logger_.info("started " + id + (entry->armed.load() ? " (armed)" : " (disarmed: it will compute quotes and send nothing)"));
+    log_params(*entry);
     return {};
+}
+
+void StrategyHost::log_params(const Entry& entry) const {
+    // Every parameter this run is using, in the strategy's own log, at the
+    // moment it starts. On start and not on create, because a stopped row's
+    // parameters are editable and Start is what applies them: the values that
+    // matter are the ones it is about to trade on. It is written again on
+    // every start, so a row stopped, retuned and restarted leaves both sets
+    // in the file in the order they were used.
+    //
+    // strategy.log and not the narrative, because this is the key to reading
+    // the rest of that file - what the model's working was computed from -
+    // and because an operator asking "what was BADQ set to at 06:13" should
+    // find the answer in the same file as the lines it explains, without
+    // having to trust a screenshot of the page.
+    //
+    // Schema order and the operator's label, so the line reads like the
+    // columns on the page rather than like the map's alphabetical order.
+    if (!venue_.log) return;
+    const auto* kind = registry_.find(entry.kind);
+    if (kind == nullptr) return;
+    std::string line = entry.kind + " params:";
+    for (const auto& spec : kind->schema) {
+        const auto value = entry.params.find(spec.name);
+        if (value == entry.params.end()) continue;
+        line += " " + (spec.label.empty() ? spec.name : spec.label) + "=" +
+                (value->second.empty() ? "(unset)" : value->second);
+    }
+    venue_.log(log_tag(entry.id, entry.symbols) + line);
 }
 
 void StrategyHost::begin_stop(Entry& entry, const std::string& why) {

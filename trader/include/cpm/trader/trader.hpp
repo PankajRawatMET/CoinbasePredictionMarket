@@ -69,6 +69,10 @@ struct TraderOptions {
     // cadence: the page is rebuilt twice a second, and a P&L series at that
     // rate would be 170,000 rows a day per instrument to say the same thing.
     std::chrono::seconds pnl_every{5};
+    // This run's ClOrdID tag (cpm::oms::run_tag). Empty takes it from the
+    // clock, which is every real run; a test pins it so the ids it asserts on
+    // are the same every time.
+    std::string run_tag;
     // A daemon meant to stay up for days must drop the instruments it will
     // never see again (GUI-N3): the sandbox lists ~100 rolling windows a day.
     std::chrono::seconds evict_finished_after{std::chrono::minutes(15)};
@@ -225,6 +229,14 @@ private:
     cpm::strategy::StrategyHost host_;
     std::unique_ptr<ControlApi> api_;
 
+    // Every ClOrdID this daemon sends carries the run tag, so no two runs can
+    // mint the same id and nothing about the counter needs to survive a
+    // restart (cpm::oms::run_tag). It was once saved to the bookmark on every
+    // allocation, which put two fsyncs on the tick thread immediately before
+    // every send and every cancel.
+    const std::string run_tag_;
+    const std::string mm_prefix_;  // "mm-<run tag>-", the strategies'
+    const std::string ex_prefix_;  // "ex-<run tag>-", the operator's own exit
     std::atomic<std::uint64_t> cl_ord_counter_{0};
 
     // The halt, in two phases: withdraw everything, then once the cancels are

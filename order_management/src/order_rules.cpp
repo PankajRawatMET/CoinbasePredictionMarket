@@ -78,8 +78,9 @@ std::optional<std::string> check_subaccount(const std::string& subaccount) {
 
 std::optional<std::string> check_cl_ord_id(const std::string& cl_ord_id) {
     if (cl_ord_id.empty()) return "ClOrdID(11) is required";
-    if (cl_ord_id.size() > 16) {
-        return "ClOrdID(11) is limited to 16 bytes, got " + std::to_string(cl_ord_id.size());
+    if (cl_ord_id.size() > kClOrdIdMaxBytes) {
+        return "ClOrdID(11) is limited to " + std::to_string(kClOrdIdMaxBytes) + " bytes, got " +
+               std::to_string(cl_ord_id.size());
     }
     for (const unsigned char c : cl_ord_id) {
         if (c < 0x20 || c > 0x7E) return "ClOrdID(11) must be printable ASCII";
@@ -167,6 +168,38 @@ std::string make_cl_ord_id(const std::string& prefix, std::uint64_t counter) {
         throw std::invalid_argument("cannot build a ClOrdID from prefix '" + prefix + "': " + *bad);
     }
     return id;
+}
+
+namespace {
+// 36^6: the tag's width, and the wrap period in seconds.
+constexpr std::uint64_t kRunTagSpan = 2'176'782'336ULL;
+constexpr std::size_t kRunTagWidth = 6;
+}  // namespace
+
+std::string run_tag(std::uint64_t epoch_seconds) {
+    static constexpr char kDigits[] = "0123456789abcdefghijklmnopqrstuvwxyz";
+    std::uint64_t value = epoch_seconds % kRunTagSpan;
+    std::string tag(kRunTagWidth, '0');
+    for (std::size_t i = kRunTagWidth; i > 0; --i) {
+        tag[i - 1] = kDigits[value % 36];
+        value /= 36;
+    }
+    return tag;
+}
+
+std::string run_tag() {
+    const auto now = std::chrono::system_clock::now().time_since_epoch();
+    return run_tag(
+        static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(now).count()));
+}
+
+std::string run_prefix(const std::string& role, const std::string& tag) {
+    const std::string prefix = role + tag + "-";
+    // One character of counter is the least that can be called a sequence.
+    if (prefix.size() >= kClOrdIdMaxBytes) {
+        throw std::invalid_argument("a ClOrdID prefix of '" + prefix + "' leaves no room for a counter");
+    }
+    return prefix;
 }
 
 bool wait_for(const std::function<bool()>& ready, std::chrono::milliseconds timeout) {

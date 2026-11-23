@@ -4,6 +4,8 @@
 #include "cpm/oms/orders.hpp"
 
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <optional>
 #include <string>
@@ -37,20 +39,47 @@ std::optional<std::string> check_mass_cancel(const MassCancel& request);
 // "invalid PartyID", so it is worth catching before the round trip.
 std::optional<std::string> check_subaccount(const std::string& subaccount);
 
-// ClOrdID: at most 16 bytes of printable ASCII, and non-empty. The limit is in
-// bytes, so multi-byte characters are refused rather than silently truncated.
+// The venue's limit on ClOrdID(11), in bytes.
+inline constexpr std::size_t kClOrdIdMaxBytes = 16;
+
+// ClOrdID: at most kClOrdIdMaxBytes of printable ASCII, and non-empty. The
+// limit is in bytes, so multi-byte characters are refused rather than silently
+// truncated.
 std::optional<std::string> check_cl_ord_id(const std::string& cl_ord_id);
 
-// A ClOrdID from a configured prefix plus a base36 counter (OE-Q9). The counter
-// is passed in, so the caller can persist it with the ExecID bookmark, which is
-// what keeps ids unique across a restart.
+// A ClOrdID from a configured prefix plus a base36 counter (OE-Q9).
 //
 // Throws std::invalid_argument rather than returning something the gateway
 // would reject: the 16-byte limit is the venue's, so an id that cannot fit is a
 // configuration error, not a value to truncate. A base36 counter needs one
 // character per 36x of range, so a prefix of 6 characters or fewer leaves room
-// for 36^10 (about 3.6e15) orders.
+// for 36^10 (about 3.6e15) orders, and the 10-character prefix run_prefix()
+// builds leaves room for 36^6 (about 2.2e9) - 22 years at the rate three
+// strategies quote.
 std::string make_cl_ord_id(const std::string& prefix, std::uint64_t counter);
+
+// Six base36 characters naming one run of the daemon: the Unix epoch second it
+// started, wrapped into 36^6. Fixed width, so a prefix built from it is always
+// the same length.
+//
+// This is what keeps ClOrdIDs unique across a restart (OE-Q9), and it replaced
+// a counter persisted in the bookmark on every id allocated. That cost two
+// fsyncs - about 3.3ms on a spinning disk - on the tick thread immediately
+// before every send and every cancel, to buy a guarantee the clock already
+// gives for nothing. Two runs cannot share a tag unless they start in the same
+// second, and they cannot: one daemon holds the lock file at a time
+// (cpm/common/lock_file.hpp), and a restart must log on and reconcile - seconds
+// of it - before it may allocate anything.
+//
+// The wrap period is 36^6 seconds, about 69 years.
+std::string run_tag(std::uint64_t epoch_seconds);
+// This run's tag, from the system clock.
+std::string run_tag();
+
+// A ClOrdID prefix unique to one run: `role` + the tag + '-', so "mm-" becomes
+// "mm-toqjx0-". Throws std::invalid_argument when that leaves no room for a
+// counter inside the venue's 16 bytes.
+std::string run_prefix(const std::string& role, const std::string& tag);
 
 // Is ExecID `a` older than `b`? ExecIDs are decimal integers in one increasing
 // space, carried as strings because they are identifiers and not arithmetic

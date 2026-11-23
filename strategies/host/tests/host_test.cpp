@@ -251,6 +251,8 @@ TEST(StrategyLog, SaysWhichStrategyAndInstrumentALineIsAbout) {
     Fixture f;
     const auto id = f.live();
     ASSERT_EQ(f.fakes.size(), 1u);
+    // start() writes the parameter line, which has its own test below.
+    f.logs.clear();
 
     // The strategy writes what it decided; the host says whose decision it
     // was. One file holds every series, so without this a line about
@@ -285,10 +287,44 @@ TEST(StrategyLog, NamesOnlyTheStrategyWhenItQuotesMoreThanOneSymbol) {
     // symbol here would be a guess. The strategy says which leg itself.
     const auto id = f.live(kSym + "," + kOther);
     ASSERT_EQ(f.fakes.size(), 1u);
+    f.logs.clear();  // the parameter line start() wrote
 
     f.fakes[0]->say("withdrawing both quotes: reference is stale");
     ASSERT_EQ(f.logs.size(), 1u);
     EXPECT_EQ(f.logs[0], "[" + id + "] withdrawing both quotes: reference is stale");
+}
+
+// Every parameter a run is using, in the strategy's own log, so the file that
+// holds the model's working also holds what it was computed from. Nothing else
+// writes them down: the narrative says "created fake-1 (Fake) on <symbol>" and
+// no more, and the page's form is not a record of anything.
+TEST(StrategyLog, WritesEveryParameterWhenAStrategyStarts) {
+    Fixture f;
+    const auto id = f.create();
+    EXPECT_TRUE(f.logs.empty()) << "nothing is running yet";
+
+    ASSERT_EQ(f.host->start(id), "");
+    ASSERT_EQ(f.logs.size(), 1u);
+    // Tagged like every other line of that file, the kind named, and in
+    // schema order rather than the map's alphabetical one.
+    EXPECT_EQ(f.logs[0],
+              "[" + id + " " + kSym + "] Fake params: symbol=" + kSym + " width-ticks=2");
+}
+
+// A stopped row's parameters are editable and Start is what applies them, so
+// the values worth writing down are the ones it is about to trade on - which
+// means writing them on every start, not once per row.
+TEST(StrategyLog, WritesTheParametersAgainWhenTheyChangeAndItIsRestarted) {
+    Fixture f;
+    const auto id = f.create();
+    ASSERT_EQ(f.host->start(id), "");
+    ASSERT_EQ(f.host->stop(id, "retuning"), "");
+    ASSERT_EQ(f.host->update(id, ParamValues{{"symbol", kSym}, {"width-ticks", "7"}}), "");
+    ASSERT_EQ(f.host->start(id), "");
+
+    ASSERT_EQ(f.logs.size(), 2u);
+    EXPECT_NE(f.logs[0].find("width-ticks=2"), std::string::npos) << f.logs[0];
+    EXPECT_NE(f.logs[1].find("width-ticks=7"), std::string::npos) << f.logs[1];
 }
 
 // --- a strategy that stops itself -----------------------------------------

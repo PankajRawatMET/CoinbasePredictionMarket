@@ -32,6 +32,171 @@ cpm::oms::OeClientOptions oe_options(const TraderOptions& options) {
     return out;
 }
 
+// How long a quote rested before it was hit, in seconds to the millisecond:
+// "9.052s". Microseconds are what the record carries and what rest_us in
+// fills.csv keeps, but a line being read by eye wants the magnitude, and the
+// last three digits of nine seconds are not it.
+std::string rested_text(std::chrono::microseconds rested) {
+    return cpm::format_scaled(rested.count() / 1000, 3) + "s";
+}
+
+// The venue's round trip in whole milliseconds: "250ms". Microseconds are
+// what the record carries and what latency_us in orders.csv keeps, but a line
+// read by eye wants the magnitude, and a quarter of a second does not need
+// six digits to say so. Empty when there is no number - never a zero, which
+// would read as "answered instantly" rather than "not measured".
+std::string took(const std::optional<std::chrono::microseconds>& value) {
+    return value ? std::to_string(value->count() / 1000) + "ms" : std::string();
+}
+
+// One report as a line of a strategy's own log, with the level to write it at.
+// Empty text for an event this does not narrate.
+struct Narrated {
+    std::string text;
+    bool warn = false;
+};
+
+// An order's whole life in strategy.log, beside the reasoning that produced
+// it: the send is already there from the reconciler ("quoting buy 1 @0.78 as
+// mm-u1l"), and these are the venue's answers to it, which were not written
+// down anywhere but the CSVs.
+//
+// Narrated from here rather than from QuoteReconciler::on_report, which sees
+// the same reports, because this is where the latencies are measured and
+// where the venue's OrderID is known. An "added" line without the ack latency
+// is worth little: on 2026-11-19 at 07:01 a quote was sent at .621,
+// abandoned by the strategy at .696 and only reached the book at .871, where
+// it was taken 56ms later - and none of those 250ms was visible in this file.
+// It is also the only place that sees the operator's own exit orders.
+//
+// One shape for the whole family - "<verb>: <side> <qty> @<price>, <detail>
+// (<cl_ord_id>)" - so the lines read as one timeline and the ClOrdID is
+// always in the same place.
+//
+// Not narrated: a CancelReject, which is not an order event and which the
+// reconciler already judges and reports (OE-Q6); the absence of a "deleted"
+// line is what says a cancel did not land. Replaced and PendingCancel are
+// declared by the spec and never emitted.
+Narrated narrate(const cpm::oms::AppliedReport& applied, const std::string& strategy) {
+    if (applied.kind != cpm::oms::AppliedReport::Kind::Report) return {};
+    const auto& report = applied.report;
+    const auto& order = applied.order;
+
+    // The venue's view of the order where it has one, ours where it does not:
+    // a report need not repeat the size and the price it already knows.
+    const Qty quantity = report.order_quantity ? *report.order_quantity : order.order_quantity;
+    const Price price = report.price ? *report.price : order.price;
+    // The order's own id, never the cancel's: a cancel's report names the
+    // cancel in ClOrdID (OE-O2), and it is the order this line is about.
+    const std::string& cl_ord_id =
+        order.cl_ord_id.empty() ? report.cl_ord_id : order.cl_ord_id;
+
+    const auto head = [&](const char* verb) {
+        return cpm::strategy::log_tag(strategy, report.symbol) + verb + ": " +
+               to_string(report.side) + " " + cpm::format_qty(quantity) + " @" +
+               cpm::format_price(price);
+    };
+    const auto tail = [&](std::string line) {
+        if (!cl_ord_id.empty()) line += " (" + cl_ord_id + ")";
+        // A report the gateway sent again after a restart, not something that
+        // just happened: the stamp on this line is this run's, not the event's.
+        if (report.replayed) line += " replayed";
+        return line;
+    };
+
+    switch (report.exec_type) {
+        case cpm::oms::ExecType::New: {
+            // Resting, and only now cancellable: a cancel cannot be sent for
+            // an order the venue has not acknowledged, which is why the gap
+            // between the send and this line is the window in which a quote
+            // is live and unmanageable.
+            std::string line = head("added");
+            if (const auto latency = took(applied.latency); !latency.empty()) {
+                line += ", acked in " + latency;
+            }
+            if (!report.order_id.empty()) line += ", oid " + report.order_id;
+            return {tail(std::move(line)), false};
+        }
+        case cpm::oms::ExecType::PendingNew: {
+            // Held in an instrument's speed bump: accepted, not matchable.
+            std::string line = head("held") + " in the speed bump";
+            if (const auto latency = took(applied.latency); !latency.empty()) {
+                line += ", answered in " + latency;
+            }
+            return {tail(std::move(line)), false};
+        }
+        case cpm::oms::ExecType::Canceled: {
+            std::string line = head("deleted");
+            if (report.cancel_reason != cpm::oms::CancelReason::None) {
+                // The venue's own doing - cancel-on-disconnect, a closing
+                // window, self-match prevention - and not an answer to
+                // anything we sent. Worth telling apart: one is the strategy
+                // working, the other is the strategy being overruled.
+                line += " by the venue: " + std::string(to_string(report.cancel_reason));
+            } else {
+                if (const auto latency = took(applied.latency); !latency.empty()) {
+                    line += ", cancelled in " + latency;
+                }
+                // Which cancel did it, so the request logged earlier can be
+                // joined to its answer.
+                if (!report.orig_cl_ord_id.empty() && !report.cl_ord_id.empty()) {
+                    line += " by " + report.cl_ord_id;
+                }
+            }
+            return {tail(std::move(line)), false};
+        }
+        case cpm::oms::ExecType::Expired: {
+            // The bell, or an IOC remainder. Not a problem and not ours.
+            std::string line = head("expired");
+            if (report.leaves_quantity > 0) {
+                line += ", " + cpm::format_qty(report.leaves_quantity) + " unfilled";
+            }
+            return {tail(std::move(line)), false};
+        }
+        case cpm::oms::ExecType::Rejected: {
+            // Warn, so it reaches the narrative as well. The reconciler
+            // already decides whether a reject is forgivable or halts the
+            // daemon; this is the same event in the strategy's own timeline,
+            // where its absence would leave an order that was sent and then
+            // simply stopped being mentioned.
+            std::string line = head("rejected");
+            if (report.reject_reason) line += ", reason " + std::to_string(*report.reject_reason);
+            if (!report.text.empty()) line += ": " + report.text;
+            return {tail(std::move(line)), true};
+        }
+        case cpm::oms::ExecType::Trade: break;
+        default: return {};
+    }
+
+    // A fill: the same facts as a fills.csv row, in the order a fill is asked
+    // about - what traded, at what, on which side of the book, what it cost,
+    // how long the quote waited, and where it leaves the position. Not a
+    // replacement for the row, which keeps the ids and the latencies this
+    // leaves out, but an operator reading why a strategy did something should
+    // not have to open a second file to find out whether it worked.
+    const auto& fill = report.fill;
+    std::string line = cpm::strategy::log_tag(strategy, report.symbol) + "fill: " +
+                       to_string(report.side);
+    if (fill) {
+        line += " " + cpm::format_qty(fill->quantity) + " @" + cpm::format_price(fill->price) +
+                (fill->aggressor ? " taker" : " maker");
+        // Absent is not free: MiscFeeAmt(137) is simply not on every fill,
+        // and a "0" here would say the venue charged nothing.
+        if (fill->fee) line += ", fee " + cpm::format_amount(*fill->fee);
+    }
+    if (applied.rested) line += ", rested " + rested_text(*applied.rested);
+    line += ", order " + cpm::format_qty(report.cumulative_quantity) + "/" +
+            cpm::format_qty(order.order_quantity);
+    if (report.leaves_quantity > 0) line += " left " + cpm::format_qty(report.leaves_quantity);
+    if (applied.position) {
+        // Signed: a short YES position is negative, and format_qty would
+        // render it as a flat 0.
+        line += ", net " + cpm::format_signed(applied.position->net, cpm::kQtyScale) + ", cash " +
+                cpm::format_amount(applied.position->cash);
+    }
+    return {tail(std::move(line)), false};
+}
+
 }  // namespace
 
 Trader::Trader(TraderOptions options, const cpm::strategy::StrategyRegistry& registry,
@@ -68,14 +233,14 @@ Trader::Trader(TraderOptions options, const cpm::strategy::StrategyRegistry& reg
                 // just before the send it wraps.
                 hooks.attribute = [this](const std::string& cl_ord_id,
                                          const std::string& strategy_id) {
-                    if (!records_) return;
                     std::lock_guard lock(attribution_mutex_);
                     attribution_[cl_ord_id] = strategy_id;
                 };
+                // No disk in here. The run tag makes the id unique across a
+                // restart, so this is an atomic increment and a base36 format
+                // on the tick thread, where it used to be two fsyncs.
                 hooks.next_cl_ord_id = [this] {
-                    const auto next = ++cl_ord_counter_;
-                    if (reconciler_) reconciler_->note_cl_ord_counter(next);
-                    return cpm::oms::make_cl_ord_id("mm-", next);
+                    return cpm::oms::make_cl_ord_id(mm_prefix_, ++cl_ord_counter_);
                 };
                 // A strategy talking about its own quoting: the whole of it
                 // goes to the log file, and none of it to the operator's
@@ -103,7 +268,10 @@ Trader::Trader(TraderOptions options, const cpm::strategy::StrategyRegistry& reg
                 };
                 return feeds;
             }(),
-            logger) {
+            logger),
+      run_tag_(options_.run_tag.empty() ? cpm::oms::run_tag() : options_.run_tag),
+      mm_prefix_(cpm::oms::run_prefix("mm-", run_tag_)),
+      ex_prefix_(cpm::oms::run_prefix("ex-", run_tag_)) {
     // --- market data --------------------------------------------------
     book_.on_anomaly([this](const cpm::md::BookAnomaly& anomaly) {
         logger_.warn(std::string("feed anomaly: ") + to_string(anomaly.kind) + " on " +
@@ -132,7 +300,11 @@ Trader::Trader(TraderOptions options, const cpm::strategy::StrategyRegistry& reg
     md_.on_session_event(feed_->session_callback());
 
     // --- order entry --------------------------------------------------
+    // One line the operator can grep a whole run by: every ClOrdID this
+    // daemon sends carries this tag, whoever built it.
+    logger_.info("ClOrdID run tag " + run_tag_ + ": ids look like " + mm_prefix_ + "1");
     cpm::oms::Reconciler::Options reconcile;
+    reconcile.run_tag = run_tag_;
     // The one reject the daemon forgives, and only because the instrument's
     // own name says the window had ended before the order reached it.
     reconcile.window_has_ended = [](const std::string& symbol) {
@@ -256,16 +428,15 @@ Trader::Trader(TraderOptions options, const cpm::strategy::StrategyRegistry& reg
     };
     env.resting_orders = [this](const std::string& symbol) { return resting_on(symbol); };
     env.next_cl_ord_id = [this] {
-        const auto next = ++cl_ord_counter_;
-        if (reconciler_) reconciler_->note_cl_ord_counter(next);
         // "ex-" rather than "mm-": the log, the CSVs and the wire should all
-        // say that this one was not a quote.
-        return cpm::oms::make_cl_ord_id("ex-", next);
+        // say that this one was not a quote. The counter is shared with the
+        // strategies', so an operator's exit never collides with a quote.
+        return cpm::oms::make_cl_ord_id(ex_prefix_, ++cl_ord_counter_);
     };
     env.send_order = [this](const cpm::oms::NewOrder& order) -> std::string {
         // Attributed and recorded before it goes, because the ack can reach
         // a QuickFIX thread before send() has returned here.
-        if (records_) {
+        {
             std::lock_guard lock(attribution_mutex_);
             attribution_[order.cl_ord_id] = kOperatorId;
         }
@@ -551,7 +722,6 @@ void Trader::record_quotes() {
 }
 
 void Trader::record(const cpm::oms::AppliedReport& applied) {
-    if (!records_) return;
     const auto& order_id = applied.kind == cpm::oms::AppliedReport::Kind::CancelReject
                                ? applied.reject.orig_cl_ord_id
                                : applied.order.cl_ord_id;
@@ -562,10 +732,33 @@ void Trader::record(const cpm::oms::AppliedReport& applied) {
     if (strategy.empty() && applied.kind == cpm::oms::AppliedReport::Kind::CancelReject) {
         strategy = strategy_of(applied.reject.cl_ord_id);
     }
-    records_->write(applied, strategy);
+
+    // The order's life in strategy.log, beside the reasoning that produced
+    // it. Logged whether or not the record files were opened - this is the
+    // narrative half, and a run writing to stdout only still has one - and
+    // from here rather than from the strategies, because this is where a
+    // report is attributed, where the latencies are measured and where the
+    // position a fill left behind is known. A strategy is told about its own
+    // reports on the next tick and could log them itself, but then every
+    // kind would have to remember to, each would say it differently, none
+    // would have the latencies, and the operator's own exit (G13) would say
+    // nothing at all.
+    //
+    // LogSource::Strategy, so it files beside the commentary it belongs
+    // with and stays off the console with the rest of it; --console-strategy
+    // puts the whole source back. A Warn is never silenced, so a reject is
+    // on screen and in the narrative whatever this says.
+    if (const auto narrated = narrate(applied, strategy); !narrated.text.empty()) {
+        logger_.log(narrated.warn ? cpm::LogLevel::Warn : cpm::LogLevel::Info, narrated.text,
+                    cpm::LogSource::Strategy);
+    }
+
+    if (records_) records_->write(applied, strategy);
 
     // Forget what is finished with, so the map stays the size of what is
-    // live rather than of the day.
+    // live rather than of the day. Whether or not anything was written: the
+    // map is filled on every send now, so it has to be drained on every
+    // report, not only on the ones a record file saw.
     std::lock_guard lock(attribution_mutex_);
     if (applied.kind == cpm::oms::AppliedReport::Kind::Report) {
         if (applied.order.terminal) attribution_.erase(applied.order.cl_ord_id);
@@ -689,7 +882,6 @@ std::string Trader::start(std::chrono::milliseconds timeout) {
         logger_.info("watching " + wanted + (symbol == wanted ? "" : " on " + symbol));
     }
 
-    cl_ord_counter_.store(reconciler_->cl_ord_counter());
     last_evict_ = Clock::now();
     return {};
 }

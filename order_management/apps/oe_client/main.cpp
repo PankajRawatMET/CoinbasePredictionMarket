@@ -276,10 +276,15 @@ int main(int argc, char** argv) {
             return 2;
         }
 
+        // Every id this tool sends carries the run tag, for the same reason
+        // the daemon's do: two runs must not mint the same ClOrdID
+        // (cpm::oms::run_tag).
+        const auto run = cpm::oms::run_tag();
+
         // The kill switch: cancel everything this API key has, then stop.
         if (args.mass_cancel) {
             cpm::oms::MassCancel request;
-            request.cl_ord_id = cpm::oms::make_cl_ord_id("kill-", 1);
+            request.cl_ord_id = cpm::oms::make_cl_ord_id(cpm::oms::run_prefix("kill-", run), 1);
             request.scope = cpm::oms::MassCancel::Scope::All;
             if (!client.mass_cancel(request)) {
                 logger.error("mass cancel could not be sent");
@@ -310,9 +315,7 @@ int main(int argc, char** argv) {
                 return 4;
             }
             cpm::oms::NewOrder order;
-            const auto counter = reconciler.cl_ord_counter() + 1;
-            reconciler.note_cl_ord_counter(counter);
-            order.cl_ord_id = cpm::oms::make_cl_ord_id("t-", counter);
+            order.cl_ord_id = cpm::oms::make_cl_ord_id(cpm::oms::run_prefix("t-", run), 1);
             order.symbol = args.test_order_symbol;
             order.side = args.side;
             order.quantity = args.quantity;
@@ -346,7 +349,8 @@ int main(int argc, char** argv) {
             // Cancel the test order again, so nothing is left resting.
             if (!test_order_id.empty() && elapsed == args.cancel_after_secs) {
                 cpm::oms::CancelOrder request;
-                request.cl_ord_id = cpm::oms::make_cl_ord_id("c-", static_cast<std::uint64_t>(elapsed));
+                request.cl_ord_id = cpm::oms::make_cl_ord_id(cpm::oms::run_prefix("c-", run),
+                                                             static_cast<std::uint64_t>(elapsed));
                 request.orig_cl_ord_id = test_order_id;
                 request.symbol = args.test_order_symbol;
                 request.side = args.side;

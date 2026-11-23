@@ -68,12 +68,33 @@ struct Params {
     // this does nothing.
     std::chrono::seconds withdraw_before{0};
     // The speed bump (GUI column PricingMidMoveThreshold, B-Q2). If the
-    // reference venue's mid moves this many of ITS ticks away from where it
-    // was when these quotes were placed, the quotes are stale: cancel them
-    // and do not come back until this market has repriced.
+    // reference venue's mid moves this many of ITS ticks between one update
+    // and the next, the quotes are stale: cancel them, and quote again on the
+    // next update of this market's own book.
     //
     // 0 - the default - is off, and the strategy is exactly what it was.
     std::int64_t mid_move_threshold_ticks = 0;
+    // BADQ (the GUI column): the widest market, in grid rungs, that this
+    // strategy will lean on. While the book EXCLUDING OUR OWN ORDERS is wider
+    // than this, both quotes come off and nothing is placed; when it narrows
+    // back inside, quoting resumes by itself.
+    //
+    // Measured on the book without our orders because that is the book the
+    // mid is taken from, and because the raw book is the wrong answer
+    // exactly when this guard is needed: when our own pair is the only thing
+    // at the touch, the raw spread is our own width and looks tight. On
+    // 2026-11-19 at 06:13 the raw book read 0.70/0.72 while the market
+    // behind it was 0.44/0.98; the mid of that vacuum is 0.71, so the
+    // strategy bid 0.70 in a market that had been trading at 0.50 ten
+    // seconds earlier and was taken twice inside eleven seconds.
+    //
+    // In grid rungs and not in price, because the grid is tapered: 5 rungs is
+    // 0.05 between 0.100 and 0.900 and 0.005 outside it (md/ticks.hpp). A
+    // difference in price is therefore not a number of ticks, which is why
+    // this is counted by walking the grid rather than by subtracting.
+    //
+    // 0 - the default - is off, and the strategy is exactly what it was.
+    int max_quote_spread_ticks = 0;
 };
 
 // The whole decision, as a pure function of the book, the position and the
@@ -123,19 +144,19 @@ private:
     std::string last_announcement_;
 
     // --- the speed bump ---------------------------------------------------
-    // Where the reference was when these quotes were placed. The measure is
-    // always "since we priced", never a drift summed across re-quotes
-    // (B-Q9), so this is refreshed on every place and replace.
-    std::optional<Price> reference_at_quote_;
+    // The reference mid at the previous update. A breach is one update
+    // against the one before it, not a drift summed since we priced.
+    std::optional<Price> previous_reference_;
     // The latest the reference feed has said, and whether it can be trusted.
     cpm::binance::ReferenceView reference_;
-    // Sitting out after a breach, until this market moves a tick from where
-    // it was when we left (B-Q3).
+    // Sitting out after a breach, until this market's book updates. The host
+    // calls on_market on every pass, reference wakes included, so "an update"
+    // is the book's own timestamp moving, not merely being shown the book.
     bool held_ = false;
-    std::optional<Price> mid_at_withdraw_;
-    // The mid of the last book we were shown, which is what the release
-    // above is measured against.
-    std::optional<Price> last_market_mid_;
+    std::optional<decltype(InstrumentView::book_time)> book_time_at_withdraw_;
+    // The timestamp of the last book we were shown, which the release above
+    // is measured against.
+    std::optional<decltype(InstrumentView::book_time)> last_book_time_;
 };
 
 // CryptoMM as the host runs it: a QuoteManager, its parameters, and nothing
