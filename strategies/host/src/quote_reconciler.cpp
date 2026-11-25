@@ -13,6 +13,7 @@ QuoteReconciler::QuoteReconciler(QuoteSettings settings, Hooks hooks)
 void QuoteReconciler::update(const DesiredQuotes& desired) {
     ++passes_;
     last_reason_ = desired.reason;
+    log_quote_availability(desired.bid.has_value(), desired.ask.has_value(), desired.reason);
     if (!desired.bid && !desired.ask) ++passes_without_quotes_;
     if (desired.stop) {
         if (hooks_.stop_me) hooks_.stop_me(desired.reason);
@@ -22,6 +23,28 @@ void QuoteReconciler::update(const DesiredQuotes& desired) {
     if (hooks_.can_submit && !hooks_.can_submit()) return;
     reconcile_side(Side::Buy, desired.bid, bid_, settings_.symbol);
     reconcile_side(Side::Sell, desired.ask, ask_, settings_.symbol);
+}
+
+void QuoteReconciler::log_quote_availability(bool quoting_bid, bool quoting_ask,
+                                             const std::string& reason) {
+    const bool pause_bid = !quoting_bid && !reason.empty();
+    const bool pause_ask = !quoting_ask && !reason.empty();
+    const bool new_bid_pause = pause_bid && !bid_paused_;
+    const bool new_ask_pause = pause_ask && !ask_paused_;
+    bid_paused_ = pause_bid;
+    ask_paused_ = pause_ask;
+    if ((!new_bid_pause && !new_ask_pause) || !hooks_.log_quote_pause) return;
+
+    if (pause_bid && pause_ask) {
+        const bool pulling = (bid_ && !bid_->cancel_pending) || (ask_ && !ask_->cancel_pending);
+        hooks_.log_quote_pause((pulling ? "Pulling quotes: " : "Quoting paused: ") + reason);
+    } else {
+        const auto& quote = pause_bid ? bid_ : ask_;
+        const std::string side = pause_bid ? "bid" : "ask";
+        hooks_.log_quote_pause(quote && !quote->cancel_pending
+                                  ? "Pulling " + side + " quote: " + reason
+                                  : "Quoting paused on " + side + ": " + reason);
+    }
 }
 
 StrategyStatus QuoteReconciler::status() const {
@@ -184,7 +207,10 @@ void QuoteReconciler::on_report(const ExecutionReport& report) {
 }
 
 void QuoteReconciler::withdraw(const std::string& why) {
-    if (hooks_.log) hooks_.log("withdrawing both quotes: " + why);
+    log_quote_availability(false, false, why);
+    if (hooks_.log && ((bid_ && !bid_->cancel_pending) || (ask_ && !ask_->cancel_pending))) {
+        hooks_.log("withdrawing both quotes: " + why);
+    }
     for (auto* quote : {&bid_, &ask_}) {
         if (!*quote || (*quote)->cancel_pending) continue;
         // The same guard reconcile_side keeps: an order the venue has already

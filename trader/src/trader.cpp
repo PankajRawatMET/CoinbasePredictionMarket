@@ -249,6 +249,9 @@ Trader::Trader(TraderOptions options, const cpm::strategy::StrategyRegistry& reg
                 // goes to the log file, and none of it to the operator's
                 // panel, where thirty lines a second would hide the one
                 // that matters (GUI-Q28).
+                hooks.log_quote_pause = [this](const std::string& line) {
+                    logger_.warn(line, cpm::LogSource::Strategy);
+                };
                 hooks.log = [this](const std::string& line) {
                     logger_.info(line, cpm::LogSource::Strategy);
                 };

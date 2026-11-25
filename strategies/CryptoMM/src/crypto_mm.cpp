@@ -322,6 +322,7 @@ void QuoteManager::on_market(const InstrumentView& book, const Position& positio
                                             ? hooks_.resting_orders(params_.symbol)
                                             : std::vector<LiveLeg>{});
     last_reason_ = desired.reason;
+    log_quote_availability(desired.bid.has_value(), desired.ask.has_value(), desired.reason);
     if (!desired.bid && !desired.ask) ++passes_without_quotes_;
 
     const bool may_send = !hooks_.can_submit || hooks_.can_submit();

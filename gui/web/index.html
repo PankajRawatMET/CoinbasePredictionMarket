@@ -164,25 +164,30 @@
   button.drop { min-width: 0; padding: 4px 8px; color: var(--dim); }
   #add-row { margin-top: 14px; }
 
-  /* The log. pre, not wrap: a line that wrapped would hide the shape of the
-     thing being read, so it scrolls sideways instead. */
-  /* Pinned to the window, not to the end of the page. Only the Strategies
-     view has one, and that view's main gets the room for it below. */
-  .logs {
-    position: fixed; left: 0; right: 0; bottom: 0; z-index: 5;
-    margin: 0; border: 0; border-top: 1px solid var(--line); border-radius: 0;
-    background: var(--panel);
+  body[data-page="strategies"] {
+    display: flex; flex-direction: column; height: 100vh; height: 100dvh;
   }
-  /* Which page is open, set on the body by the nav. It is deliberately not
-     the attribute a section carries: nothing above the header belongs to
-     one page, and a test holds the page to that. */
-  body[data-page="strategies"] main { padding-bottom: 250px; }
-  .logs h2 {
-    margin: 0; padding: 10px 14px; font-size: 11px; letter-spacing: .12em;
-    text-transform: uppercase; color: var(--dim); border-bottom: 1px solid var(--line);
+  body[data-page="strategies"] main {
+    flex: 1; min-height: 0; padding: 0; gap: 0;
+    grid-template-rows: minmax(0, 1fr) clamp(min(105px, 30%), var(--log-height, 230px), 75%);
   }
+  main > section[data-view="strategies"]:not(.logs) {
+    margin: 16px; overflow: auto;
+  }
+  .logs:not([hidden]) {
+    display: grid; grid-template-rows: auto auto minmax(0, 1fr);
+    border: 0; border-radius: 0;
+  }
+  .log-resize {
+    height: 10px; cursor: ns-resize; touch-action: none; user-select: none;
+    border-top: 1px solid var(--line); display: grid; place-items: center;
+  }
+  .log-resize::before {
+    content: ""; width: 32px; height: 2px; border-radius: 1px; background: var(--dim);
+  }
+  .log-resize:hover, .log-resize:focus-visible { background: #1b2030; outline-offset: -2px; }
   .logbody {
-    height: 190px; overflow: auto; padding: 8px 14px; font-size: 12px;
+    overflow: auto; padding: 8px 14px; font-size: 12px;
     white-space: pre; line-height: 1.45;
   }
   .logbody .line { color: var(--ink); }
@@ -359,13 +364,10 @@
       <p class="empty" id="positions-empty">Nothing filled.</p>
     </div>
   </section>
-  <!-- The tail of the daemon's log: the Strategies page only, and pinned to
-       the bottom of the window rather than the end of the document, so it
-       stays put while the rows scroll above it (GUI-Q28). Both scrollbars,
-       because a wrapped log line is unreadable and a truncated one is
-       worse. -->
   <section class="logs" data-view="strategies">
-    <h2>Log</h2>
+    <div class="log-resize" id="log-resize" role="separator" tabindex="0"
+         aria-label="Resize logs" aria-orientation="horizontal" aria-controls="log-lines"></div>
+    <h2>Logs</h2>
     <div class="logbody" id="log-lines"></div>
   </section>
 </main>
@@ -445,6 +447,47 @@
     return 'strategies';
   }
 
+  var logResize = document.getElementById('log-resize');
+  var logPanel = logResize.parentElement;
+  var splitPane = logPanel.parentElement;
+  var logDrag = null;
+
+  function updateLogSize(height) {
+    if (logPanel.hidden || !splitPane.clientHeight) return;
+    var available = splitPane.clientHeight;
+    var min = Math.min(105, available * 0.30);
+    var max = available * 0.75;
+    if (height !== undefined) {
+      splitPane.style.setProperty('--log-height', Math.max(min, Math.min(height, max)) + 'px');
+    }
+    logResize.setAttribute('aria-valuemin', Math.round(min / available * 100));
+    logResize.setAttribute('aria-valuemax', 75);
+    logResize.setAttribute('aria-valuenow', Math.round(logPanel.offsetHeight / available * 100));
+  }
+
+  logResize.addEventListener('pointerdown', function (event) {
+    if (!event.isPrimary || event.button !== 0) return;
+    logDrag = { id: event.pointerId, y: event.clientY, height: logPanel.offsetHeight };
+    logResize.setPointerCapture(event.pointerId);
+  });
+  logResize.addEventListener('pointermove', function (event) {
+    if (logDrag && logDrag.id === event.pointerId) {
+      updateLogSize(logDrag.height + logDrag.y - event.clientY);
+    }
+  });
+  logResize.addEventListener('lostpointercapture', function () { logDrag = null; });
+  logResize.addEventListener('keydown', function (event) {
+    var height = logPanel.offsetHeight;
+    if (event.key === 'ArrowUp') height += 20;
+    else if (event.key === 'ArrowDown') height -= 20;
+    else if (event.key === 'Home') height = 0;
+    else if (event.key === 'End') height = splitPane.clientHeight;
+    else return;
+    event.preventDefault();
+    updateLogSize(height);
+  });
+  new ResizeObserver(function () { updateLogSize(); }).observe(splitPane);
+
   function showView(name) {
     view = name;
     // Ladders built while this page was hidden could not be centred then.
@@ -462,9 +505,8 @@
     for (var i = 0; i < sections.length; ++i) {
       sections[i].hidden = sections[i].getAttribute('data-view') !== name;
     }
-    // The log panel is fixed to the window on this view, so this view's
-    // content needs room under it; the others must not leave a gap.
     document.body.setAttribute('data-page', name);
+    if (name === 'strategies') updateLogSize();
     var buttons = document.querySelectorAll('#nav button');
     for (var j = 0; j < buttons.length; ++j) {
       buttons[j].className = buttons[j].getAttribute('data-view') === name ? 'on' : '';
@@ -816,26 +858,8 @@
     return box;
   }
 
-  // What the row says about a strategy. Nothing here moves by itself
-  // (GUI-Q28): the live orders and the placed/cancelled/fills counters used
-  // to tick twice a second in a section whose job is to hold controls, and
-  // they are on the Ladders, Books and Positions pages where they belong.
-  // What is left changes when the operator acts on it, when it rolls, or
-  // when it stops - and then it must change, because a strategy that halted
-  // and did not say so would be the worst thing on this page.
   function strategyStatus(strategy) {
     var line = el('div', 'status');
-    // The state and armed tags, the id, the series and the window are not
-    // here any more (2026-11-02): the row above says what this strategy is
-    // and what may be done to it, and repeating it underneath was a second
-    // place to read the same thing from.
-    //
-    // Why it is not acting, and why it last stopped, stay: they are the two
-    // questions an operator asks of a strategy that is quoting nothing, and
-    // a strategy that halted and did not say so would be the worst thing on
-    // this page (GUI-Q28). The line is empty while there is nothing wrong.
-    var why = [strategy.reason, strategy.note].filter(Boolean).join(' · ');
-    if (why) line.appendChild(el('span', 'muted', why));
     var diagnostics = strategy.diagnostics || {};
     var names = Object.keys(diagnostics);
     if (names.length) {
@@ -857,7 +881,7 @@
   function rowsSignature() {
     return snapshot.strategies.map(function (strategy) {
       return [strategy.id, strategy.kind, strategy.state, strategy.armed, strategy.feed,
-              strategy.series, strategy.symbols.join(','), strategy.reason, strategy.note,
+              strategy.series, strategy.symbols.join(','),
               JSON.stringify(strategy.params)].join('|');
     }).join('||') + '#' + snapshot.state + '#' + snapshot.allow_orders + '#' + busy;
   }

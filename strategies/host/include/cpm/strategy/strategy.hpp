@@ -119,6 +119,7 @@ struct StrategyHooks {
     // discards, which is the one-shot crypto_mm binary and every test that
     // does not care.
     std::function<void(const std::string&)> log;
+    std::function<void(const std::string&)> log_quote_pause;
 };
 
 // What a strategy says about itself. Deliberately flat and kind-agnostic: the

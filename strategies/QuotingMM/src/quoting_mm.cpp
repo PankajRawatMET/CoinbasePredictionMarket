@@ -334,10 +334,7 @@ void QuotingMm::stand_aside(const std::string& why) {
         if (log_) log_(why);
         last_log_ = why;
     }
-    const auto legs = orders_.legs();
-    if (std::any_of(legs.begin(), legs.end(), [](const auto& leg) { return !leg.cancel_pending; })) {
-        orders_.withdraw(why);
-    }
+    orders_.withdraw(why);
     target_fair_.reset();
 }
 

@@ -116,6 +116,11 @@ StrategyHooks StrategyHost::hooks_for(Entry& entry) const {
             log(log_tag(target->id, target->symbols) + line);
         };
     }
+    if (const auto log = venue_.log_quote_pause) {
+        hooks.log_quote_pause = [log, target](const std::string& line) {
+            log(log_tag(target->id, target->symbols) + line);
+        };
+    }
     if (venue_.attribute) {
         const std::string id = entry.id;
         const auto attribute = venue_.attribute;
@@ -541,6 +546,7 @@ void StrategyHost::drive(Entry& entry, Clock::time_point now) {
                 // on an instrument it closes, and a cancel of ours racing
                 // that one is an OrderCancelReject, which halts.
                 entry.strategy->abandon(entry.note);
+                logger_.info(log_tag(entry.id, entry.symbols) + "Quoting stopped: " + entry.note);
             }
             continue;
         }

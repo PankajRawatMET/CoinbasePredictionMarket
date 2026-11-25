@@ -561,6 +561,7 @@ struct Fake {
             return finished.count(cl_ord_id) > 0;
         };
         hooks.log = [this](const std::string& line) { log.push_back(line); };
+        hooks.log_quote_pause = [this](const std::string& line) { quote_pauses.push_back(line); };
         if (owned) {
             hooks.stop_me = [this](const std::string& why) { stop_asked.push_back(why); };
         }
@@ -593,6 +594,7 @@ struct Fake {
     std::vector<cpm::oms::CancelOrder> cancels;
     std::vector<std::string> stop_asked;
     std::vector<std::string> log;
+    std::vector<std::string> quote_pauses;
     std::unique_ptr<QuoteManager> manager;
 };
 
@@ -1083,6 +1085,21 @@ TEST(CryptoMmDriver, QuotesNothingWhileSubmissionIsBlocked) {
     fake.allowed = true;
     fake.manager->on_market(book(500, 400), flat(), {});
     EXPECT_EQ(fake.sent.size(), 2u);
+}
+
+TEST(CryptoMmDriver, LogsWhyLiveQuotesWerePulledOncePerPause) {
+    Fake fake;
+    fake.manager->on_market(book(500, 400), flat(), {});
+    ASSERT_EQ(fake.sent.size(), 2u);
+    EXPECT_TRUE(fake.quote_pauses.empty());
+
+    fake.manager->on_market(book(500, 0), flat(), {});
+    EXPECT_EQ(fake.cancels.size(), 2u);
+    ASSERT_EQ(fake.quote_pauses.size(), 1u);
+    EXPECT_EQ(fake.quote_pauses.front(), "Pulling quotes: one-sided book");
+
+    fake.manager->on_market(book(500, 0), flat(), {});
+    EXPECT_EQ(fake.quote_pauses.size(), 1u);
 }
 
 // A run that places nothing must be able to say why: silence is the one

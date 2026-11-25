@@ -56,6 +56,7 @@ protected:
         bool acknowledged = false;
         bool slid = false;
     };
+    void log_quote_availability(bool quoting_bid, bool quoting_ask, const std::string& reason);
     bool worth_replacing(const LiveQuote& live, const Quote& desired) const;
     void reconcile_side(cpm::oms::Side side, const std::optional<Quote>& desired,
                         std::optional<LiveQuote>& live, const std::string& symbol);
@@ -69,6 +70,10 @@ protected:
     std::size_t passes_ = 0;
     std::size_t passes_without_quotes_ = 0;
     std::string last_reason_;
+
+private:
+    bool bid_paused_ = false;
+    bool ask_paused_ = false;
 };
 
 }  // namespace cpm::strategy
