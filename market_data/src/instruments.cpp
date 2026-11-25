@@ -85,6 +85,30 @@ std::string rest_signature(const std::string& secret_b64, const std::string& tim
     return hmac_sha256_b64(secret_b64, timestamp + method + path);
 }
 
+cpm::HttpsResponse signed_rest_get(const RestConfig& config, const RestEndpoint& endpoint,
+                                   const std::string& path, const std::string& query,
+                                   const HttpsFetch& fetch, Clock::time_point now) {
+    const auto timestamp = std::to_string(
+        std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count());
+
+    cpm::HttpsRequest request;
+    request.host = endpoint.host;
+    request.port = endpoint.port;
+    request.path = path;
+    request.query = query;
+    request.ca_file = config.ca_file;
+    request.timeout = config.timeout;
+    request.headers = {
+        {"CB-ACCESS-KEY", config.api_key},
+        {"CB-ACCESS-SIGN", rest_signature(config.secret_b64, timestamp, "GET", path)},
+        {"CB-ACCESS-PASSPHRASE", config.passphrase},
+        {"CB-ACCESS-TIMESTAMP", timestamp},
+        {"Accept", "application/json"},
+    };
+
+    return fetch(request);
+}
+
 InstrumentQuery open_instruments(const RestConfig& config, const std::string& series,
                                  const HttpsFetch& fetch, Clock::time_point now) {
     InstrumentQuery out;
@@ -107,25 +131,8 @@ InstrumentQuery open_instruments(const RestConfig& config, const std::string& se
     }
 
     const auto path = endpoint.prefix + "/instruments";
-    const auto timestamp = std::to_string(
-        std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count());
-
-    cpm::HttpsRequest request;
-    request.host = endpoint.host;
-    request.port = endpoint.port;
-    request.path = path;
-    request.query = "series_ticker=" + series + "&status=OPEN";
-    request.ca_file = config.ca_file;
-    request.timeout = config.timeout;
-    request.headers = {
-        {"CB-ACCESS-KEY", config.api_key},
-        {"CB-ACCESS-SIGN", rest_signature(config.secret_b64, timestamp, "GET", path)},
-        {"CB-ACCESS-PASSPHRASE", config.passphrase},
-        {"CB-ACCESS-TIMESTAMP", timestamp},
-        {"Accept", "application/json"},
-    };
-
-    const auto response = fetch(request);
+    const auto response = signed_rest_get(config, endpoint, path,
+                                          "series_ticker=" + series + "&status=OPEN", fetch, now);
     if (!response.error.empty()) {
         out.error = "could not reach the instrument catalog: " + response.error;
         return out;

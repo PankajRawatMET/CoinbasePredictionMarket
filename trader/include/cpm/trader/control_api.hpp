@@ -142,6 +142,7 @@ struct Snapshot {
     std::vector<StrategyInfo> strategies;
     std::vector<BookView> books;
     std::vector<PositionView> positions;
+    std::vector<cpm::oms::ExecutionReport> fills;
     // One row per position, in the same order, and the daemon's total.
     std::vector<PnlView> pnl;
     PnlTotals pnl_total;
@@ -190,6 +191,8 @@ public:
         // One word for the header: off, up, stale or down.
         std::function<std::string()> reference;
         std::function<std::vector<PositionView>()> positions;
+        std::function<std::vector<cpm::oms::ExecutionReport>()> fills;
+        std::function<std::string(const std::string&)> recover_fills;
         // The P&L of each position, marked where a mid can be had. Computed
         // by the daemon because the mark comes from the book, which this
         // class does not read.

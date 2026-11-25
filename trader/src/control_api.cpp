@@ -126,6 +126,13 @@ Result ControlApi::update(const std::string& id, const ParamValues& params) {
 }
 
 Result ControlApi::start(const std::string& id) {
+    if (const auto info = host_.info(id); env_.recover_fills && info && info->feed &&
+                                         info->state == cpm::strategy::RunState::Stopped &&
+                                         !host_.halted()) {
+        for (const auto& symbol : info->symbols) {
+            if (const auto error = env_.recover_fills(symbol); !error.empty()) return {error, {}};
+        }
+    }
     Result result{host_.start(id), {}};
     if (result.ok()) bump();
     return result;
@@ -160,6 +167,13 @@ Result ControlApi::arm(const std::string& id) {
                                   "and withdraw, and an order caught by the close is a reject",
                               {}};
             }
+        }
+    }
+    if (const auto info = host_.info(id); env_.recover_fills && info &&
+                                         info->state == cpm::strategy::RunState::Running &&
+                                         !host_.halted()) {
+        for (const auto& symbol : info->symbols) {
+            if (const auto error = env_.recover_fills(symbol); !error.empty()) return {error, {}};
         }
     }
     Result result{host_.arm(id), {}};
@@ -537,6 +551,7 @@ Snapshot ControlApi::snapshot() const {
     if (env_.recovery) out.recovery = env_.recovery();
     if (env_.reference) out.reference = env_.reference();
     if (env_.positions) out.positions = env_.positions();
+    if (env_.fills) out.fills = env_.fills();
     // Whether each position can be exited, and at what, answered by the same
     // function the order itself goes through (G13). Computed here rather than
     // in the browser so the button is never offered for an order the daemon

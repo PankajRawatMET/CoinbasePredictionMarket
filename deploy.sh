@@ -223,7 +223,8 @@ EOF
 
     if [ ! -f "$CREDS_DIR/creds-rest.env" ]; then
         cat > "$CREDS_DIR/creds-rest.env" << 'EOF'
-# REST instrument catalog (CPM_REST_*). chmod 600. Never committed. Optional.
+# REST instrument catalog and fill recovery (CPM_REST_*). chmod 600. Never committed.
+# Sandbox trading requires these credentials for the same firm as order-entry FIX.
 #
 # Without it a series target like BTCD15M cannot be resolved to the window
 # that is open now - FIX has no SecurityList and the lifecycle feed is
@@ -525,7 +526,7 @@ print_summary() {
     echo "${BOLD}1. Fill in the credentials${NC}"
     echo "     \$EDITOR $CREDS_DIR/creds.env        # CPM_*       market data"
     echo "     \$EDITOR $CREDS_DIR/creds-oe.env     # CPM_OE_*    order entry, and the subaccount"
-    echo "     \$EDITOR $CREDS_DIR/creds-rest.env   # CPM_REST_*  instrument catalog (optional)"
+    echo "     \$EDITOR $CREDS_DIR/creds-rest.env   # CPM_REST_*  instrument catalog and fill recovery"
     echo
     echo "${BOLD}2. Run it in the foreground first${NC}"
     echo "     cd $INSTALL_DIR && ./start.sh"

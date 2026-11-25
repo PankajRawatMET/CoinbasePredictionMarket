@@ -3,6 +3,8 @@
 // and the clean shutdown that leaves nothing resting.
 #include "cpm/trader/trader.hpp"
 
+#include "../src/fill_recovery.hpp"
+
 #include "cpm/md/sim/simulator.hpp"
 #include "cpm/oms/sim/simulator.hpp"
 #include "cpm/strategy/crypto_mm.hpp"
@@ -33,6 +35,48 @@ using cpm::trader::TraderOptions;
 
 // The market data simulator's first default instrument, which the order entry
 // simulator is pointed at so both services speak about the same symbol.
+TEST(FillRecovery, ReadsAllPagesForOneInstrumentAndSubaccount) {
+    cpm::md::RestConfig config;
+    config.url = "https://api.cpm-sandbox.fairx.net/api/v1";
+    config.api_key = "test";
+    config.passphrase = "test";
+    config.secret_b64 = "dGVzdA==";
+    int fill_pages = 0;
+    const auto fetch = [&](const cpm::HttpsRequest& request) {
+        if (request.path == "/api/v1/instruments/CURRENT") {
+            return cpm::HttpsResponse{200, R"({"ticker":"CURRENT","id":"42","status":"OPEN"})", {}};
+        }
+        EXPECT_TRUE(request.query.starts_with("instrument_id=42&sub_account=desk%20one"));
+        if (request.path == "/api/orders") return cpm::HttpsResponse{200, R"({"data":[]})", {}};
+        if (request.path == "/api/positions") {
+            return cpm::HttpsResponse{200, R"({"data":[{"ticker":"CURRENT","instrument_id":"42",)"
+                R"("sub_account":"desk one","quantity":"-2.00"}]})", {}};
+        }
+
+        EXPECT_EQ(request.path, "/api/fills");
+        ++fill_pages;
+        if (fill_pages == 1) {
+            return cpm::HttpsResponse{200, R"({"data":[{"ticker":"CURRENT","instrument_id":"42",)"
+                R"("sub_account":"desk one","trade_id":"2","order_id":"9","side":"SELL",)"
+                R"("role":"TAKER","price":"0.550000","quantity":"1.00","fee":"0.002000",)"
+                R"("timestamp":"2026-11-27T17:25:45.678Z"}],"cursor":"next+="})", {}};
+        }
+        EXPECT_TRUE(request.query.ends_with("&cursor=next%2B%3D"));
+        return cpm::HttpsResponse{200, R"({"data":[{"ticker":"CURRENT","instrument_id":"42",)"
+            R"("sub_account":"desk one","trade_id":"1","order_id":"8","side":"SELL",)"
+            R"("role":"MAKER","price":"0.600000","quantity":"1.00","fee":"-0.001000",)"
+            R"("timestamp":"2026-11-27T17:25:44Z"}]})", {}};
+    };
+    const auto result = cpm::trader::fetch_fill_history(config, fetch, "CURRENT", "desk one");
+    ASSERT_TRUE(result.error.empty()) << result.error;
+    EXPECT_EQ(fill_pages, 2);
+    EXPECT_EQ(result.net, -200);
+    ASSERT_EQ(result.fills.size(), 2u);
+    EXPECT_EQ(result.fills.front().fill->trade_match_id, "1");
+    EXPECT_EQ(result.fills.front().fill->fee, -1000);
+    EXPECT_EQ(result.fills.back().fill->price, 550);
+}
+
 const std::string kSym = "SIMGAME-26NOV01HOMAWY-HOM";
 
 std::uint16_t free_port() {

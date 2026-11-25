@@ -568,9 +568,13 @@ int main(int argc, char** argv) {
         options.rest.url = rest.url;
         options.rest.ca_file = rest.ca_file;
         if (!options.rest.configured()) {
-            logger.warn(
-                "REST is not configured, so a series like BTCD15M cannot be resolved: name a "
-                "full ticker, or source config/creds.env and restart");
+            if (options.allow_orders && options.oe.endpoint.host == cpm::kOeSandboxHost) {
+                logger.warn("REST is not configured, so sandbox strategies cannot recover fills. "
+                            "Set CPM_REST_* in creds-rest.env and restart");
+            } else {
+                logger.warn("REST is not configured for series lookup. Use a full ticker "
+                            "or set CPM_REST_* in creds-rest.env and restart");
+            }
         }
         options.reference_enabled = args.binance_on || !args.binance_symbols.empty();
 

@@ -86,6 +86,10 @@ struct RestEndpoint {
 };
 RestEndpoint parse_rest_url(const std::string& url);
 
+cpm::HttpsResponse signed_rest_get(const RestConfig& config, const RestEndpoint& endpoint,
+                                   const std::string& path, const std::string& query,
+                                   const HttpsFetch& fetch, Clock::time_point now);
+
 // The signature the venue asks for: base64(HMAC-SHA256(timestamp + method +
 // path)), with the query string excluded and an empty body on a GET (API spec
 // section 2.2).

@@ -19,6 +19,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -165,6 +166,10 @@ private:
     // manager rather than from any strategy's own two slots. One function,
     // because a strategy reading the book and an operator about to cross it
     // have to see the same orders of ours.
+    std::string recover_cycle_fills(const std::string& symbol);
+    std::mutex fill_recovery_mutex_;
+    std::set<std::string> recovered_markets_;
+
     std::vector<cpm::strategy::LiveLeg> resting_on(const std::string& symbol) const;
     // A position, the mark the page would show for it, and the P&L that
     // follows from that mark. One function, so the page and the record file

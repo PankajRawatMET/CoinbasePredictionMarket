@@ -132,6 +132,42 @@ TEST(OrderStateTest, AccumulatesFillsIntoTheOrderAndThePosition) {
     EXPECT_EQ(rig.state.anomalies(), 0u) << rig.first_anomaly();
 }
 
+TEST(OrderStateTest, RestoredFillsSettleAfterRestartAndDeduplicateFixOverlap) {
+    Rig rig;
+    auto first = report("", ExecType::Trade, OrdStatus::Unknown, 0, 0, "");
+    first.side = Side::Sell;
+    first.fill = Fill{100, 600, "1", false, -1000};
+    auto second = first;
+    second.fill = Fill{100, 550, "2", true, 2000};
+
+    EXPECT_FALSE(rig.state.recover_fills(kSym, {first, second}, -100).empty());
+    EXPECT_FALSE(rig.state.position(kSym).has_value());
+    ASSERT_EQ(rig.state.recover_fills(kSym, {first, second}, -200), "");
+    ASSERT_EQ(rig.state.fills().size(), 2u);
+    EXPECT_TRUE(rig.state.last_exec_id().empty());
+    EXPECT_TRUE(rig.state.orders().empty());
+
+    second.exec_id = "12";
+    second.replayed = true;
+    rig.state.apply(second);
+    EXPECT_EQ(rig.state.last_exec_id(), "12");
+
+    cpm::oms::SettlementReport settlement;
+    settlement.symbol = kSym;
+    settlement.outcome = cpm::oms::SettlementReport::Outcome::No;
+    settlement.short_quantity = 200;
+    settlement.payout = 2000000;
+    rig.state.apply(settlement);
+    const auto position = rig.state.position(kSym);
+    ASSERT_TRUE(position);
+    EXPECT_EQ(position->net, -200);
+    EXPECT_EQ(position->fills, 2u);
+    EXPECT_EQ(position->cash, -1149000);
+    EXPECT_EQ(position->fees, 1000);
+    EXPECT_EQ(position->settlement_payout, 2000000);
+    EXPECT_TRUE(rig.anomalies.empty()) << rig.first_anomaly();
+}
+
 TEST(OrderStateTest, SellsSubtractFromThePosition) {
     Rig rig;
     rig.state.record_sent(sent("buy", Side::Buy));

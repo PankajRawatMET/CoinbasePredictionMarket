@@ -60,7 +60,7 @@ so a pull can never touch them. Fill in the templates the deployment wrote:
 |---|---|---|
 | `creds.env` | `CPM_*` | market data session |
 | `creds-oe.env` | `CPM_OE_*` | order entry session, and `CPM_OE_SUBACCOUNT` |
-| `creds-rest.env` | `CPM_REST_*` | instrument catalog (optional) |
+| `creds-rest.env` | `CPM_REST_*` | instrument catalog and fill recovery (required when trading on the sandbox) |
 | `trader.env` | `CPM_TRADER_ARGS` | flags for the service |
 
 Use a **subaccount nothing else trades**. The order entry session receives
@@ -71,6 +71,13 @@ this daemon did not send is an anomaly that halts the run — see
 Without `creds-rest.env` a strategy can only name a full ticker: FIX has no
 SecurityList, so a series like `BTCD15M` cannot be resolved to the window that
 is open now.
+
+For a trading session on the sandbox, configure REST credentials for the same
+firm as FIX, with access to fills, open orders, and positions. Before a strategy
+starts on a market, the daemon recovers that contract's fills for the FIX
+sub-account. If the venue still has working orders for that contract, cancel
+them before retrying Start. The Fills view includes both recovered and live
+fills from current market windows.
 
 ## Running it
 

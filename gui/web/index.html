@@ -318,6 +318,19 @@
     </div>
   </section>
 
+  <section data-view="fills">
+    <div class="panel">
+      <table id="fills" hidden>
+        <thead><tr>
+          <th>Time (UTC)</th><th>Market</th><th>Side</th><th class="num">Quantity</th>
+          <th class="num">Price (%)</th><th class="num">Fee</th><th>Trade ID</th><th>Order ID</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+      <p class="empty" id="fills-empty">No fills in the current market windows.</p>
+    </div>
+  </section>
+
   <section data-view="positions">
     <h2>Positions</h2>
     <div class="body">
@@ -418,7 +431,8 @@
     { name: 'strategies', label: 'Strategies' },
     { name: 'ladders', label: 'Ladders' },
     { name: 'books', label: 'Books' },
-    { name: 'positions', label: 'Positions' }
+    { name: 'positions', label: 'Positions' },
+    { name: 'fills', label: 'Fills' }
   ];
   var view = 'strategies';
 
@@ -1248,6 +1262,26 @@
     });
   }
 
+  function renderFills() {
+    var fills = snapshot.fills || [];
+    var body = document.querySelector('#fills tbody');
+    clear(body);
+    document.getElementById('fills-empty').hidden = fills.length > 0;
+    document.getElementById('fills').hidden = fills.length === 0;
+    fills.forEach(function (fill) {
+      var row = el('tr');
+      cell(row, fill.time);
+      cell(row, fill.symbol);
+      cell(row, fill.side);
+      cell(row, fill.quantity, 'num');
+      cell(row, fill.price, 'num');
+      cell(row, fill.fee, 'num');
+      cell(row, fill.trade_id);
+      cell(row, fill.order_id);
+      body.appendChild(row);
+    });
+  }
+
   function renderPositions() {
     var body = document.querySelector('#positions tbody');
     clear(body);
@@ -1825,6 +1859,7 @@
     renderBooks();
     renderLadders();
     renderPositions();
+    renderFills();
   }
 
   // ---- the stream ---------------------------------------------------------

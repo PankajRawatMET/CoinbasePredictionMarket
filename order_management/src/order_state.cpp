@@ -3,6 +3,7 @@
 #include "cpm/oms/order_rules.hpp"
 
 #include <algorithm>
+#include <set>
 
 namespace cpm::oms {
 namespace {
@@ -35,6 +36,12 @@ int rank(OrdStatus status) {
 
 Amount notional_of(Qty quantity, Price price) { return quantity * price * 10; }
 
+bool same_fill(const ExecutionReport& left, const ExecutionReport& right) {
+    return left.symbol == right.symbol && left.side == right.side &&
+           left.fill->quantity == right.fill->quantity && left.fill->price == right.fill->price &&
+           left.fill->fee.value_or(0) == right.fill->fee.value_or(0);
+}
+
 }  // namespace
 
 const char* to_string(OrderAnomaly::Kind kind) {
@@ -43,6 +50,7 @@ const char* to_string(OrderAnomaly::Kind kind) {
         case OrderAnomaly::Kind::AfterTerminal: return "report after a terminal state";
         case OrderAnomaly::Kind::QuantityMismatch: return "CumQty + LeavesQty mismatch";
         case OrderAnomaly::Kind::MissingFill: return "trade report without fill fields";
+        case OrderAnomaly::Kind::FillMismatch: return "reports disagree on the same fill";
         case OrderAnomaly::Kind::StatusRegression: return "order status went backwards";
         case OrderAnomaly::Kind::OrderIdChanged: return "OrderID changed";
         case OrderAnomaly::Kind::PayoutMismatch: return "settlement payout identity does not hold";
@@ -176,12 +184,78 @@ void OrderState::apply_fill(OrderRecord& record, const ExecutionReport& report) 
     }
 }
 
+std::string OrderState::recover_fills(const std::string& symbol,
+                                      const std::vector<ExecutionReport>& fills, Qty venue_net) {
+    {
+        std::lock_guard lock(mutex_);
+        const auto position = positions_.find(symbol);
+        if (position != positions_.end() && position->second.settlement_payout) {
+            return "market already settled during fill recovery";
+        }
+        if (std::any_of(unidentified_fills_.begin(), unidentified_fills_.end(),
+                        [&](const auto& fill) { return fill.symbol == symbol; })) {
+            return "a FIX fill has no trade or order ID for REST reconciliation";
+        }
+
+        std::set<FillKey> confirmed;
+        Qty net = 0;
+        for (const auto& report : fills) {
+            if (report.exec_type != ExecType::Trade || !report.fill || report.symbol != symbol ||
+                report.order_id.empty() || report.order_id == "0" ||
+                report.fill->trade_match_id.empty()) {
+                return "REST recovery supplied an invalid fill";
+            }
+            const auto& fill = *report.fill;
+            const FillKey key{fill.trade_match_id, report.order_id};
+            if (!confirmed.insert(key).second) return "duplicate fill in REST history";
+            net += report.side == Side::Buy ? fill.quantity : -fill.quantity;
+            if (const auto prior = fills_.find(key);
+                prior != fills_.end() && !same_fill(prior->second, report)) {
+                return "REST and FIX disagree on fill " + fill.trade_match_id;
+            }
+        }
+        for (const auto& [key, fill] : fills_) {
+            if (fill.symbol == symbol && !confirmed.contains(key)) {
+                return "a FIX fill is missing from REST history";
+            }
+        }
+        if (net != venue_net) return "REST fill history disagrees with the open position";
+
+        for (const auto& report : fills) {
+            if (!fills_.try_emplace({report.fill->trade_match_id, report.order_id}, report).second)
+                continue;
+            OrderRecord order;
+            order.order_id = report.order_id;
+            order.symbol = symbol;
+            order.side = report.side;
+            apply_fill(order, report);
+            if (on_applied_) {
+                AppliedReport applied;
+                applied.kind = AppliedReport::Kind::Report;
+                applied.report = report;
+                applied.order = std::move(order);
+                applied.position = positions_.at(symbol);
+                applied_.push_back(std::move(applied));
+            }
+        }
+    }
+    dispatch();
+    return {};
+}
+
+std::vector<ExecutionReport> OrderState::fills() const {
+    std::lock_guard lock(mutex_);
+    auto result = unidentified_fills_;
+    for (const auto& [key, report] : fills_) result.push_back(report);
+    return result;
+}
+
 void OrderState::apply(const ExecutionReport& report) {
     // T1, before the lock: the instant the answer reached this process, not
     // the instant we got round to recording it.
     const auto answered_at = SteadyClock::now();
     {
-        std::lock_guard lock(mutex_);
+        std::unique_lock lock(mutex_);
         // Event Resend delivers the same events again, with the same ExecID
         // and PossResend=Y, so an ExecID already applied changes nothing.
         if (!report.exec_id.empty() && !seen_exec_ids_.insert(report.exec_id).second) {
@@ -191,6 +265,24 @@ void OrderState::apply(const ExecutionReport& report) {
         if (!report.exec_id.empty()) {
             // ExecIDs share one increasing space, so the newest is the bookmark.
             if (exec_id_before(last_exec_id_, report.exec_id)) last_exec_id_ = report.exec_id;
+        }
+
+        if (report.exec_type == ExecType::Trade && report.fill) {
+            if (report.fill->trade_match_id.empty() || report.order_id.empty() ||
+                report.order_id == "0") {
+                unidentified_fills_.push_back(report);
+            } else if (const auto [it, inserted] =
+                           fills_.try_emplace({report.fill->trade_match_id, report.order_id}, report);
+                       !inserted) {
+                ++duplicate_reports_;
+                if (!same_fill(it->second, report)) {
+                    note(OrderAnomaly::Kind::FillMismatch, report.cl_ord_id, report.symbol,
+                         "trade " + report.fill->trade_match_id + " on order " + report.order_id);
+                    lock.unlock();
+                    dispatch();
+                }
+                return;
+            }
         }
 
         OrderRecord* found = find(report);

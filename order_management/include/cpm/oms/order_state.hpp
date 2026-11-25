@@ -23,6 +23,7 @@ struct OrderAnomaly {
         AfterTerminal,      // a further report for an order already finished
         QuantityMismatch,   // CumQty + LeavesQty disagrees with OrderQty
         MissingFill,        // ExecType=F with no LastQty/LastPx
+        FillMismatch,       // two reports disagree on the same trade and order
         StatusRegression,   // Filled or Canceled going back to New
         OrderIdChanged,     // a second OrderID for one order
         PayoutMismatch,     // a settlement whose payout identity does not hold
@@ -169,6 +170,11 @@ public:
     void record_sent(const NewOrder& order);
     void record_cancel_sent(const CancelOrder& cancel);
 
+    // REST history contains trades, with no FIX order lifecycle or replay cursor.
+    std::string recover_fills(const std::string& symbol, const std::vector<ExecutionReport>& fills,
+                              Qty venue_net);
+    std::vector<ExecutionReport> fills() const;
+
     std::optional<OrderRecord> order(const std::string& cl_ord_id) const;
     std::vector<OrderRecord> orders() const;
     // Orders that are not terminal, i.e. what is still live at the venue.
@@ -202,6 +208,9 @@ private:
     };
     std::map<std::string, SentCancel> cancels_;
     std::map<std::string, Position> positions_;
+    using FillKey = std::pair<std::string, std::string>;
+    std::map<FillKey, ExecutionReport> fills_;
+    std::vector<ExecutionReport> unidentified_fills_;
     std::unordered_set<std::string> seen_exec_ids_;
     std::string last_exec_id_;
     std::size_t duplicate_reports_ = 0;

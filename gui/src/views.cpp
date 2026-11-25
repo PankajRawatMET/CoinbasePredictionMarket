@@ -1,5 +1,6 @@
 #include "cpm/gui/views.hpp"
 
+#include "cpm/md/events.hpp"
 #include "cpm/md/ticker.hpp"
 #include "cpm/md/ticks.hpp"
 #include "cpm/oms/orders.hpp"
@@ -189,7 +190,7 @@ std::string snapshot_json(const Snapshot& snapshot) {
     JsonWriter out;
     out.object_begin();
     out.field("state", to_string(snapshot.state));
-    // Every price in this document is a percentage chance: "59.9", not
+    // Prices in this document are percentage chances: "59.9", not
     // "0.599". The daemon's own logs and the stdin console still speak in the
     // wire's units, which is the form the venue and the FIX messages use.
     out.field("price_unit", "percent");
@@ -218,6 +219,23 @@ std::string snapshot_json(const Snapshot& snapshot) {
 
     out.key("books").array_begin();
     for (const auto& book : snapshot.books) write_book(out, book);
+    out.array_end();
+
+    out.key("fills").array_begin();
+    for (const auto& report : snapshot.fills) {
+        if (!report.fill) continue;
+        const auto& fill = *report.fill;
+        out.object_begin();
+        out.field("time", cpm::md::to_utc_string(report.transact_time));
+        out.field("symbol", report.symbol);
+        out.field("side", cpm::oms::to_string(report.side));
+        out.field_scaled("quantity", fill.quantity, kQtyScale);
+        out.field("price", format_percent(fill.price));
+        out.field("fee", fill.fee ? format_amount(*fill.fee) : std::string());
+        out.field("trade_id", fill.trade_match_id);
+        out.field("order_id", report.order_id);
+        out.object_end();
+    }
     out.array_end();
 
     out.key("positions").array_begin();

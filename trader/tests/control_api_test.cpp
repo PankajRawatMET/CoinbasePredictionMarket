@@ -78,6 +78,10 @@ struct Fixture {
         env.order_entry = [this] { return SessionView{oe_up, oe_up ? "" : "not connected"}; };
         env.recovery = [] { return std::string("live"); };
         env.positions = [this] { return positions; };
+        env.recover_fills = [this](const std::string& symbol) {
+            recovery_symbol = symbol;
+            return recovery_error;
+        };
         env.pnl = [this] { return pnl; };
         env.limits = [] {
             LimitsView limits;
@@ -148,6 +152,8 @@ struct Fixture {
 
     bool allow_orders = true;
     bool gate_open = true;
+    std::string recovery_symbol;
+    std::string recovery_error;
     bool md_up = true;
     bool oe_up = true;
     bool have_book = true;
@@ -185,6 +191,22 @@ struct Fixture {
 };
 
 // --- the kinds and their schemas ------------------------------------------
+
+TEST(ControlApi, FillRecoveryMustSucceedBeforeStarting) {
+    Fixture f;
+    const auto created = f.api->create(f.spec());
+    ASSERT_TRUE(created.ok());
+    f.recovery_error = "fill history unavailable";
+
+    EXPECT_EQ(f.api->start(created.id).error, f.recovery_error);
+    EXPECT_EQ(f.recovery_symbol, kSym);
+    EXPECT_EQ(f.host->info(created.id)->state, RunState::Stopped);
+    EXPECT_TRUE(f.sent.empty());
+
+    f.recovery_error.clear();
+    EXPECT_TRUE(f.api->start(created.id).ok());
+    EXPECT_EQ(f.host->info(created.id)->state, RunState::Running);
+}
 
 TEST(ControlApi, PublishesTheKindsAndTheirSchemas) {
     Fixture f;

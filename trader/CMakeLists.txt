@@ -4,6 +4,7 @@
 
 add_library(cpm_trader_lib
   src/control_api.cpp
+  src/fill_recovery.cpp
   src/trader.cpp
 )
 target_include_directories(cpm_trader_lib PUBLIC include)

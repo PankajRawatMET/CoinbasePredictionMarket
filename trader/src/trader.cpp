@@ -1,11 +1,14 @@
 #include "cpm/trader/trader.hpp"
 
+#include "fill_recovery.hpp"
+
 #include <fcntl.h>
 #include <unistd.h>
 
 #include "cpm/oms/order_rules.hpp"
 #include "cpm/oms/pnl.hpp"
 
+#include <algorithm>
 #include <utility>
 
 namespace cpm::trader {
@@ -355,6 +358,19 @@ Trader::Trader(TraderOptions options, const cpm::strategy::StrategyRegistry& reg
             if (!reference_->latest(symbol, now).usable()) return "stale";
         }
         return "up";
+    };
+    env.recover_fills = [this](const std::string& symbol) { return recover_cycle_fills(symbol); };
+    env.fills = [this] {
+        auto fills = orders_.fills();
+        const auto now = Clock::now();
+        std::erase_if(fills, [now](const auto& fill) {
+            const auto market = cpm::md::parse_ticker(fill.symbol);
+            return market && now >= market->window_end;
+        });
+        std::stable_sort(fills.begin(), fills.end(), [](const auto& left, const auto& right) {
+            return left.transact_time > right.transact_time;
+        });
+        return fills;
     };
     env.positions = [this] {
         std::vector<PositionView> out;
@@ -952,6 +968,38 @@ void Trader::tick(Clock::time_point now) {
             logger_.debug("forgot " + std::to_string(forgotten) + " finished window(s)");
         }
     }
+}
+
+std::string Trader::recover_cycle_fills(const std::string& symbol) {
+    if (!options_.allow_orders || options_.oe.endpoint.host != cpm::kOeSandboxHost) {
+        return {};
+    }
+    std::lock_guard lock(fill_recovery_mutex_);
+    if (recovered_markets_.contains(symbol)) return {};
+
+    const auto failure = [&](const std::string& reason) {
+        return "fill recovery for " + symbol + ": " + reason;
+    };
+    if (!reconciler_->submission_allowed()) return failure("wait for FIX recovery to finish");
+    if (const auto window = cpm::md::parse_ticker(symbol);
+        window && Clock::now() >= window->window_end) {
+        return failure("the market window has ended");
+    }
+    const auto fetch = options_.rest_fetch ? options_.rest_fetch : cpm::md::HttpsFetch(cpm::https_get);
+    const auto recovered = fetch_fill_history(options_.rest, fetch, symbol, options_.oe.subaccount);
+    if (!recovered.error.empty()) return failure(recovered.error);
+    if (!reconciler_->submission_allowed()) return failure("FIX recovery changed during the request");
+    if (const auto window = cpm::md::parse_ticker(symbol);
+        window && Clock::now() >= window->window_end) {
+        return failure("the market window ended during the request");
+    }
+    if (const auto error = orders_.recover_fills(symbol, recovered.fills, recovered.net);
+        !error.empty()) {
+        return failure(error);
+    }
+    recovered_markets_.insert(symbol);
+    logger_.info("recovered " + std::to_string(recovered.fills.size()) + " fills for " + symbol);
+    return {};
 }
 
 ControlApi::Env::Resolved Trader::resolve_series(const std::string& series) {
